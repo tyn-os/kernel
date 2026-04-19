@@ -74,24 +74,42 @@ Hello Tyn!
 
 ### Prerequisites
 
-- Rust nightly toolchain
+- Rust nightly toolchain with `rust-src` component
 - QEMU with KVM support (`qemu-system-x86_64`)
-- `grub-mkrescue` and `xorriso` (for bootable ISO)
 
-### Build and run
+### Build
 
 ```bash
-cargo build --release
-# Create bootable ISO (see scripts/mkiso.sh)
-./run.sh kvm
+cargo build --release --target x86_64-tyn.json \
+  -Zbuild-std=core,alloc,compiler_builtins \
+  -Zbuild-std-features=compiler-builtins-mem
 ```
+
+### Run
+
+```bash
+qemu-system-x86_64 \
+  -enable-kvm \
+  -machine q35 \
+  -kernel target/x86_64-tyn/release/tyn-kernel \
+  -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off \
+  -netdev user,id=net0,hostfwd=tcp::5555-:8080 \
+  -serial stdio \
+  -display none \
+  -m 128M
+```
+
+Key flags:
+- `-machine q35` — provides ECAM PCI config space at `0xB0000000`
+- `disable-legacy=on,disable-modern=off` — modern virtio-pci v1.0+ only
+- `hostfwd=tcp::5555-:8080` — forward host port 5555 to guest TCP echo server
 
 ### Test TCP echo
 
 ```bash
 # In another terminal:
-nc localhost 5555
-# Type text, see it echoed back
+echo "Hello Tyn!" | nc localhost 5555
+# → Hello Tyn!
 ```
 
 ## Design Principles
