@@ -1,0 +1,8 @@
+[package]
+name = "vsock_server"
+version = "0.1.0"
+authors = ["Alice Wang <aliceywang@google.com>"]
+edition = "2024"
+
+[dependencies]
+vsock = "0.5.3"

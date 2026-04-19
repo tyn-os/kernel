@@ -1,0 +1,6 @@
+directions/
+target/
+.claude/
+*.iso
+iso_root/
+limine-bin/

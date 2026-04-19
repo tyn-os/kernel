@@ -1,0 +1,32 @@
+[package]
+name = "tyn-kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["James James"]
+
+[dependencies]
+x86_64 = "0.14"
+uart_16550 = "0.2"
+spin = "0.9"
+linked_list_allocator = "0.9"
+log = "0.4"
+virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"] }
+
+[patch.crates-io]
+virtio-drivers = { path = "virtio-drivers-patched" }
+
+[dependencies.smoltcp]
+version = "0.13"
+default-features = false
+features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+    "alloc",
+]
+
+[profile.release]
+debug = true
+lto = false
