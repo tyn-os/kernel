@@ -1,5 +1,9 @@
-//! smoltcp Device impl — matches rcore tcp.rs pattern.
+//! smoltcp `Device` implementation wrapping `VirtIONet`.
+//!
+//! RX: calls `VirtIONet::receive()` directly (no `can_recv` guard).
+//! TX: non-blocking `transmit_begin`, completed descriptors drained each poll.
 
+use crate::drivers::virtio::hal::TynHal;
 use crate::serial_println;
 use alloc::vec::Vec;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -7,30 +11,40 @@ use smoltcp::time::Instant;
 use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::transport::Transport;
 
-use crate::drivers::virtio::hal::TynHal;
-
 const QUEUE_SIZE: usize = 16;
 
+/// smoltcp device backed by a VirtIONet driver.
 pub struct VirtioNetDevice<T: Transport> {
+    /// The underlying virtio-net driver.
     pub inner: VirtIONet<TynHal, T, QUEUE_SIZE>,
     pending_tx: Vec<(u16, Vec<u8>)>,
 }
 
 impl<T: Transport> VirtioNetDevice<T> {
+    /// Wrap a `VirtIONet` driver for use with smoltcp.
     pub fn new(inner: VirtIONet<TynHal, T, QUEUE_SIZE>) -> Self {
-        Self { inner, pending_tx: Vec::new() }
+        Self {
+            inner,
+            pending_tx: Vec::new(),
+        }
     }
 
+    /// Drain completed TX descriptors so buffers can be freed and reused.
     pub fn drain_completed_tx(&mut self) {
         let raw = &mut self.inner.inner;
         while let Some(token) = raw.poll_transmit() {
             if let Some(idx) = self.pending_tx.iter().position(|(t, _)| *t == token) {
                 let (_t, buf) = self.pending_tx.remove(idx);
-                unsafe { raw.transmit_complete(token, &buf).ok(); }
+                // SAFETY: `buf` is the same buffer passed to `transmit_begin`
+                // when this token was issued.
+                unsafe {
+                    raw.transmit_complete(token, &buf).ok();
+                }
             }
         }
     }
 
+    /// Read the device's MAC address.
     pub fn mac_address(&self) -> [u8; 6] {
         self.inner.mac_address()
     }
@@ -72,24 +86,30 @@ impl<T: Transport> Device for VirtioNetDevice<T> {
     }
 }
 
+/// Received packet data, consumed by smoltcp.
 pub struct VirtioRxToken {
     packet: Vec<u8>,
 }
 
 impl RxToken for VirtioRxToken {
     fn consume<R, F>(self, f: F) -> R
-    where F: FnOnce(&[u8]) -> R {
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
         f(&self.packet)
     }
 }
 
+/// Transmit token — holds a mutable reference to the device for sending.
 pub struct VirtioTxToken<'a, T: Transport> {
     device: &'a mut VirtioNetDevice<T>,
 }
 
 impl<T: Transport> TxToken for VirtioTxToken<'_, T> {
     fn consume<R, F>(self, len: usize, f: F) -> R
-    where F: FnOnce(&mut [u8]) -> R {
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
         self.device.drain_completed_tx();
 
         let raw = &mut self.device.inner.inner;
@@ -99,6 +119,9 @@ impl<T: Transport> TxToken for VirtioTxToken<'_, T> {
         let result = f(&mut buf[hdr_len..]);
 
         serial_println!("[tx] {} bytes", len);
+        // SAFETY: `buf` contains a valid virtio-net header followed by the
+        // Ethernet frame. The buffer is kept alive in `pending_tx` until
+        // `transmit_complete` is called with the matching token.
         match unsafe { raw.transmit_begin(&buf) } {
             Ok(token) => {
                 self.device.pending_tx.push((token, buf));

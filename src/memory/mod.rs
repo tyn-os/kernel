@@ -1,3 +1,3 @@
-//! Memory subsystem modules.
+//! Memory subsystem — heap allocator.
 
 pub mod heap;

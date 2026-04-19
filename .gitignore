@@ -1,6 +1,12 @@
 directions/
 target/
 .claude/
+.cargo/
 *.iso
 iso_root/
 limine-bin/
+build-iso.sh
+limine.cfg
+limine.conf
+run.sh
+tests/
