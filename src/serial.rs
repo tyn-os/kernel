@@ -37,6 +37,36 @@ macro_rules! serial_print {
     };
 }
 
+/// Write a hex u64 value to COM1 without format machinery.
+pub fn raw_hex(val: u64) {
+    let hex = b"0123456789abcdef";
+    raw_str(b"0x");
+    let mut started = false;
+    for i in (0..16).rev() {
+        let nibble = ((val >> (i * 4)) & 0xf) as usize;
+        if nibble != 0 || started || i == 0 {
+            started = true;
+            // SAFETY: COM1 I/O ports.
+            unsafe {
+                while (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20) == 0 {}
+                x86_64::instructions::port::Port::<u8>::new(0x3F8).write(hex[nibble]);
+            }
+        }
+    }
+}
+
+/// Write a raw byte string to COM1 without format machinery.
+/// Safe to call even when .rodata vtables are corrupted.
+pub fn raw_str(s: &[u8]) {
+    for &b in s {
+        // SAFETY: 0x3F8 is COM1 data port, 0x3FD is LSR.
+        unsafe {
+            while (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20) == 0 {}
+            x86_64::instructions::port::Port::<u8>::new(0x3F8).write(b);
+        }
+    }
+}
+
 /// Prints to the serial port (COM1) with a newline.
 #[macro_export]
 macro_rules! serial_println {

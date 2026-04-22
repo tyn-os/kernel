@@ -2,14 +2,20 @@
 
 #![no_std]
 #![feature(abi_x86_interrupt)]
+#![feature(naked_functions)]
 
 extern crate alloc;
 
 pub mod drivers;
+pub mod elf;
 pub mod interrupts;
 pub mod memory;
 pub mod net;
 pub mod serial;
+pub mod syscall;
+pub mod pipe;
+pub mod thread;
+pub mod vfs;
 
 /// Halt the CPU in a loop, waking only on interrupts.
 pub fn halt_loop() -> ! {

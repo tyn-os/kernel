@@ -6,7 +6,7 @@ No Linux. No POSIX. Just your Erlang/Elixir/Gleam code on bare metal.
 
 ## What is Tyn?
 
-Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with a few thousand lines of Rust, targeting KVM/QEMU cloud deployments.
+Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~3,200 lines of Rust, targeting KVM/QEMU cloud deployments.
 
 The BEAM already has its own process model, scheduler, memory management, and distribution protocol. Linux sits underneath adding 30 million lines of unverified C that the BEAM neither needs nor benefits from. Tyn removes that.
 
@@ -31,9 +31,10 @@ The BEAM already has its own process model, scheduler, memory management, and di
 │  ERTS / BEAM VM (unmodified)            │
 ├─────────────────────────────────────────┤
 │  BEAM Host Interface (Rust)             │
+│  ~50 Linux syscalls emulated            │
 ├─────────────────────────────────────────┤
-│  Tyn Kernel (Rust)                      │
-│  Memory · Interrupts · virtio · TCP/IP  │
+│  Tyn Kernel (Rust, ~3,200 LOC)          │
+│  Memory · Interrupts · VFS · Serial I/O │
 ├─────────────────────────────────────────┤
 │  KVM / QEMU / Cloud Hypervisor          │
 └─────────────────────────────────────────┘
@@ -43,32 +44,54 @@ Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP shi
 
 ## Status
 
-🚧 **Early development — Phase 2 complete.**
-
-The kernel boots via multiboot2 on QEMU/KVM, initializes memory with identity-mapped page tables, discovers PCI devices, negotiates with a virtio-net device, and runs a TCP echo server via [smoltcp](https://github.com/smoltcp-rs/smoltcp).
+**Phase 3 complete — BEAM runs on bare metal.**
 
 ```
-$ nc localhost 5555
-Hello Tyn!
-Hello Tyn!
+=== Tyn Kernel v0.1.0 ===
+[vfs] cpio: 155 files, 8113152 bytes
+[vfs] open /otp/bin/start.boot (5583 bytes)
+[vfs] open /otp/lib/kernel/ebin/error_handler.beam (4144 bytes)
+[vfs] open /otp/lib/kernel/ebin/application.beam (11520 bytes)
+...51 .beam files loaded...
+{otp,"20"}
+{procs,25}
+{math,2}
+{spawn_test,<0.54.0>}
+hello_from_spawn
+Eshell V9.3.3.15  (abort with ^G)
+1>
 ```
+
+- The Erlang shell boots and reaches the `1>` prompt
+- 25 OTP processes start (kernel_sup, code_server, error_logger, etc.)
+- `spawn/1` creates and schedules new processes
+- `erlang:display/1` evaluates expressions and prints results
+- 51 `.beam` files loaded from an in-memory VFS
 
 ### What works
 
 - Multiboot2 boot with identity-mapped 4 GiB address space
-- GDT, IDT, interrupt handling (exceptions + PIC timer)
-- Physical frame allocator and kernel heap
+- GDT, IDT, TSS with IST for safe interrupt handling
+- PIT timer (100 Hz) with preemptive scheduling
+- ~50 Linux syscalls emulated (mmap, read, write, open, stat, pipe, ppoll, futex, clone, ...)
+- ELF loader for static musl binaries
+- In-memory VFS backed by cpio archive (start.boot + kernel/stdlib .beam files)
+- Directory listing (getdents64) for OTP code_server
+- Cooperative and preemptive threading (up to 24 threads)
+- Per-thread kernel stacks and IST stacks
+- Monotonic clock via RDTSC
+- COM1 serial I/O (stdin/stdout/stderr)
 - PCI bus enumeration (ECAM on q35)
-- virtio-net driver via [virtio-drivers](https://github.com/rcore-os/virtio-drivers) crate
-- TCP/IP networking via smoltcp
-- TCP echo server on port 8080
+- virtio-net driver via [virtio-drivers](https://github.com/rcore-os/virtio-drivers)
+- TCP/IP networking via [smoltcp](https://github.com/smoltcp-rs/smoltcp)
 
 ### What's next
 
-- **Phase 3:** BEAM host interface — implement the syscall/libc shim that lets ERTS run on Tyn
-- **Phase 4:** Boot ERTS and reach an Erlang shell over the network
-- **Phase 5:** Run a Phoenix application
-- **Phase 6:** Production hardening, cloud image packaging, formal verification with [Verus](https://github.com/verus-lang/verus)
+- **Interactive shell** — full stdin support so the Erlang shell accepts typed input
+- **OTP 27 SMP** — multi-CPU kernel support to run modern ERTS with threading
+- **Virtio networking** — connect ERTS inet to the virtio-net driver
+- **Phoenix application** — run a web framework on Tyn
+- **Formal verification** — Verus proofs for critical kernel paths
 
 ## Building & Running
 
@@ -76,6 +99,7 @@ Hello Tyn!
 
 - Rust nightly toolchain with `rust-src` component
 - QEMU with KVM support (`qemu-system-x86_64`)
+- Pre-built BEAM binary and OTP rootfs (see [BUILDING.md](BUILDING.md))
 
 ### Build
 
@@ -89,34 +113,28 @@ cargo build --release --target x86_64-tyn.json \
 
 ```bash
 qemu-system-x86_64 \
-  -enable-kvm \
-  -machine q35 \
   -kernel target/x86_64-tyn/release/tyn-kernel \
-  -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off \
-  -netdev user,id=net0,hostfwd=tcp::5555-:8080 \
-  -serial stdio \
-  -display none \
-  -m 128M
+  -m 2G -machine q35 -cpu host -enable-kvm \
+  -nographic -no-reboot -serial mon:stdio
 ```
 
-Key flags:
-- `-machine q35` — provides ECAM PCI config space at `0xB0000000`
-- `disable-legacy=on,disable-modern=off` — modern virtio-pci v1.0+ only
-- `hostfwd=tcp::5555-:8080` — forward host port 5555 to guest TCP echo server
-
-### Test TCP echo
+### Remote build (on AWS)
 
 ```bash
-# In another terminal:
-echo "Hello Tyn!" | nc localhost 5555
-# → Hello Tyn!
+ssh -i ~/.ssh/april2026.pem ubuntu@34.224.79.157
+source ~/.cargo/env && cd /home/ubuntu/kernel
+cargo build --release --target x86_64-tyn.json
+timeout 30 qemu-system-x86_64 \
+  -kernel target/x86_64-tyn/release/tyn-kernel \
+  -m 2G -machine q35 -cpu host -enable-kvm \
+  -nographic -no-reboot -serial mon:stdio
 ```
 
 ## Design Principles
 
 **Run the real BEAM.** Not a reimplementation — the actual ERTS, cross-compiled for Tyn's host interface.
 
-**Path A: everything is BEAM or Rust.** No Linux, no POSIX, no arbitrary binaries. This constraint enables the small trusted computing base and clean verification story.
+**Everything is BEAM or Rust.** No Linux, no POSIX, no arbitrary binaries. This constraint enables the small trusted computing base and clean verification story.
 
 **Minimal kernel, maximal BEAM.** The kernel provides only what BEAM needs — memory, interrupts, device access, network. BEAM handles its own scheduling, memory management, code loading, and supervision.
 

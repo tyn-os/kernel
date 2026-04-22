@@ -10,3 +10,4 @@ limine.cfg
 limine.conf
 run.sh
 tests/
+CONTEXT.md

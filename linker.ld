@@ -1,7 +1,11 @@
 OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
 
-BASE_ADDRESS = 0x200000;
+/* Kernel at 240 MiB — above ALL ERTS memory (segments, fixed mmaps, stack).
+   ERTS loads at 0x400000..0xE56000 with fixed mmaps up to ~0x1000000.
+   The mmap bump allocator starts at 128 MiB. User stack at 224 MiB.
+   Kernel must be above all of these. */
+BASE_ADDRESS = 0xF000000;
 
 SECTIONS
 {
