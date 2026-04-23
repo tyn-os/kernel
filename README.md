@@ -44,29 +44,29 @@ Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP shi
 
 ## Status
 
-**Phase 3 complete — BEAM runs on bare metal.**
+**Phase 3 complete — BEAM runs on bare metal with TCP networking.**
 
 ```
 === Tyn Kernel v0.1.0 ===
+[pci] 0:2.0 VirtIO Network
+[net] MAC=[52, 54, 00, 12, 34, 56]
+[net] initialized, IP=10.0.2.15
 [vfs] cpio: 155 files, 8113152 bytes
-[vfs] open /otp/bin/start.boot (5583 bytes)
-[vfs] open /otp/lib/kernel/ebin/error_handler.beam (4144 bytes)
-[vfs] open /otp/lib/kernel/ebin/application.beam (11520 bytes)
 ...51 .beam files loaded...
-{otp,"20"}
-{procs,25}
-{math,2}
-{spawn_test,<0.54.0>}
-hello_from_spawn
-Eshell V9.3.3.15  (abort with ^G)
-1>
+{listen,ok}
+{accepted,#Port<0.155>}
+done
 ```
 
-- The Erlang shell boots and reaches the `1>` prompt
-- 25 OTP processes start (kernel_sup, code_server, error_logger, etc.)
-- `spawn/1` creates and schedules new processes
-- `erlang:display/1` evaluates expressions and prints results
-- 51 `.beam` files loaded from an in-memory VFS
+```
+$ echo "hello" | nc localhost 5555
+Hi Tyn
+```
+
+- ERTS boots, loads 51 .beam files, starts 25 OTP processes
+- `gen_tcp:listen` → `gen_tcp:accept` → `gen_tcp:send` works end-to-end
+- Host connects via `nc`, receives response from Erlang code running on Tyn
+- Full path: ERTS → syscall → smoltcp → virtio-net → QEMU → host
 
 ### What works
 
@@ -74,6 +74,7 @@ Eshell V9.3.3.15  (abort with ^G)
 - GDT, IDT, TSS with IST for safe interrupt handling
 - PIT timer (100 Hz) with preemptive scheduling
 - ~50 Linux syscalls emulated (mmap, read, write, open, stat, pipe, ppoll, futex, clone, ...)
+- POSIX socket layer (socket, bind, listen, accept, send, recv, setsockopt, getsockopt)
 - ELF loader for static musl binaries
 - In-memory VFS backed by cpio archive (start.boot + kernel/stdlib .beam files)
 - Directory listing (getdents64) for OTP code_server
@@ -84,6 +85,7 @@ Eshell V9.3.3.15  (abort with ^G)
 - PCI bus enumeration (ECAM on q35)
 - virtio-net driver via [virtio-drivers](https://github.com/rcore-os/virtio-drivers)
 - TCP/IP networking via [smoltcp](https://github.com/smoltcp-rs/smoltcp)
+- gen_tcp:listen/accept/send works — Erlang TCP server serves responses to host clients
 
 ### What's next
 
@@ -115,19 +117,17 @@ cargo build --release --target x86_64-tyn.json \
 qemu-system-x86_64 \
   -kernel target/x86_64-tyn/release/tyn-kernel \
   -m 2G -machine q35 -cpu host -enable-kvm \
-  -nographic -no-reboot -serial mon:stdio
+  -nographic -no-reboot -serial mon:stdio \
+  -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off \
+  -netdev user,id=net0,hostfwd=tcp::5555-:8080
 ```
 
-### Remote build (on AWS)
+### Test TCP from host
 
 ```bash
-ssh -i ~/.ssh/april2026.pem ubuntu@34.224.79.157
-source ~/.cargo/env && cd /home/ubuntu/kernel
-cargo build --release --target x86_64-tyn.json
-timeout 30 qemu-system-x86_64 \
-  -kernel target/x86_64-tyn/release/tyn-kernel \
-  -m 2G -machine q35 -cpu host -enable-kvm \
-  -nographic -no-reboot -serial mon:stdio
+# In another terminal while QEMU is running:
+echo "hello" | nc localhost 5555
+# → Hi Tyn
 ```
 
 ## Design Principles

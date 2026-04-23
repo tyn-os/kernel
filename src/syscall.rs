@@ -266,8 +266,11 @@ extern "C" fn syscall_dispatch(
     {
         static SC: AtomicU64 = AtomicU64::new(0);
         let c = SC.fetch_add(1, Ordering::Relaxed);
-        // Logging disabled for clean output
-        let _ = (c, nr, a0);
+        // Log all syscalls that touch fd 502 (accepted socket), plus socket ops
+        if nr == 41 || nr == 43 || nr == 49 || nr == 50 || nr == 288
+           || a0 == 502 || (nr == 233 && a1 == 502) { // epoll_ctl with fd=502
+            serial_println!("[sc] #{} nr={} a0={:#x} a1={:#x}", c, nr, a0, a1);
+        }
     }
     let idx = crate::thread::current_idx();
     if idx < 24 { IN_SYSCALL[idx].store(true, Ordering::Relaxed); }
@@ -304,6 +307,8 @@ fn syscall_dispatch_inner(
         SYS_CLOSE => {
             crate::vfs::close(a0 as i32);
             crate::pipe::close(a0 as i32);
+            crate::net::socket::close(a0 as i32);
+            crate::net::poll(); // flush FIN
             0
         }
         SYS_STAT => sys_stat(a0 as *const u8, a1 as *mut u8),
@@ -349,6 +354,7 @@ fn syscall_dispatch_inner(
         SYS_FUTEX => sys_futex(a0, a1, a2),
         SYS_PPOLL => sys_ppoll(a0, a1),
         SYS_SELECT => {
+            crate::net::poll();
             crate::thread::yield_to_other();
             0 // timeout expired
         }
@@ -365,12 +371,38 @@ fn syscall_dispatch_inner(
             sys_clone(a0, a1, a2, a3, _a4)
         }
         SYS_EXIT => sys_exit_group(a0 as i32),
-        41 | 42 | 43 | 44 | 45 | 46 | 47 | 48 | 49 | 50 | 51 | 54 | 55 => {
-            // Socket syscalls: socket, connect, accept, sendto, recvfrom,
-            // sendmsg, recvmsg, shutdown, bind, listen, getsockname,
-            // setsockopt, getsockopt → not supported
-            -97 // -EAFNOSUPPORT
+        // Socket syscalls
+        41 => crate::net::socket::sys_socket(a0 as i32, a1 as i32, a2 as i32),
+        42 => -115, // connect → -EINPROGRESS (TODO)
+        43 | 288 => crate::net::socket::sys_accept(a0 as i32, a1 as *mut u8, a2 as *mut u32, a3 as i32),
+        44 => crate::net::socket::sys_sendto(a0 as i32, a1 as *const u8, a2 as usize, a3 as i32, 0 as *const u8, 0),
+        45 => crate::net::socket::sys_recvfrom(a0 as i32, a1 as *mut u8, a2 as usize, a3 as i32, 0 as *mut u8, 0 as *mut u32),
+        46 => { // sendmsg — used by erl_child_setup protocol
+            // Parse msghdr to get total iov length for return value
+            // struct msghdr { void *name; socklen_t namelen; struct iovec *iov;
+            //                 size_t iovlen; void *control; size_t controllen; int flags; }
+            let iov_ptr = unsafe { *((a1 + 16) as *const u64) };
+            let iov_len = unsafe { *((a1 + 24) as *const u64) };
+            let mut total = 0i64;
+            for i in 0..iov_len {
+                let len = unsafe { *((iov_ptr + i * 16 + 8) as *const u64) };
+                total += len as i64;
+            }
+            // Write the data to the pipe if it's a pipe fd
+            if crate::pipe::is_pipe_fd(a0 as i32) {
+                let base = unsafe { *((iov_ptr) as *const u64) };
+                crate::pipe::write(a0 as i32, base as *const u8, total as usize);
+            }
+            total
         }
+        47 => -11, // recvmsg → -EAGAIN
+        48 => 0,   // shutdown → success
+        49 => crate::net::socket::sys_bind(a0 as i32, a1 as *const u8, a2 as u32),
+        50 => crate::net::socket::sys_listen(a0 as i32, a1 as i32),
+        51 => crate::net::socket::sys_getsockname(a0 as i32, a1 as *mut u8, a2 as *mut u32),
+        52 => crate::net::socket::sys_getpeername(a0 as i32, a1 as *mut u8, a2 as *mut u32),
+        54 => crate::net::socket::sys_setsockopt(a0 as i32, a1 as i32, a2 as i32, a3 as *const u8, _a4 as u32),
+        55 => crate::net::socket::sys_getsockopt(a0 as i32, a1 as i32, a2 as i32, a3 as *mut u8, _a4 as *mut u32),
         _ => {
             serial_println!("[syscall] UNHANDLED nr={}", nr);
             -38 // -ENOSYS
@@ -404,6 +436,10 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
             }
         }
         result
+    } else if crate::net::socket::is_socket_fd(fd) {
+        let r = crate::net::socket::sys_sendto(fd, buf, count, 0, core::ptr::null(), 0);
+        crate::net::poll(); // flush smoltcp's tx buffer
+        r
     } else {
         -9 // -EBADF
     }
@@ -427,6 +463,10 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
             unsafe { *(buf as *mut u64) = 1; }
         }
         return 8;
+    }
+    // Socket read
+    if crate::net::socket::is_socket_fd(fd) {
+        return crate::net::socket::sys_recvfrom(fd, buf, count, 0, core::ptr::null_mut(), core::ptr::null_mut());
     }
     0 // EOF for other fds
 }
@@ -756,6 +796,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
 /// Returns 0 (no events / timeout) so the caller runs its housekeeping loop.
 /// struct epoll_event { u32 events; u64 data; } = 12 bytes
 fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64) -> i64 {
+    crate::net::poll();
     crate::thread::yield_to_other();
 
     // Check for pipe data
@@ -778,9 +819,28 @@ fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64) -> i64 {
 /// ppoll: check pollfds for ready pipe fds.
 /// struct pollfd { int fd; short events; short revents; } — 8 bytes each.
 fn sys_ppoll(fds_ptr: u64, nfds: u64) -> i64 {
+    // Poll the network stack so smoltcp processes packets and updates
+    // socket readiness before we check pollfds.
+    crate::net::poll();
+
     crate::thread::yield_to_other();
 
-    // Check pollfds and return -EINTR if nothing ready
+    // Debug: log first ppoll that includes socket fds
+    {
+        static LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.load(Ordering::Relaxed) {
+            for i in 0..nfds as usize {
+                let fd = unsafe { *((fds_ptr + (i as u64) * 8) as *const i32) };
+                if fd >= 500 {
+                    LOGGED.store(true, Ordering::Relaxed);
+                    serial_println!("[ppoll] nfds={} socket_fd={} at idx={}", nfds, fd, i);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Check pollfds
     let mut ready = 0i64;
     const POLLIN: u16 = 0x0001;
 
@@ -792,17 +852,21 @@ fn sys_ppoll(fds_ptr: u64, nfds: u64) -> i64 {
             let events = *((pfd as u64 + 4) as *const u16);
             // Clear revents
             *((pfd as u64 + 6) as *mut u16) = 0;
-            if (events & POLLIN) != 0 {
-                let has_data = if fd == 0 {
+            if events != 0 {
+                let revents = if fd == 0 {
                     // stdin: check COM1 LSR bit 0
-                    (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 1) != 0
+                    if (events & POLLIN) != 0 && (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 1) != 0 {
+                        POLLIN
+                    } else { 0 }
                 } else if crate::pipe::is_pipe_fd(fd) {
-                    crate::pipe::has_data(fd)
+                    if (events & POLLIN) != 0 && crate::pipe::has_data(fd) { POLLIN } else { 0 }
+                } else if crate::net::socket::is_socket_fd(fd) {
+                    crate::net::socket::poll_socket(fd) & events
                 } else {
-                    false
+                    0
                 };
-                if has_data {
-                    *((pfd as u64 + 6) as *mut u16) = POLLIN;
+                if revents != 0 {
+                    *((pfd as u64 + 6) as *mut u16) = revents;
                     ready += 1;
                 }
             }
