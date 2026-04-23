@@ -56,13 +56,46 @@ pub fn raw_hex(val: u64) {
 }
 
 /// Write a raw byte string to COM1 without format machinery.
-/// Safe to call even when .rodata vtables are corrupted.
+/// Uses the serial lock to prevent interleaving on SMP.
 pub fn raw_str(s: &[u8]) {
+    use x86_64::instructions::interrupts;
+    interrupts::without_interrupts(|| {
+        let _lock = SERIAL1.lock();
+        for &b in s {
+            // SAFETY: 0x3F8 is COM1 data port, 0x3FD is LSR.
+            unsafe {
+                while (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20) == 0 {}
+                x86_64::instructions::port::Port::<u8>::new(0x3F8).write(b);
+            }
+        }
+    });
+}
+
+/// Write directly to COM1 WITHOUT the serial lock.
+/// Only for crash handlers where the lock might be held by another CPU.
+/// Output may interleave with other serial output.
+pub fn raw_str_nolock(s: &[u8]) {
     for &b in s {
-        // SAFETY: 0x3F8 is COM1 data port, 0x3FD is LSR.
         unsafe {
             while (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20) == 0 {}
             x86_64::instructions::port::Port::<u8>::new(0x3F8).write(b);
+        }
+    }
+}
+
+/// Write a hex u64 value to COM1 WITHOUT the serial lock (crash handler use only).
+pub fn raw_hex_nolock(val: u64) {
+    let hex = b"0123456789abcdef";
+    raw_str_nolock(b"0x");
+    let mut started = false;
+    for i in (0..16).rev() {
+        let nibble = ((val >> (i * 4)) & 0xf) as usize;
+        if nibble != 0 || started || i == 0 {
+            started = true;
+            unsafe {
+                while (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20) == 0 {}
+                x86_64::instructions::port::Port::<u8>::new(0x3F8).write(hex[nibble]);
+            }
         }
     }
 }

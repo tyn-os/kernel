@@ -212,10 +212,7 @@ pub fn yield_to_other() {
         CURRENT.store(next, Ordering::SeqCst);
 
         // Switch to the target thread's per-thread kernel stack
-        extern "C" {
-            static mut current_kernel_stack: u64;
-        }
-        current_kernel_stack = CONTEXTS[next].kernel_stack_top;
+        crate::syscall::set_current_kernel_stack(CONTEXTS[next].kernel_stack_top);
 
         // Update TSS.IST1 to the target thread's IST stack so timer
         // interrupts use a per-thread stack (prevents iretq frame corruption

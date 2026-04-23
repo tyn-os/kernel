@@ -72,9 +72,11 @@ static mut PIPES: [Pipe; MAX_PIPES] = {
     const EMPTY: Pipe = Pipe::empty();
     [EMPTY; MAX_PIPES]
 };
+static PIPE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 /// Create a new pipe. Returns (read_fd, write_fd).
 pub fn create() -> (i32, i32) {
+    let _lock = PIPE_LOCK.lock();
     let read_fd = NEXT_PIPE_FD.fetch_add(1, Ordering::Relaxed) as i32;
     let write_fd = NEXT_PIPE_FD.fetch_add(1, Ordering::Relaxed) as i32;
 
@@ -96,36 +98,42 @@ pub fn create() -> (i32, i32) {
 
 /// Write data to a pipe. Returns bytes written.
 pub fn write(fd: i32, data: *const u8, count: usize) -> i64 {
-    // SAFETY: Single-threaded cooperative access.
-    unsafe {
-        for (idx, pipe) in PIPES.iter_mut().enumerate() {
-            if pipe.write_fd == fd {
-                let mut written = 0;
-                for i in 0..count {
-                    let byte = *data.add(i);
-                    let next_tail = (pipe.tail + 1) % PIPE_BUF_SIZE;
-                    if next_tail == pipe.head {
-                        break; // full
+    let result;
+    {
+        let _lock = PIPE_LOCK.lock();
+        result = unsafe {
+            let mut ret = -9i64; // -EBADF
+            for (idx, pipe) in PIPES.iter_mut().enumerate() {
+                if pipe.write_fd == fd {
+                    let mut written = 0;
+                    for i in 0..count {
+                        let byte = *data.add(i);
+                        let next_tail = (pipe.tail + 1) % PIPE_BUF_SIZE;
+                        if next_tail == pipe.head {
+                            break; // full
+                        }
+                        pipe.buf[pipe.tail] = byte;
+                        pipe.tail = next_tail;
+                        written += 1;
                     }
-                    pipe.buf[pipe.tail] = byte;
-                    pipe.tail = next_tail;
-                    written += 1;
+                    if fd == 205 {
+                        crate::serial_println!("[pipe] write fd=205 slot={} read_fd={} head={} tail={} written={}",
+                            idx, pipe.read_fd, pipe.head, pipe.tail, written);
+                    }
+                    ret = written as i64;
+                    break;
                 }
-                // Log the pipe state after write
-                if fd == 205 {
-                    crate::serial_println!("[pipe] write fd=205 slot={} read_fd={} head={} tail={} written={}",
-                        idx, pipe.read_fd, pipe.head, pipe.tail, written);
-                }
-                return written as i64;
             }
-        }
-    }
-    -9 // -EBADF
+            ret
+        };
+    } // _lock dropped
+    result
 }
 
 /// Read data from a pipe. Non-blocking pipes return -EAGAIN when empty.
 /// Blocking pipes yield once and return -EINTR if still empty.
 pub fn read(fd: i32, buf: *mut u8, count: usize) -> i64 {
+    let _lock = PIPE_LOCK.lock();
     // SAFETY: Single-threaded cooperative access.
     unsafe {
         for pipe in PIPES.iter_mut() {
@@ -158,12 +166,16 @@ pub fn read(fd: i32, buf: *mut u8, count: usize) -> i64 {
                     return -11; // -EAGAIN
                 }
 
-                // Blocking: yield and retry once.
-                crate::thread::yield_to_other();
-                if !pipe.is_empty() {
-                    return pipe.read(buf, count) as i64;
-                }
-                return -4; // -EINTR
+                // Blocking: yield and return -EINTR so caller retries.
+                // To prevent a tight spin when this is the only runnable
+                // thread on the CPU, HLT until the next timer tick first.
+                drop(_lock);
+                crate::sched::yield_current();
+                // If yield returned immediately (no other runnable threads),
+                // sleep until the next timer tick to avoid burning CPU.
+                x86_64::instructions::interrupts::enable();
+                x86_64::instructions::hlt();
+                return -4; // -EINTR (caller retries)
             }
         }
     }
@@ -209,6 +221,7 @@ pub fn has_data(fd: i32) -> bool {
 
 /// Close a pipe fd.
 pub fn close(fd: i32) {
+    let _lock = PIPE_LOCK.lock();
     // SAFETY: Single-threaded.
     unsafe {
         for pipe in PIPES.iter_mut() {

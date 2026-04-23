@@ -7,37 +7,81 @@ use crate::serial_println;
 use core::arch::global_asm;
 
 /// Initialize the syscall entry point via MSRs.
-pub fn init() {
-    // SAFETY: Writing MSRs to configure syscall instruction handling.
+/// Per-CPU data for syscall entry, accessed via GS segment.
+/// Layout: [0]=kernel_stack, [8]=scratch, [16]=saved_r9, [24]=saved_clone_rip
+#[repr(C, align(64))]
+struct PerCpuSyscall {
+    kernel_stack: u64,  // gs:[0]
+    scratch: u64,       // gs:[8]
+    saved_r9: u64,      // gs:[16] — R9 at syscall entry (fn ptr for clone)
+    saved_clone_rip: u64, // gs:[24] — RCX at syscall entry (return addr for child)
+}
+
+/// Per-CPU syscall data for up to 2 CPUs.
+static mut PERCPU_SYSCALL: [PerCpuSyscall; 2] = [
+    PerCpuSyscall { kernel_stack: 0, scratch: 0, saved_r9: 0, saved_clone_rip: 0 },
+    PerCpuSyscall { kernel_stack: 0, scratch: 0, saved_r9: 0, saved_clone_rip: 0 },
+];
+
+/// Set up syscall MSRs on the current CPU. Must be called on every CPU.
+/// Sets LSTAR, STAR, SFMASK, EFER.SCE, and GS_BASE for per-CPU data.
+pub fn init_cpu_msrs(cpu_id: usize) {
     unsafe {
         use x86_64::registers::model_specific::Msr;
 
         // STAR: kernel CS/SS in bits 47:32. User segment not used (ring 0).
-        let mut star = Msr::new(0xC000_0081);
-        star.write(0x10u64 << 32);
+        Msr::new(0xC000_0081).write(0x10u64 << 32);
 
         // LSTAR: syscall entry point.
-        let mut lstar = Msr::new(0xC000_0082);
-        lstar.write(syscall_entry as u64);
+        Msr::new(0xC000_0082).write(syscall_entry as u64);
 
         // SFMASK: clear IF on syscall entry.
-        let mut sfmask = Msr::new(0xC000_0084);
-        sfmask.write(0x200);
+        Msr::new(0xC000_0084).write(0x200);
 
         // Enable SCE (System Call Enable) in EFER.
         let mut efer = Msr::new(0xC000_0080);
         let val = efer.read();
         efer.write(val | 1);
+
+        // Set GS_BASE to this CPU's per-CPU syscall data.
+        // The syscall entry stub uses gs:0 for kernel stack and gs:8 for scratch.
+        let gs_base = &raw const PERCPU_SYSCALL[cpu_id] as u64;
+        Msr::new(0xC000_0101).write(gs_base); // IA32_GS_BASE
     }
-    // Initialize kernel stack pointer to thread 0's stack.
+}
+
+pub fn init() {
+    init_cpu_msrs(0);
+    // Initialize kernel stack pointer for CPU 0 (thread 0's stack).
     unsafe {
-        extern "C" { static mut current_kernel_stack: u64; }
         extern "C" { static syscall_stack_0_top: u8; }
-        current_kernel_stack = &syscall_stack_0_top as *const u8 as u64;
+        let kstack = &syscall_stack_0_top as *const u8 as u64;
+        PERCPU_SYSCALL[0].kernel_stack = kstack;
     }
-    // Mark main thread context as valid.
-    crate::thread::init_main();
     serial_println!("[syscall] MSRs configured");
+}
+
+/// Update the per-CPU kernel stack pointer (called from scheduler on context switch).
+pub fn set_current_kernel_stack(kstack: u64) {
+    let cpu = unsafe {
+        let apic_id = *((0xFEE0_0020u64) as *const u32) >> 24;
+        apic_id as usize
+    };
+    unsafe {
+        PERCPU_SYSCALL[cpu].kernel_stack = kstack;
+    }
+}
+
+/// Read saved R9 and clone RIP from this CPU's per-CPU data.
+/// These are saved at syscall entry and must be per-CPU to avoid SMP races.
+pub fn get_clone_regs() -> (u64, u64) {
+    let cpu = unsafe {
+        let apic_id = *((0xFEE0_0020u64) as *const u32) >> 24;
+        apic_id as usize
+    };
+    unsafe {
+        (PERCPU_SYSCALL[cpu].saved_r9, PERCPU_SYSCALL[cpu].saved_clone_rip)
+    }
 }
 
 // ---------- Assembly entry stub ----------
@@ -53,14 +97,8 @@ global_asm!(
     "syscall_stack_1_bottom: .space 32768",
     ".global syscall_stack_1_top",
     "syscall_stack_1_top:",
-    "saved_user_rsp: .quad 0",
     ".global last_syscall_ret",
     "last_syscall_ret: .quad 0",
-    ".global saved_r9",
-    "saved_r9: .quad 0",
-    // Current kernel stack top pointer (switches between stacks 0 and 1)
-    ".global current_kernel_stack",
-    "current_kernel_stack: .quad 0",
     ".global timer_active",
     "timer_active: .byte 0",
     ".section .text",
@@ -69,11 +107,10 @@ global_asm!(
     "syscall_entry:",
     // rcx = user return RIP (clobbered by syscall instruction)
     // r11 = user RFLAGS (clobbered by syscall instruction)
-    // Use r11 as scratch since it's already clobbered by syscall.
-    "mov r11, rsp",  // r11 = user RSP
-    "mov rsp, [rip + current_kernel_stack]",
-    // Push user RSP on kernel stack (per-thread, safe across yields)
-    "push r11",      // user RSP
+    // GS_BASE points to per-CPU data: [0]=kernel_stack, [8]=scratch
+    "mov gs:[8], rsp",           // save user RSP to per-CPU scratch
+    "mov rsp, gs:[0]",           // load per-CPU kernel stack
+    "push qword ptr gs:[8]",     // push saved user RSP onto kernel stack
     "push 0",        // alignment padding (16 pushes total = even → RSP%16=8 after call)
     // Save ALL user registers that Linux syscall ABI preserves
     "push rcx",      // return RIP
@@ -90,8 +127,10 @@ global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    // Save R9 for clone (musl passes fn in R9)
-    "mov [rip + saved_r9], r9",
+    // Save R9 for clone (musl passes fn in R9) and RCX (return RIP for child)
+    // Per-CPU via GS to avoid SMP race when both CPUs are in syscall handlers
+    "mov gs:[16], r9",
+    "mov gs:[24], rcx",
     // Shuffle: RAX=nr,RDI=a0,RSI=a1,RDX=a2,R10=a3,R8=a4,R9=a5
     //       → RDI=nr,RSI=a0,RDX=a1,RCX=a2,R8=a3,R9=a4
     "mov r9, r8",
@@ -118,24 +157,12 @@ global_asm!(
     "pop rcx",
     "mov [rip + last_syscall_ret], rcx",
     "add rsp, 8",    // skip alignment padding
-    // Restore kernel stack top for next syscall, then switch to user RSP
+    // Save kernel stack top to per-CPU data for next syscall
     "lea r11, [rsp + 8]",
-    "mov [rip + current_kernel_stack], r11",
+    "mov gs:[0], r11",           // per-CPU kernel stack update
     "pop rsp",
-    // Re-enable interrupts only after timer is active (first clone).
-    // Pre-clone: IF stays 0 so spin-waits exhaust naturally.
-    // Post-clone: IST protects red zone during timer preemption.
-    "cmp byte ptr [rip + timer_active], 1",
-    "jne 3f",
-    "sti",
-    "3:",
-    // Validate return address is in ERTS code range
-    "cmp rcx, 0x400000",
-    "jb 2f",
-    "cmp rcx, 0x900000",
-    "ja 2f",
-    "jmp rcx",
-    "2:",
+    "sti",  // Re-enable interrupts before returning to user
+    "jmp rcx",  // Return to user code
     // Bad return address — print and halt
     "push rcx",
     "push rax",
@@ -249,7 +276,7 @@ static IN_SYSCALL: [core::sync::atomic::AtomicBool; 24] = {
 
 /// Check if the CURRENT thread is inside a syscall handler.
 pub fn in_syscall() -> bool {
-    let idx = crate::thread::current_idx();
+    let idx = crate::sched::current_idx();
     if idx < 24 { IN_SYSCALL[idx].load(Ordering::Relaxed) } else { false }
 }
 
@@ -263,19 +290,25 @@ extern "C" fn syscall_dispatch(
     a3: u64,
     _a4: u64,
 ) -> i64 {
+    let idx = crate::sched::current_idx();
     {
         static SC: AtomicU64 = AtomicU64::new(0);
         let c = SC.fetch_add(1, Ordering::Relaxed);
-        // Log all syscalls that touch fd 502 (accepted socket), plus socket ops
-        if nr == 41 || nr == 43 || nr == 49 || nr == 50 || nr == 288
-           || a0 == 502 || (nr == 233 && a1 == 502) { // epoll_ctl with fd=502
-            serial_println!("[sc] #{} nr={} a0={:#x} a1={:#x}", c, nr, a0, a1);
+        if c < 10 || (c >= 130 && c <= 200) || (idx == 0 && c > 200) || (c % 50000 == 0) {
+            serial_println!("[sc] #{} nr={} a0={:#x} a1={:#x} t={}", c, nr, a0, a1, idx);
         }
     }
-    let idx = crate::thread::current_idx();
     if idx < 24 { IN_SYSCALL[idx].store(true, Ordering::Relaxed); }
     let result = syscall_dispatch_inner(nr, a0, a1, a2, a3, _a4);
     if idx < 24 { IN_SYSCALL[idx].store(false, Ordering::Relaxed); }
+    crate::sched::check_resched();
+    {
+        static SC2: AtomicU64 = AtomicU64::new(0);
+        let c = SC2.fetch_add(1, Ordering::Relaxed);
+        if c < 10 || (c >= 130 && c <= 200) || (idx == 0 && c > 200) || (c % 50000 == 0) {
+            serial_println!("[ret] #{} = {}", c, result);
+        }
+    }
     result
 }
 
@@ -354,16 +387,22 @@ fn syscall_dispatch_inner(
         SYS_FUTEX => sys_futex(a0, a1, a2),
         SYS_PPOLL => sys_ppoll(a0, a1),
         SYS_SELECT => {
-            crate::net::poll();
-            crate::thread::yield_to_other();
-            0 // timeout expired
+            // select(0, NULL, NULL, NULL, ...) is ERTS's idle poll.
+            // Don't yield — just return immediately so the scheduler loop runs fast.
+            if a0 == 0 {
+                0
+            } else {
+                crate::net::poll();
+                crate::sched::yield_current();
+                0
+            }
         }
         SYS_TIMERFD_SETTIME => 0,
         SYS_SCHED_YIELD => {
-            crate::thread::yield_to_other();
+            crate::sched::yield_current();
             0
         }
-        SYS_NANOSLEEP => { crate::thread::yield_to_other(); 0 }
+        SYS_NANOSLEEP => { crate::sched::yield_current(); 0 }
         SYS_FORK => -38, // -ENOSYS
         SYS_CLONE => {
             // Allow clone but log. With our single-scheduler ERTS patch,
@@ -435,6 +474,14 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
                 serial_println!("[pipe] write fd={} count={} result={}", fd, count, result);
             }
         }
+        // Auto-respond on erl_child_setup response pipe.
+        // When writing to the command pipe (odd fd like 205, 207, ...),
+        // simulate erl_child_setup by writing a 0 byte to the response
+        // pipe (fd - 2, which is the write end of the response pipe).
+        if fd >= 205 && fd % 2 == 1 && crate::pipe::is_pipe_fd(fd - 2) {
+            let r = crate::pipe::write(fd - 2, [0u8].as_ptr(), 1);
+            serial_println!("[auto-resp] wrote {} byte(s) to fd {}", r, fd - 2);
+        }
         result
     } else if crate::net::socket::is_socket_fd(fd) {
         let r = crate::net::socket::sys_sendto(fd, buf, count, 0, core::ptr::null(), 0);
@@ -458,7 +505,7 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     }
     // timerfd read: return expiration count (1).
     if fd == 51 {
-        crate::thread::yield_to_other();
+        crate::sched::yield_current();
         if count >= 8 {
             unsafe { *(buf as *mut u64) = 1; }
         }
@@ -486,7 +533,7 @@ fn sys_read_stdin(buf: *mut u8, count: usize) -> i64 {
             return 1;
         }
         // No data — yield and retry (non-blocking poll)
-        crate::thread::yield_to_other();
+        crate::sched::yield_current();
     }
 }
 
@@ -758,37 +805,27 @@ fn sys_clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
         return -22; // -EINVAL
     }
 
-    let clone_num = CLONE_COUNT.fetch_add(1, Ordering::Relaxed);
-    let tid = (clone_num + 2) as i32;
-
-    // Start preemptive timer on first clone. IST protects the red zone.
-    if clone_num == 0 {
-        crate::interrupts::init_timer();
-    }
-
     // musl's __clone puts arg at [stack] and passes fn through R9.
-    // SAFETY: stack points to identity-mapped user memory; saved_r9 is a BSS global.
-    let fn_ptr = unsafe {
-        extern "C" { static saved_r9: u64; }
-        core::ptr::read_volatile(&saved_r9)
-    };
+    // Read from per-CPU GS data (set at syscall entry).
+    let (fn_ptr, _) = get_clone_regs();
 
-    // CLONE_PARENT_SETTID: write TID to parent_tid (ptid).
-    // Do NOT write to child_tid (ctid) — musl passes &__thread_list_lock
-    // as ctid for CLONE_CHILD_CLEARTID (kernel clears it on thread exit).
+    // saved_clone_rip is set in the assembly stub (RCX = return RIP from syscall)
+    // The child reads it in clone_child_return to return to musl's __clone
+
+    // Use the SMP scheduler to create the thread
+    let tid = crate::sched::spawn(fn_ptr, stack, tls, child_tid);
+
+    // CLONE_PARENT_SETTID (0x00100000): write TID to parent_tid.
     if (flags & 0x00100000) != 0 && parent_tid != 0 {
-        // SAFETY: parent_tid points to user memory.
-        unsafe { *(parent_tid as *mut u32) = tid as u32; }
+        unsafe { *(parent_tid as *mut u32) = tid; }
+    }
+    // CLONE_CHILD_SETTID (0x01000000): write TID to child_tid.
+    // Must happen before clone returns so the parent sees it immediately.
+    if (flags & 0x01000000) != 0 && child_tid != 0 {
+        unsafe { *(child_tid as *mut u32) = tid; }
     }
 
-    serial_println!("[clone] #{} tid={} ptid={:#x} ctid={:#x}", clone_num, tid, parent_tid, child_tid);
-
-    // Create cooperative threads for all clones.
-    // SAFETY: fn_ptr and stack are from musl's pthread_create.
-    unsafe {
-        crate::thread::spawn(fn_ptr, stack, 0, tls, child_tid);
-    }
-
+    serial_println!("[clone] tid={} fn={:#x}", tid, fn_ptr);
     tid as i64
 }
 
@@ -797,7 +834,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
 /// struct epoll_event { u32 events; u64 data; } = 12 bytes
 fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64) -> i64 {
     crate::net::poll();
-    crate::thread::yield_to_other();
+    crate::sched::yield_current();
 
     // Check for pipe data
     let mut count = 0i64;
@@ -823,7 +860,7 @@ fn sys_ppoll(fds_ptr: u64, nfds: u64) -> i64 {
     // socket readiness before we check pollfds.
     crate::net::poll();
 
-    crate::thread::yield_to_other();
+    crate::sched::yield_current();
 
     // Debug: log first ppoll that includes socket fds
     {
@@ -897,27 +934,13 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
     let cmd = (op & 0x7f) as u32; // mask FUTEX_PRIVATE_FLAG
     match cmd {
         0 | 9 => {
-            // FUTEX_WAIT / FUTEX_WAIT_BITSET: block until value changes.
-            // Sleep the thread and let the timer wake it periodically
-            // to recheck. This prevents the thread from consuming CPU
-            // while waiting for a lock holder to release.
-            let current = unsafe { *(uaddr as *const u32) };
-            if current != val as u32 {
-                return -11; // -EAGAIN
-            }
-            crate::thread::futex_sleep(uaddr, val as u32);
-            0
+            // FUTEX_WAIT / FUTEX_WAIT_BITSET: atomically check-and-sleep
+            // under a per-address spinlock (SMP-safe).
+            crate::sched::futex_wait(uaddr, val as u32)
         }
         1 => {
-            // FUTEX_WAKE: wake sleeping threads, then yield N times
-            // to give EVERY thread a chance to see the value change
-            // before any thread can re-lock the mutex.
-            let woken = crate::thread::futex_wake(uaddr, val as u32);
-            // Yield to all threads so the waiter sees the unlock
-            for _ in 0..crate::thread::num_threads() {
-                crate::thread::yield_to_other();
-            }
-            if woken > 0 { woken } else { 1 }
+            // FUTEX_WAKE: wake up to `val` threads, send IPI if target idle.
+            crate::sched::futex_wake(uaddr, val as u32)
         }
         _ => 0,
     }
@@ -1026,6 +1049,7 @@ pub fn jump_to_user(entry: u64, user_stack_top: u64) -> ! {
         core::arch::asm!(
             "mov rsp, {sp}",
             "xor rbp, rbp",
+            "sti",  // Enable interrupts for ERTS execution
             "jmp {entry}",
             sp = in(reg) user_stack_top,
             entry = in(reg) entry,

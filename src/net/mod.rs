@@ -37,6 +37,7 @@ impl NetState {
 }
 
 static mut NET_STATE: Option<NetState> = None;
+static NET_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 /// Initialize networking with a virtio-net PCI transport.
 /// Called from main.rs after PCI enumeration finds a network device.
@@ -69,11 +70,12 @@ pub fn init_with_transport(transport: PciTransport) {
     serial_println!("[net] initialized, IP={}", interface::KERNEL_IP);
 }
 
-/// Access the global network state.
+/// Access the global network state (SMP-safe via spinlock).
 pub fn with_net<F, R>(f: F) -> R
 where
     F: FnOnce(&mut NetState) -> R,
 {
+    let _lock = NET_LOCK.lock();
     unsafe {
         match NET_STATE.as_mut() {
             Some(state) => f(state),
@@ -82,8 +84,9 @@ where
     }
 }
 
-/// Poll the network stack (call from ppoll/timer).
+/// Poll the network stack (SMP-safe via spinlock).
 pub fn poll() {
+    let _lock = NET_LOCK.lock();
     unsafe {
         if let Some(state) = NET_STATE.as_mut() {
             state.poll();

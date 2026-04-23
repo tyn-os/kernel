@@ -1,75 +1,51 @@
 //! IDT with exception handlers, timer interrupt with IST.
 
 use crate::serial_println;
-use spin::Mutex;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use x86_64::structures::tss::TaskStateSegment;
-use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor};
-use x86_64::VirtAddr;
 
-/// Interrupt stack for the timer handler (avoids red zone corruption).
-#[repr(align(16))]
-struct AlignedStack([u8; 16384]);
-static mut TIMER_IST_STACK: AlignedStack = AlignedStack([0; 16384]);
+/// Shared IDT — initialized once by BSP, loaded on all CPUs.
+/// Not behind a Mutex because it's write-once then read-only.
+static mut IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
 
-/// TSS with IST1 pointing to the timer interrupt stack.
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
-
-/// GDT with kernel code segment + TSS descriptor.
-static mut GDT: GlobalDescriptorTable = GlobalDescriptorTable::new();
-
-static IDT: Mutex<InterruptDescriptorTable> = Mutex::new(InterruptDescriptorTable::new());
-
-/// Set up GDT with TSS, then load IDT with IST-enabled timer handler.
+/// Set up the shared IDT and per-CPU GDT/TSS for the BSP.
+/// APs call `load_idt()` after their own GDT/TSS is set up via `percpu::init_cpu`.
 pub fn init_idt() {
-    // Set up TSS with IST1 = timer interrupt stack
+    // Initialize per-CPU GDT+TSS for BSP (cpu 0, apic 0)
+    crate::percpu::init_cpu(0, 0);
+
+    // Set up the shared IDT (only BSP writes to it, before APs exist)
     unsafe {
-        let stack_top = &TIMER_IST_STACK.0 as *const u8 as u64 + 16384;
-        TSS.interrupt_stack_table[0] = VirtAddr::new(stack_top); // IST1
+        IDT.page_fault.set_handler_fn(page_fault_handler);
+        IDT.double_fault.set_handler_fn(double_fault_handler);
+        IDT.general_protection_fault.set_handler_fn(gpf_handler);
+        IDT.breakpoint.set_handler_fn(breakpoint_handler);
+        IDT.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        IDT.device_not_available.set_handler_fn(device_not_available_handler);
+        IDT.simd_floating_point.set_handler_fn(simd_handler);
+        // Timer at vector 32 — NO IST so the frame stays on the current thread's
+        // stack, allowing preemptive context switch from the timer handler.
+        IDT[32].set_handler_fn(timer_handler);
+        // IPI handler for SMP wakeup (vector 34)
+        IDT[34].set_handler_fn(ipi_handler);
+        // Spurious interrupt handler for APIC (vector 0xFF)
+        IDT[0xFF].set_handler_fn(spurious_handler);
+        IDT.load_unsafe();
     }
-
-    // GDT layout must match boot: null(0x00), code32(0x08), code64(0x10), data(0x18).
-    // Boot assembly set CS=0x10 (code64). We append TSS after.
-    let tss_sel = unsafe {
-        // 0x08: placeholder (boot had 32-bit code here)
-        GDT.add_entry(Descriptor::kernel_code_segment());
-        // 0x10: 64-bit kernel code (CS points here)
-        GDT.add_entry(Descriptor::kernel_code_segment());
-        // 0x18: kernel data
-        GDT.add_entry(Descriptor::kernel_data_segment());
-        // 0x20: TSS (takes 2 GDT slots)
-        let ts = GDT.add_entry(Descriptor::tss_segment(&TSS));
-        GDT.load_unsafe();
-        ts
-    };
-
-    // Load the task register
-    unsafe { x86_64::instructions::tables::load_tss(tss_sel); }
-
-    // Set up IDT
-    let mut idt = IDT.lock();
-    idt.page_fault.set_handler_fn(page_fault_handler);
-    idt.double_fault.set_handler_fn(double_fault_handler);
-    idt.general_protection_fault.set_handler_fn(gpf_handler);
-    idt.breakpoint.set_handler_fn(breakpoint_handler);
-    idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
-    idt.device_not_available.set_handler_fn(device_not_available_handler);
-    idt.simd_floating_point.set_handler_fn(simd_handler);
-    // Timer at vector 32 with IST1 — uses dedicated stack, avoids red zone
-    unsafe {
-        idt[32].set_handler_fn(timer_handler)
-            .set_stack_index(0); // IST1 (0-indexed in API = IST entry 1)
-    }
-    spin::MutexGuard::leak(idt).load();
 }
 
 /// Update TSS.IST1 to the given stack top address. Called during context
 /// switch so each thread gets its own timer interrupt stack.
-pub fn set_ist1(stack_top: u64) {
-    unsafe {
-        TSS.interrupt_stack_table[0] = VirtAddr::new(stack_top);
-    }
+/// With per-CPU TSS (SMP), this is handled differently — each CPU has
+/// its own IST via percpu::init_cpu. This is kept for OTP 20 compatibility.
+pub fn set_ist1(_stack_top: u64) {
+    // Per-CPU TSS handles IST stacks now. This is a no-op.
+    // For SMP, each CPU's TSS.IST1 is set in percpu::init_cpu.
+}
+
+/// Load the shared IDT on the current CPU. Called by APs after percpu::init_cpu.
+pub fn load_idt() {
+    unsafe { IDT.load_unsafe(); }
 }
 
 /// Initialize the PIT (Programmable Interval Timer) at ~100 Hz.
@@ -114,42 +90,45 @@ pub fn init_timer() {
     x86_64::instructions::interrupts::enable();
 }
 
-extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
-    // EOI first.
-    unsafe {
-        x86_64::instructions::port::Port::<u8>::new(0x20).write(0x20);
+extern "x86-interrupt" fn timer_handler(frame: InterruptStackFrame) {
+    // EOI to APIC (PIC is disabled)
+    crate::apic::eoi();
+
+    // Watchdog: every ~1 second (100 ticks), check for blocked threads
+    // with changed futex values (missed wake events).
+    static WD_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let tick = WD_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if tick % 100 == 0 && tick > 0 {
+        crate::sched::watchdog_wake();
     }
-    // Wake sleeping threads and preempt the current thread.
-    // The ERTS binary is patched to skip the monotonic time backwards check.
-    crate::thread::check_futex_waiters();
-    crate::thread::yield_to_other();
+
+    // Preempt user-mode code directly. The x86-interrupt calling convention
+    // saves ALL registers, so context_switch in yield_current is safe.
+    // Without IST, the interrupt frame stays on the thread's stack —
+    // no IST sharing corruption when switching threads.
+    const KERNEL_BASE: u64 = 0x0F00_0000; // kernel .text starts at 240 MiB
+    let ip = frame.instruction_pointer.as_u64();
+    if ip < KERNEL_BASE {
+        // Interrupted user-mode code — preempt if there are other threads
+        crate::sched::yield_current();
+    } else {
+        // Interrupted kernel code — defer (set flag, check at syscall exit)
+        crate::sched::timer_tick();
+    }
 }
 
 extern "x86-interrupt" fn page_fault_handler(
     frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    let last_ret = unsafe {
-        extern "C" { static last_syscall_ret: u64; }
-        core::ptr::read_volatile(&last_syscall_ret)
-    };
-    let thread_idx = crate::thread::current_idx();
-    serial_println!("#PF ip={:#x} cr2={:#x} err={:?} sc_ret={:#x} thread={}",
-        frame.instruction_pointer, Cr2::read_raw(), error_code, last_ret, thread_idx);
-    // Dump bytes at crash IP to see what instruction is there
-    let ip = frame.instruction_pointer.as_u64() as *const u8;
-    let bytes: [u8; 16] = unsafe {
-        let mut b = [0u8; 16];
-        for i in 0..16 { b[i] = *ip.add(i); }
-        b
-    };
-    serial_println!("  code: {:02x?}", bytes);
-    // Dump RSP area
-    let rsp = frame.stack_pointer.as_u64() as *const u64;
-    for i in 0..4 {
-        let v = unsafe { *rsp.add(i) };
-        serial_println!("  [rsp+{}] = {:#x}", i*8, v);
-    }
+    // Use lock-free serial writes for crash output (works even if another CPU holds the lock)
+    crate::serial::raw_str_nolock(b"\n#PF ip=");
+    crate::serial::raw_hex_nolock(frame.instruction_pointer.as_u64());
+    crate::serial::raw_str_nolock(b" cr2=");
+    crate::serial::raw_hex_nolock(Cr2::read_raw());
+    crate::serial::raw_str_nolock(b" rsp=");
+    crate::serial::raw_hex_nolock(frame.stack_pointer.as_u64());
+    crate::serial::raw_str_nolock(b"\n");
     crate::halt_loop();
 }
 
@@ -157,20 +136,25 @@ extern "x86-interrupt" fn double_fault_handler(
     _frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
-    crate::serial::raw_str(b"DOUBLE FAULT\n");
+    crate::serial::raw_str_nolock(b"\nDOUBLE FAULT\n");
     crate::halt_loop();
 }
 
 extern "x86-interrupt" fn gpf_handler(frame: InterruptStackFrame, _error_code: u64) {
-    serial_println!("#GP at {:#x}", frame.instruction_pointer);
+    crate::serial::raw_str_nolock(b"\n#GP ip=");
+    crate::serial::raw_hex_nolock(frame.instruction_pointer.as_u64());
+    crate::serial::raw_str_nolock(b" rsp=");
+    crate::serial::raw_hex_nolock(frame.stack_pointer.as_u64());
+    crate::serial::raw_str_nolock(b"\n");
     crate::halt_loop();
 }
 
 extern "x86-interrupt" fn breakpoint_handler(_frame: InterruptStackFrame) {}
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
-    serial_println!("#UD at {:#x} rsp={:#x} thread={}",
-        frame.instruction_pointer, frame.stack_pointer, crate::thread::current_idx());
+    crate::serial::raw_str_nolock(b"\n#UD ip=");
+    crate::serial::raw_hex_nolock(frame.instruction_pointer.as_u64());
+    crate::serial::raw_str_nolock(b"\n");
     crate::halt_loop();
 }
 
@@ -182,4 +166,13 @@ extern "x86-interrupt" fn device_not_available_handler(_frame: InterruptStackFra
 extern "x86-interrupt" fn simd_handler(_frame: InterruptStackFrame) {
     crate::serial::raw_str(b"#XM\n");
     crate::halt_loop();
+}
+
+extern "x86-interrupt" fn ipi_handler(_frame: InterruptStackFrame) {
+    // Just EOI — no serial output to keep the handler minimal
+    crate::apic::eoi();
+}
+
+extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {
+    // Spurious interrupts from the APIC — no EOI needed
 }

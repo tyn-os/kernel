@@ -18,9 +18,9 @@ const MMCONFIG_BASE: usize = 0xB000_0000;
 extern "C" fn main(_mbi: *const u8) -> ! {
     serial_println!("=== Tyn Kernel v{} ===", env!("CARGO_PKG_VERSION"));
 
-    tyn_kernel::interrupts::init_idt();
     tyn_kernel::memory::heap::init_static();
     tyn_kernel::drivers::virtio::hal::init_dma();
+    tyn_kernel::interrupts::init_idt();
 
     // Clear CR0.TS (Task Switched) to allow SSE instructions in user code.
     // SAFETY: Clearing TS only affects FPU/SSE lazy state saving.
@@ -30,6 +30,26 @@ extern "C" fn main(_mbi: *const u8) -> ! {
 
     // NOTE: CR4.TSD can't trap RDTSC in ring 0 (we run everything in ring 0).
     // The ERTS time-backwards issue from timer preemption needs a different fix.
+
+    // Discover CPUs via ACPI MADT and initialize APIC
+    let acpi_info = tyn_kernel::acpi::discover_cpus();
+    if let Some(ref info) = acpi_info {
+        serial_println!("[boot] {} CPUs available", info.num_cpus);
+        let ioapic_addr = info.ioapic.as_ref().map(|io| io.address);
+        tyn_kernel::apic::init_bsp(info.local_apic_addr, ioapic_addr);
+    }
+
+    // Initialize SMP scheduler
+    let ncpus = acpi_info.as_ref().map(|i| i.num_cpus).unwrap_or(1);
+    tyn_kernel::sched::init(ncpus);
+
+    // Boot Application Processors (if multi-CPU)
+    // Disable interrupts during AP bringup to prevent heap allocator races
+    if let Some(ref info) = acpi_info {
+        x86_64::instructions::interrupts::disable();
+        tyn_kernel::smp::boot_aps(info);
+        x86_64::instructions::interrupts::enable();
+    }
 
     // Initialize virtio-net via PCI enumeration
     init_networking();
@@ -90,13 +110,17 @@ extern "C" fn main(_mbi: *const u8) -> ! {
     unsafe {
         // Put argv strings near top of stack
         let args: &[&[u8]] = &[
-            b"/otp/erts-9.3/bin/beam\0",
+            b"/otp/erts-15.2.7/bin/beam.smp\0",
+            b"-S\0", b"1\0",
+            b"-SDcpu\0", b"1\0",
+            b"-SDio\0", b"1\0",
+            b"-A\0", b"0\0",
             b"--\0",
             b"-root\0", b"/otp\0",
-            b"-bindir\0", b"/otp/erts-9.3/bin\0",
+            b"-bindir\0", b"/otp/erts-15.2.7/bin\0",
             b"-noshell\0",
             b"-noinput\0",
-            b"-eval\0", b"{ok,L}=gen_tcp:listen(8080,[]),erlang:display({listen,ok}),{ok,C}=gen_tcp:accept(L),erlang:display({accepted,C}),gen_tcp:send(C,\"Hi Tyn\\n\"),gen_tcp:close(C),erlang:display(done).\0",
+            b"-eval\0", b"erlang:display({otp27,erlang:system_info(otp_release)}).\0",
         ];
         let mut arg_ptrs = [0u64; 20];
         for (i, arg) in args.iter().enumerate() {
@@ -109,9 +133,9 @@ extern "C" fn main(_mbi: *const u8) -> ! {
         // Put environment variables
         let envs: &[&[u8]] = &[
             b"ROOTDIR=/otp\0",
-            b"BINDIR=/otp/erts-9.3/bin\0",
+            b"BINDIR=/otp/erts-15.2.7/bin\0",
             b"EMU=beam\0",
-            b"PROGNAME=beam\0",
+            b"PROGNAME=beam.smp\0",
         ];
         let mut env_ptrs = [0u64; 8];
         for (i, env) in envs.iter().enumerate() {

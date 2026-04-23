@@ -6,12 +6,17 @@
 
 extern crate alloc;
 
+pub mod acpi;
+pub mod apic;
 pub mod drivers;
 pub mod elf;
 pub mod interrupts;
 pub mod memory;
 pub mod net;
+pub mod percpu;
+pub mod sched;
 pub mod serial;
+pub mod smp;
 pub mod syscall;
 pub mod pipe;
 pub mod thread;
