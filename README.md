@@ -8,11 +8,11 @@ No Linux. No POSIX. Just your Erlang/Elixir/Gleam code on bare metal.
 
 Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~3,200 lines of Rust, targeting KVM/QEMU cloud deployments.
 
-The BEAM already has its own process model, scheduler, memory management, and distribution protocol. Linux sits underneath adding 30 million lines of unverified C that the BEAM neither needs nor benefits from. Tyn removes that.
+The BEAM already has its own process model, scheduler, memory management, and distribution protocol. Linux sits underneath adding 40 million lines of unverified C that the BEAM neither needs nor benefits from. Tyn removes that.
 
 ## Why?
 
-**Security.** A typical Linux kernel has thousands of CVEs across subsystems your BEAM workload never touches — USB drivers, filesystem code, GPU support. Tyn has none of that. The attack surface is a few thousand lines of Rust instead of 30 million lines of C.
+**Security.** A typical Linux kernel has thousands of CVEs across subsystems your BEAM workload never touches — USB drivers, filesystem code, GPU support. Tyn has none of that. The attack surface is a few thousand lines of Rust instead of 40 million lines of C.
 
 **Simplicity.** Everything in a Tyn image is either BEAM bytecode or Rust compiled for this kernel. Nothing else. No systemd, no shell, no package manager, no users, no cron.
 
