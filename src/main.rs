@@ -111,10 +111,10 @@ extern "C" fn main(_mbi: *const u8) -> ! {
         // Put argv strings near top of stack
         let args: &[&[u8]] = &[
             b"/otp/erts-15.2.7/bin/beam.smp\0",
-            b"-S\0", b"1\0",
-            b"-SDcpu\0", b"1\0",
+            b"-S\0", b"2:2\0",
+            b"-SDcpu\0", b"1:1\0",
             b"-SDio\0", b"1\0",
-            b"-A\0", b"0\0",
+            b"-A\0", b"1\0",
             b"--\0",
             b"-root\0", b"/otp\0",
             b"-bindir\0", b"/otp/erts-15.2.7/bin\0",
