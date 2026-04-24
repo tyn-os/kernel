@@ -6,7 +6,7 @@
 use linked_list_allocator::LockedHeap;
 
 /// Heap size: 64 KiB (static array, no page table ops needed).
-const HEAP_SIZE: usize = 512 * 1024;
+const HEAP_SIZE: usize = 2 * 1024 * 1024;
 
 static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 

@@ -120,7 +120,7 @@ extern "C" fn main(_mbi: *const u8) -> ! {
             b"-bindir\0", b"/otp/erts-15.2.7/bin\0",
             b"-noshell\0",
             b"-noinput\0",
-            b"-eval\0", b"erlang:display({otp27,erlang:system_info(otp_release)}).\0",
+            b"-eval\0", b"erlang:display({otp27,erlang:system_info(otp_release)}), 'Elixir.IO':puts(<<\"Hello from Elixir on Tyn!\">>).\0",
         ];
         let mut arg_ptrs = [0u64; 20];
         for (i, arg) in args.iter().enumerate() {

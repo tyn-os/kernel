@@ -41,7 +41,7 @@ pub unsafe fn relocate(dest: usize) {
 static NEXT_VFS_FD: AtomicU64 = AtomicU64::new(1000);
 
 /// Maximum number of simultaneously open VFS files.
-const MAX_OPEN: usize = 32;
+const MAX_OPEN: usize = 256;
 
 /// An open VFS file — tracks position within the archive data.
 struct OpenFile {
@@ -103,13 +103,15 @@ fn cpio_lookup(path: &[u8]) -> Option<(usize, usize)> {
             break;
         }
 
-        // Compare with requested path (try with and without leading /)
-        let matches = if path.first() == Some(&b'/') {
-            // Caller passed "/otp/bin/start.boot", archive has "otp/bin/start.boot"
-            entry_name == &path[1..]
+        // Compare with requested path (normalize leading / and ./)
+        let normalized = if path.starts_with(b"/") {
+            &path[1..]
+        } else if path.starts_with(b"./") {
+            &path[2..]
         } else {
-            entry_name == path
+            path
         };
+        let matches = entry_name == normalized;
 
         if matches {
             return Some((data_start, filesize));

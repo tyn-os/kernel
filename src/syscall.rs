@@ -17,11 +17,13 @@ struct PerCpuSyscall {
     saved_clone_rip: u64, // gs:[24] — RCX at syscall entry (return addr for child)
 }
 
-/// Per-CPU syscall data for up to 2 CPUs.
-static mut PERCPU_SYSCALL: [PerCpuSyscall; 2] = [
-    PerCpuSyscall { kernel_stack: 0, scratch: 0, saved_r9: 0, saved_clone_rip: 0 },
-    PerCpuSyscall { kernel_stack: 0, scratch: 0, saved_r9: 0, saved_clone_rip: 0 },
-];
+const MAX_CPUS: usize = 16;
+
+/// Per-CPU syscall data for up to 16 CPUs.
+static mut PERCPU_SYSCALL: [PerCpuSyscall; MAX_CPUS] = {
+    const EMPTY: PerCpuSyscall = PerCpuSyscall { kernel_stack: 0, scratch: 0, saved_r9: 0, saved_clone_rip: 0 };
+    [EMPTY; MAX_CPUS]
+};
 
 /// Set up syscall MSRs on the current CPU. Must be called on every CPU.
 /// Sets LSTAR, STAR, SFMASK, EFER.SCE, and GS_BASE for per-CPU data.
@@ -294,20 +296,13 @@ extern "C" fn syscall_dispatch(
     {
         static SC: AtomicU64 = AtomicU64::new(0);
         let c = SC.fetch_add(1, Ordering::Relaxed);
-        if c < 10 || (c >= 130 && c <= 200) || (idx == 0 && c > 200) || (c % 50000 == 0) {
-            serial_println!("[sc] #{} nr={} a0={:#x} a1={:#x} t={}", c, nr, a0, a1, idx);
-        }
+        let _ = c; // logging disabled for clean ERTS output
     }
     if idx < 24 { IN_SYSCALL[idx].store(true, Ordering::Relaxed); }
     let result = syscall_dispatch_inner(nr, a0, a1, a2, a3, _a4);
     if idx < 24 { IN_SYSCALL[idx].store(false, Ordering::Relaxed); }
     crate::sched::check_resched();
     {
-        static SC2: AtomicU64 = AtomicU64::new(0);
-        let c = SC2.fetch_add(1, Ordering::Relaxed);
-        if c < 10 || (c >= 130 && c <= 200) || (idx == 0 && c > 200) || (c % 50000 == 0) {
-            serial_println!("[ret] #{} = {}", c, result);
-        }
     }
     result
 }
@@ -378,6 +373,19 @@ fn syscall_dispatch_inner(
         }
         SYS_CLOCK_GETTIME => sys_clock_gettime(a0 as i32, a1 as *mut u64),
         SYS_WRITEV => sys_writev(a0 as i32, a1 as *const IoVec, a2 as usize),
+        19 => { // readv — scatter read
+            let iov = a1 as *const IoVec;
+            let iovcnt = a2 as usize;
+            let mut total = 0i64;
+            for i in 0..iovcnt {
+                let v = unsafe { &*iov.add(i) };
+                let n = sys_read(a0 as i32, v.base as *mut u8, v.len);
+                if n < 0 { if total == 0 { return n; } else { break; } }
+                total += n;
+                if (n as usize) < v.len { break; }
+            }
+            total
+        }
         SYS_GETRANDOM => sys_getrandom(a0 as *mut u8, a1 as usize),
         SYS_GETCWD => sys_getcwd(a0 as *mut u8, a1 as usize),
         SYS_TKILL | SYS_TGKILL => 0,
@@ -683,6 +691,13 @@ fn sys_open(a0: u64, a1: u64, nr: u64) -> i64 {
         return vfs_fd;
     }
 
+    // Log failed opens for .beam files (debugging standard_error loading)
+    if path.len() > 5 && &path[path.len()-5..] == b".beam" {
+        if let Ok(s) = core::str::from_utf8(path) {
+            serial_println!("[vfs] ENOENT {}", s);
+        }
+    }
+
     // If no VFS file found, check if it's a directory we can list
     if crate::vfs::is_dir_prefix(path) {
         // Return a directory fd. Use fd 900+N for directory fds.
@@ -846,6 +861,16 @@ fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64) -> i64 {
             let ev = events_ptr as *mut u8;
             *(ev as *mut u32) = EPOLLIN;
             *((ev as u64 + 4) as *mut u64) = 200;
+        }
+        count += 1;
+    }
+
+    // Check socket readiness (for gen_tcp accept/recv)
+    if count < max as i64 && crate::net::socket::any_socket_ready() {
+        unsafe {
+            let ev = (events_ptr + (count as u64) * 12) as *mut u8;
+            *(ev as *mut u32) = EPOLLIN;
+            *((ev as u64 + 4) as *mut u64) = 500; // socket fd base
         }
         count += 1;
     }

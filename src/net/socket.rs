@@ -206,23 +206,29 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
         return -95; // -EOPNOTSUPP
     }
 
-    // Check if the listening socket has an established connection
-    let (is_active, is_open, state) = crate::net::with_net(|net| {
-        let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-        (tcp.is_active(), tcp.is_open(), tcp.state())
-    });
+    // Poll the network and wait for an incoming connection.
+    // For blocking sockets, loop with poll + yield until established.
+    loop {
+        crate::net::poll();
 
-    crate::serial_println!("[accept] fd={} active={} open={} state={:?}",
-        fd, is_active, is_open, state);
+        let state = crate::net::with_net(|net| {
+            let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+            tcp.state()
+        });
 
-    if state != tcp::State::Established && state != tcp::State::CloseWait {
+        if state == tcp::State::Established || state == tcp::State::CloseWait {
+            break;
+        }
+
         if sock.nonblock || (flags & 0x800) != 0 {
             return -11; // -EAGAIN
         }
-        return -11; // -EAGAIN
+
+        // Blocking: yield and retry
+        crate::sched::yield_current();
     }
 
-    crate::serial_println!("[accept] proceeding! state={:?}", state);
+    crate::serial_println!("[accept] connection established!");
 
     // Connection established on the listening socket.
     // In smoltcp, a listening socket transitions to "established" when
@@ -519,6 +525,19 @@ pub fn poll_socket(fd: i32) -> u16 {
             }
         }
     })
+}
+
+/// Check if any socket has a pending event (connection ready, data available).
+pub fn any_socket_ready() -> bool {
+    unsafe {
+        for sock in SOCKETS.iter() {
+            if sock.fd < 0 { continue; }
+            if poll_socket(sock.fd) & 0x0001 != 0 { // POLLIN
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Close a socket fd

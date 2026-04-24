@@ -6,7 +6,7 @@ No Linux. No POSIX. Just your Erlang/Elixir/Gleam code on bare metal.
 
 ## What is Tyn?
 
-Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~3,200 lines of Rust, targeting KVM/QEMU cloud deployments.
+Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~5,000 lines of Rust, targeting KVM/QEMU cloud deployments.
 
 The BEAM already has its own process model, scheduler, memory management, and distribution protocol. Linux sits underneath adding 40 million lines of unverified C that the BEAM neither needs nor benefits from. Tyn removes that.
 
@@ -28,13 +28,13 @@ The BEAM already has its own process model, scheduler, memory management, and di
 ├─────────────────────────────────────────┤
 │  OTP / Supervision Trees                │
 ├─────────────────────────────────────────┤
-│  ERTS / BEAM VM (unmodified)            │
+│  ERTS / BEAM VM (unmodified, SMP)       │
 ├─────────────────────────────────────────┤
 │  BEAM Host Interface (Rust)             │
 │  ~50 Linux syscalls emulated            │
 ├─────────────────────────────────────────┤
-│  Tyn Kernel (Rust, ~3,200 LOC)          │
-│  Memory · Interrupts · VFS · Serial I/O │
+│  Tyn Kernel (Rust, ~5,000 LOC)          │
+│  SMP · Memory · Networking · VFS · I/O  │
 ├─────────────────────────────────────────┤
 │  KVM / QEMU / Cloud Hypervisor          │
 └─────────────────────────────────────────┘
@@ -44,55 +44,38 @@ Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP shi
 
 ## Status
 
-**Phase 3 complete — BEAM runs on bare metal with TCP networking.**
+**OTP 27 BEAM running on bare metal with SMP + TCP networking + Elixir.**
 
 ```
-=== Tyn Kernel v0.1.0 ===
-[pci] 0:2.0 VirtIO Network
-[net] MAC=[52, 54, 00, 12, 34, 56]
-[net] initialized, IP=10.0.2.15
-[vfs] cpio: 155 files, 8113152 bytes
-...51 .beam files loaded...
-{listen,ok}
-{accepted,#Port<0.155>}
-done
+{otp27,"27"}
+Hello from Elixir on Tyn!
+{tcp_listen,{ok,#Port<0.3>}}
 ```
 
-```
-$ echo "hello" | nc localhost 5555
-Hi Tyn
-```
-
-- ERTS boots, loads 51 .beam files, starts 25 OTP processes
-- `gen_tcp:listen` → `gen_tcp:accept` → `gen_tcp:send` works end-to-end
-- Host connects via `nc`, receives response from Erlang code running on Tyn
-- Full path: ERTS → syscall → smoltcp → virtio-net → QEMU → host
+- OTP 27 ERTS boots with 8 CPUs, loads 83+ .beam files from in-memory VFS
+- Full OTP kernel application starts — supervision trees, code_server, logger
+- Elixir modules load and execute (`IO.puts` works)
+- `gen_tcp:listen` succeeds — smoltcp TCP/IP stack wired to virtio-net
+- 8-CPU SMP with per-CPU syscall state, preemptive scheduling, APIC timers
 
 ### What works
 
-- Multiboot2 boot with identity-mapped 4 GiB address space
-- GDT, IDT, TSS with IST for safe interrupt handling
-- PIT timer (100 Hz) with preemptive scheduling
-- ~50 Linux syscalls emulated (mmap, read, write, open, stat, pipe, ppoll, futex, clone, ...)
-- POSIX socket layer (socket, bind, listen, accept, send, recv, setsockopt, getsockopt)
-- ELF loader for static musl binaries
-- In-memory VFS backed by cpio archive (start.boot + kernel/stdlib .beam files)
-- Directory listing (getdents64) for OTP code_server
-- Cooperative and preemptive threading (up to 24 threads)
-- Per-thread kernel stacks and IST stacks
-- Monotonic clock via RDTSC
-- COM1 serial I/O (stdin/stdout/stderr)
-- PCI bus enumeration (ECAM on q35)
-- virtio-net driver via [virtio-drivers](https://github.com/rcore-os/virtio-drivers)
-- TCP/IP networking via [smoltcp](https://github.com/smoltcp-rs/smoltcp)
-- gen_tcp:listen/accept/send works — Erlang TCP server serves responses to host clients
+- **SMP** — ACPI MADT parsing, Local APIC timer calibration, AP trampoline (16-bit → 64-bit), per-CPU GDT/TSS/IST, GS_BASE per-CPU syscall data, IPI wakeup
+- **Preemptive scheduling** — timer yields user-mode code directly, deferred reschedule for kernel-mode, per-CPU run queues with load balancing
+- **~50 Linux syscalls** — mmap, read, write, open, stat, pipe, ppoll, futex, clone, epoll, select, readv, ...
+- **Networking** — POSIX socket layer → smoltcp TCP/IP → virtio-net PCI → QEMU, gen_tcp:listen works
+- **VFS** — cpio newc archive with 480+ files (OTP kernel/stdlib + Elixir core .beam files)
+- **Boot** — Multiboot1, identity-mapped 4 GiB (1 GiB huge pages), ELF loader for static musl binaries
+- **Interrupts** — IDT with IST, APIC EOI, lock-free crash handlers for SMP
+- **Threading** — up to 16 threads, per-thread kernel stacks, atomic futex with per-address spinlocks
+- **Time** — monotonic clock via RDTSC, APIC timer calibration against PIT
+- **I/O** — COM1 serial (stdin/stdout/stderr), PCI ECAM enumeration
 
 ### What's next
 
-- **Interactive shell** — full stdin support so the Erlang shell accepts typed input
-- **OTP 27 SMP** — multi-CPU kernel support to run modern ERTS with threading
-- **Virtio networking** — connect ERTS inet to the virtio-net driver
+- **TCP accept** — fix blocking accept loop for OTP 27's inet driver
 - **Phoenix application** — run a web framework on Tyn
+- **Interactive shell** — full stdin support so the Erlang shell accepts typed input
 - **Formal verification** — Verus proofs for critical kernel paths
 
 ## Building & Running
@@ -116,7 +99,7 @@ cargo build --release --target x86_64-tyn.json \
 ```bash
 qemu-system-x86_64 \
   -kernel target/x86_64-tyn/release/tyn-kernel \
-  -m 2G -machine q35 -cpu host -enable-kvm \
+  -m 2560M -machine q35 -cpu host -enable-kvm -smp 8 \
   -nographic -no-reboot -serial mon:stdio \
   -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off \
   -netdev user,id=net0,hostfwd=tcp::5555-:8080
