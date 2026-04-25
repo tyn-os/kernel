@@ -71,12 +71,9 @@ extern "C" fn main(_mbi: *const u8) -> ! {
     static HELLO_ELF: &[u8] = include_bytes!("beam.smp.elf");
     serial_println!("[boot] ELF binary: {} bytes", HELLO_ELF.len());
 
-    // The kernel's .rodata contains both the embedded ELF and the cpio archive.
-    // With the cpio, .rodata extends to ~38 MiB, overlapping with ERTS load
-    // addresses (0x400000+). Copy both to safe buffers above the kernel before
-    // loading ERTS segments, which will overwrite .rodata.
-    // Kernel is at 240 MiB, .rodata ~38 MB (26 MB ELF + 10 MB cpio + misc),
-    // so kernel ends at ~280 MiB. Place copy buffers above that.
+    // The kernel's .rodata contains the embedded ELF and cpio archive.
+    // With JIT, .rodata can be ~55 MB (34 MB ELF + 21 MB cpio). Kernel at
+    // 240 MiB extends to ~295 MiB. Place copy buffers well above that.
     const ELF_COPY_BASE: usize = 0x1200_0000; // 288 MiB
     const CPIO_COPY_BASE: usize = ELF_COPY_BASE + 0x1A0_0000; // +26 MiB = 314 MiB
     // SAFETY: Destination regions are identity-mapped and above the kernel.
@@ -94,6 +91,10 @@ extern "C" fn main(_mbi: *const u8) -> ! {
     // SAFETY: Target addresses (0x400000+) are identity-mapped and writable.
     // Source data is at 32 MiB, safely above the load addresses.
     let info = unsafe { tyn_kernel::elf::load(elf_copy) }.expect("ELF load failed");
+    serial_println!("[boot] ELF mem_end={:#x}", info.mem_end);
+
+    // Set initial brk above the loaded ELF segments
+    tyn_kernel::syscall::set_initial_brk(info.mem_end);
 
     // Allocate a user stack (2 MiB, within the 256M RAM region)
     const USER_STACK_BASE: u64 = 0x0E00_0000; // 224 MiB

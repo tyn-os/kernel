@@ -8,20 +8,23 @@ use core::arch::global_asm;
 
 /// Initialize the syscall entry point via MSRs.
 /// Per-CPU data for syscall entry, accessed via GS segment.
-/// Layout: [0]=kernel_stack, [8]=scratch, [16]=saved_r9, [24]=saved_clone_rip
+/// Layout: [0]=kernel_stack, [8]=scratch, [16]=saved_r9, [24]=saved_clone_rip,
+///         [32]=saved_rdx, [40]=saved_r8
 #[repr(C, align(64))]
 struct PerCpuSyscall {
-    kernel_stack: u64,  // gs:[0]
-    scratch: u64,       // gs:[8]
-    saved_r9: u64,      // gs:[16] — R9 at syscall entry (fn ptr for clone)
+    kernel_stack: u64,    // gs:[0]
+    scratch: u64,         // gs:[8]
+    saved_r9: u64,        // gs:[16] — R9 at syscall entry (fn ptr for clone)
     saved_clone_rip: u64, // gs:[24] — RCX at syscall entry (return addr for child)
+    saved_rdx: u64,       // gs:[32] — RDX at syscall entry (fn ptr for clone3)
+    saved_r8: u64,        // gs:[40] — R8 at syscall entry (arg for clone3)
 }
 
 const MAX_CPUS: usize = 16;
 
 /// Per-CPU syscall data for up to 16 CPUs.
 static mut PERCPU_SYSCALL: [PerCpuSyscall; MAX_CPUS] = {
-    const EMPTY: PerCpuSyscall = PerCpuSyscall { kernel_stack: 0, scratch: 0, saved_r9: 0, saved_clone_rip: 0 };
+    const EMPTY: PerCpuSyscall = PerCpuSyscall { kernel_stack: 0, scratch: 0, saved_r9: 0, saved_clone_rip: 0, saved_rdx: 0, saved_r8: 0 };
     [EMPTY; MAX_CPUS]
 };
 
@@ -74,8 +77,8 @@ pub fn set_current_kernel_stack(kstack: u64) {
     }
 }
 
-/// Read saved R9 and clone RIP from this CPU's per-CPU data.
-/// These are saved at syscall entry and must be per-CPU to avoid SMP races.
+/// Read saved clone registers from this CPU's per-CPU data.
+/// Returns (r9, rip, rdx, r8) — for clone: r9=fn, rip=ret. For clone3: rdx=fn, r8=arg.
 pub fn get_clone_regs() -> (u64, u64) {
     let cpu = unsafe {
         let apic_id = *((0xFEE0_0020u64) as *const u32) >> 24;
@@ -129,10 +132,13 @@ global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    // Save R9 for clone (musl passes fn in R9) and RCX (return RIP for child)
-    // Per-CPU via GS to avoid SMP race when both CPUs are in syscall handlers
+    // Save registers for clone/clone3 child return (per-CPU via GS)
+    // clone: R9=fn, RCX=return RIP
+    // clone3: RDX=fn, R8=arg, RCX=return RIP
     "mov gs:[16], r9",
     "mov gs:[24], rcx",
+    "mov gs:[32], rdx",
+    "mov gs:[40], r8",
     // Shuffle: RAX=nr,RDI=a0,RSI=a1,RDX=a2,R10=a3,R8=a4,R9=a5
     //       → RDI=nr,RSI=a0,RDX=a1,RCX=a2,R8=a3,R9=a4
     "mov r9, r8",
@@ -157,6 +163,9 @@ global_asm!(
     "pop rdi",
     "pop r11",
     "pop rcx",
+    // Verify RCX is a valid user code address (catch stack corruption)
+    "cmp rcx, 0x400000",
+    "jb 3f",               // bad return address → trap
     "mov [rip + last_syscall_ret], rcx",
     "add rsp, 8",    // skip alignment padding
     // Save kernel stack top to per-CPU data for next syscall
@@ -165,6 +174,11 @@ global_asm!(
     "pop rsp",
     "sti",  // Re-enable interrupts before returning to user
     "jmp rcx",  // Return to user code
+    // Bad return address detected
+    "3:",
+    "mov rdi, rcx",          // pass bad RCX as arg
+    "mov rsi, rsp",          // pass RSP
+    "call {bad_rcx}",
     // Bad return address — print and halt
     "push rcx",
     "push rax",
@@ -175,6 +189,7 @@ global_asm!(
     "hlt",
     dispatch = sym syscall_dispatch,
     bad_ret = sym bad_return_address,
+    bad_rcx = sym bad_rcx_handler,
 );
 
 #[no_mangle]
@@ -182,6 +197,23 @@ extern "C" fn bad_return_address(addr: u64) {
     crate::serial::raw_str(b"BAD_RET@");
     crate::serial::raw_hex(addr);
     crate::serial::raw_str(b"\n");
+}
+
+#[no_mangle]
+extern "C" fn bad_rcx_handler(rcx: u64, rsp: u64) {
+    crate::serial::raw_str_nolock(b"\nBAD_RCX=");
+    crate::serial::raw_hex_nolock(rcx);
+    crate::serial::raw_str_nolock(b" RSP=");
+    crate::serial::raw_hex_nolock(rsp);
+    // Dump 8 values from the kernel stack to see what's there
+    crate::serial::raw_str_nolock(b"\nStack:");
+    for i in 0..8u64 {
+        crate::serial::raw_str_nolock(b" ");
+        let val = unsafe { *((rsp + i * 8) as *const u64) };
+        crate::serial::raw_hex_nolock(val);
+    }
+    crate::serial::raw_str_nolock(b"\n");
+    crate::halt_loop();
 }
 
 extern "C" {
@@ -296,7 +328,7 @@ extern "C" fn syscall_dispatch(
     {
         static SC: AtomicU64 = AtomicU64::new(0);
         let c = SC.fetch_add(1, Ordering::Relaxed);
-        let _ = c; // logging disabled for clean ERTS output
+        let _ = c;
     }
     if idx < 24 { IN_SYSCALL[idx].store(true, Ordering::Relaxed); }
     let result = syscall_dispatch_inner(nr, a0, a1, a2, a3, _a4);
@@ -352,9 +384,10 @@ fn syscall_dispatch_inner(
         SYS_FCNTL => sys_fcntl(a0 as i32, a1 as i32, a2),
         SYS_ACCESS => -2, // -ENOENT
         SYS_READLINK => sys_readlink(a0 as *const u8, a1 as *mut u8, a2 as usize),
+        267 => sys_readlink(a1 as *const u8, a2 as *mut u8, a3 as usize), // readlinkat (ignore dirfd)
         SYS_GETDENTS64 => sys_getdents64(a0 as i32, a1 as *mut u8, a2 as usize),
         SYS_PIPE | SYS_PIPE2 => sys_pipe(a0 as *mut i32),
-        SYS_EPOLL_CREATE1 => 50, // fake epoll fd
+        SYS_EPOLL_CREATE1 | 213 => 50, // fake epoll fd (213=epoll_create, 291=epoll_create1)
         SYS_TIMERFD_CREATE => 51, // fake timerfd
         SYS_EPOLL_CTL => 0,
         SYS_EPOLL_WAIT | SYS_EPOLL_PWAIT => sys_epoll_wait(a0, a1, a2),
@@ -388,6 +421,20 @@ fn syscall_dispatch_inner(
         }
         SYS_GETRANDOM => sys_getrandom(a0 as *mut u8, a1 as usize),
         SYS_GETCWD => sys_getcwd(a0 as *mut u8, a1 as usize),
+        96 => { // gettimeofday
+            if a0 != 0 {
+                let ns = monotonic_ns();
+                unsafe {
+                    *(a0 as *mut u64) = ns / 1_000_000_000; // tv_sec
+                    *((a0 + 8) as *mut u64) = (ns / 1000) % 1_000_000; // tv_usec
+                }
+            }
+            0
+        }
+        186 => (crate::sched::current_idx() + 1) as i64, // gettid
+        270 => 0, // restart_syscall — no-op
+        319 => -38i64, // memfd_create — ENOSYS, JIT falls back to mmap
+        435 => -38i64, // clone3 → -ENOSYS, musl falls back to clone (nr=56)
         SYS_TKILL | SYS_TGKILL => 0,
         SYS_SCHED_SETAFFINITY => 0,
         SYS_SOCKETPAIR => sys_pipe(a3 as *mut i32), // fake as pipe pair
@@ -550,19 +597,15 @@ fn sys_exit_group(status: i32) -> i64 {
     crate::halt_loop();
 }
 
+/// Set initial brk to just above the loaded ELF segments.
+pub fn set_initial_brk(mem_end: u64) {
+    BRK_TOP.store(mem_end, Ordering::Relaxed);
+}
+
 fn sys_brk(addr: u64) -> i64 {
     if addr == 0 {
-        // Query current brk
-        let current = BRK_TOP.load(Ordering::Relaxed);
-        if current == 0 {
-            // First call — set initial brk after the binary
-            BRK_TOP.store(0x1000000, Ordering::Relaxed); // 16 MiB
-            0x1000000
-        } else {
-            current as i64
-        }
+        BRK_TOP.load(Ordering::Relaxed) as i64
     } else {
-        // Set new brk
         BRK_TOP.store(addr, Ordering::Relaxed);
         addr as i64
     }
@@ -789,12 +832,18 @@ fn sys_fstat(fd: i32, buf: *mut u8) -> i64 {
 }
 
 fn sys_getrandom(buf: *mut u8, len: usize) -> i64 {
-    // SAFETY: buf points to user memory; RDTSC is always available.
     unsafe {
-        let mut tsc = core::arch::x86_64::_rdtsc();
-        for i in 0..len {
-            *buf.add(i) = tsc as u8;
-            tsc = tsc.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut i = 0;
+        while i < len {
+            let mut val: u64 = 0;
+            let ok = core::arch::x86_64::_rdrand64_step(&mut val);
+            if ok == 0 {
+                val = core::arch::x86_64::_rdtsc(); // fallback
+            }
+            let bytes = val.to_ne_bytes();
+            let to_copy = (len - i).min(8);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.add(i), to_copy);
+            i += to_copy;
         }
     }
     len as i64
@@ -959,15 +1008,18 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
     let cmd = (op & 0x7f) as u32; // mask FUTEX_PRIVATE_FLAG
     match cmd {
         0 | 9 => {
-            // FUTEX_WAIT / FUTEX_WAIT_BITSET: atomically check-and-sleep
-            // under a per-address spinlock (SMP-safe).
             crate::sched::futex_wait(uaddr, val as u32)
         }
         1 => {
-            // FUTEX_WAKE: wake up to `val` threads, send IPI if target idle.
             crate::sched::futex_wake(uaddr, val as u32)
         }
-        _ => 0,
+        _ => {
+            // Return 0 for unknown commands (FUTEX_REQUEUE, etc.)
+            // But return -ENOSYS for truly unknown commands so callers
+            // don't mistake success for completion.
+            serial_println!("[futex] unknown cmd={} op={:#x}", cmd, op);
+            0
+        }
     }
 }
 

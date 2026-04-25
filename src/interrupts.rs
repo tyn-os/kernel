@@ -23,9 +23,9 @@ pub fn init_idt() {
         IDT.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         IDT.device_not_available.set_handler_fn(device_not_available_handler);
         IDT.simd_floating_point.set_handler_fn(simd_handler);
-        // Timer at vector 32 — NO IST so the frame stays on the current thread's
-        // stack, allowing preemptive context switch from the timer handler.
-        IDT[32].set_handler_fn(timer_handler);
+        // Timer at vector 32 with IST1 (safe dedicated stack for the timer ISR).
+        IDT[32].set_handler_fn(timer_handler)
+            .set_stack_index(0);
         // IPI handler for SMP wakeup (vector 34)
         IDT[34].set_handler_fn(ipi_handler);
         // Spurious interrupt handler for APIC (vector 0xFF)
@@ -90,32 +90,59 @@ pub fn init_timer() {
     x86_64::instructions::interrupts::enable();
 }
 
-extern "x86-interrupt" fn timer_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_handler(mut frame: InterruptStackFrame) {
     // EOI to APIC (PIC is disabled)
     crate::apic::eoi();
 
-    // Watchdog: every ~1 second (100 ticks), check for blocked threads
-    // with changed futex values (missed wake events).
+    // Watchdog: every ~1 second (100 ticks)
     static WD_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     let tick = WD_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if tick % 100 == 0 && tick > 0 {
         crate::sched::watchdog_wake();
     }
 
-    // Preempt user-mode code directly. The x86-interrupt calling convention
-    // saves ALL registers, so context_switch in yield_current is safe.
-    // Without IST, the interrupt frame stays on the thread's stack —
-    // no IST sharing corruption when switching threads.
-    const KERNEL_BASE: u64 = 0x0F00_0000; // kernel .text starts at 240 MiB
+    const KERNEL_BASE: u64 = 0x0F00_0000;
     let ip = frame.instruction_pointer.as_u64();
     if ip < KERNEL_BASE {
-        // Interrupted user-mode code — preempt if there are other threads
-        crate::sched::yield_current();
+        // User-mode code interrupted. Push the original RIP onto the user
+        // stack and redirect IRET to a trampoline that does sched_yield.
+        // The trampoline does `syscall(sched_yield); ret` — the ret pops
+        // the original RIP and resumes user code. check_resched at the
+        // syscall exit performs the actual yield.
+        crate::sched::timer_tick();
+
+        extern "C" { fn sched_yield_trampoline(); }
+        unsafe {
+            let user_rsp = frame.stack_pointer.as_u64();
+            let new_rsp = user_rsp - 8;
+            // Push original RIP onto user stack
+            *(new_rsp as *mut u64) = ip;
+            frame.as_mut().update(|f| {
+                f.instruction_pointer = x86_64::VirtAddr::new(sched_yield_trampoline as u64);
+                f.stack_pointer = x86_64::VirtAddr::new(new_rsp);
+            });
+        }
     } else {
-        // Interrupted kernel code — defer (set flag, check at syscall exit)
         crate::sched::timer_tick();
     }
 }
+
+core::arch::global_asm!(
+    ".section .text",
+    ".global sched_yield_trampoline",
+    "sched_yield_trampoline:",
+    // Original RIP is at [rsp] (pushed by timer handler).
+    // Save caller-saved regs that syscall clobbers.
+    "push rax",
+    "push rcx",
+    "push r11",
+    "mov eax, 24",      // SYS_sched_yield
+    "syscall",           // → kernel → check_resched → yield
+    "pop r11",
+    "pop rcx",
+    "pop rax",
+    "ret",               // pops original RIP → resumes user code
+);
 
 extern "x86-interrupt" fn page_fault_handler(
     frame: InterruptStackFrame,

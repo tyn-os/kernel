@@ -55,6 +55,8 @@ pub struct ElfInfo {
     pub phentsize: u16,
     /// Number of program header entries.
     pub phnum: u16,
+    /// End of loaded segments (highest vaddr + memsz, page-aligned up).
+    pub mem_end: u64,
 }
 
 /// Load an ELF binary from a byte slice into identity-mapped memory.
@@ -96,6 +98,7 @@ pub unsafe fn load(elf_data: &[u8]) -> Result<ElfInfo, &'static str> {
     let ph_offset = header.e_phoff as usize;
     let ph_count = header.e_phnum as usize;
     let mut phdr_vaddr: u64 = 0;
+    let mut mem_end: u64 = 0;
 
     for i in 0..ph_count {
         let offset = ph_offset + i * core::mem::size_of::<Elf64Phdr>();
@@ -140,6 +143,12 @@ pub unsafe fn load(elf_data: &[u8]) -> Result<ElfInfo, &'static str> {
             }
         }
 
+        // Track highest loaded address
+        let seg_end = (dst_addr + memsz) as u64;
+        if seg_end > mem_end {
+            mem_end = seg_end;
+        }
+
         // Check if this PT_LOAD segment contains the program headers
         // (e_phoff falls within [p_offset, p_offset + p_filesz))
         if phdr_vaddr == 0
@@ -153,10 +162,14 @@ pub unsafe fn load(elf_data: &[u8]) -> Result<ElfInfo, &'static str> {
     serial_println!("[elf] phdr_vaddr={:#x} phentsize={} phnum={}",
         phdr_vaddr, header.e_phentsize, header.e_phnum);
 
+    // Page-align mem_end up for brk
+    mem_end = (mem_end + 0xFFF) & !0xFFF;
+
     Ok(ElfInfo {
         entry: header.e_entry,
         phdr_vaddr,
         phentsize: header.e_phentsize,
         phnum: header.e_phnum,
+        mem_end,
     })
 }

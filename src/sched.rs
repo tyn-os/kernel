@@ -80,6 +80,20 @@ static mut CPU_QUEUES: [CpuQueue; MAX_CPUS] = {
     };
     [EMPTY; MAX_CPUS]
 };
+/// Per-CPU idle context — used as a context_switch target when a thread
+/// blocks and there's no other thread on the CPU. This allows the blocked
+/// thread's register state to be properly saved in its ctx, so that
+/// futex_wake can safely resume it on any CPU.
+static mut IDLE_CTX: [ThreadCtx; MAX_CPUS] = {
+    const EMPTY: ThreadCtx = ThreadCtx { rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0 };
+    [EMPTY; MAX_CPUS]
+};
+/// Per-CPU idle stacks (4 KiB each).
+static mut IDLE_STACKS: [[u8; 4096]; MAX_CPUS] = [[0; 4096]; MAX_CPUS];
+/// Per-CPU: TID of the thread that context_switched to idle. Set before
+/// context_switch, read by the idle loop to know which thread to check.
+static mut IDLE_BLOCKED_TID: [usize; MAX_CPUS] = [0; MAX_CPUS];
+
 static CPU_QUEUE_LOCKS: [Mutex<()>; MAX_CPUS] = {
     const M: Mutex<()> = Mutex::new(());
     [M; MAX_CPUS]
@@ -109,8 +123,94 @@ fn current_cpu() -> u32 {
 // --- Public API ---
 
 /// Initialize the scheduler. Call once on BSP.
+/// Per-CPU idle loop: HLTs until the blocked thread is woken or new
+/// threads arrive in the queue, then handles them.
+extern "C" fn cpu_idle_loop() -> ! {
+    let cpu = current_cpu() as usize;
+    loop {
+        x86_64::instructions::interrupts::enable();
+        x86_64::instructions::hlt();
+
+        let blocked = unsafe { IDLE_BLOCKED_TID[cpu] };
+
+        // Check if the blocked thread was woken by futex_wake.
+        // Use read_volatile to prevent the compiler from hoisting this
+        // read out of the loop — another CPU modifies the state field.
+        let woken = unsafe {
+            THREADS[blocked].as_ref()
+                .map(|t| core::ptr::read_volatile(&t.state) == State::Ready)
+                .unwrap_or(false)
+        };
+        if woken {
+            unsafe {
+                // Remove the thread from the queue if futex_wake also added it there.
+                // Without this, the thread would be both current AND in the queue.
+                {
+                    let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
+                    CPU_QUEUES[cpu].queue.retain(|&tid| tid != blocked as u32);
+                }
+            }
+            unsafe {
+                let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
+                CPU_QUEUES[cpu].current = Some(blocked as u32);
+                CPU_QUEUES[cpu].idle = false;
+
+                if let Some(thread) = THREADS[blocked].as_ref() {
+                    crate::syscall::set_current_kernel_stack(thread.kernel_stack_top);
+                    context_switch(
+                        &raw mut IDLE_CTX[cpu] as *mut ThreadCtx,
+                        &raw const thread.ctx as *const ThreadCtx,
+                    );
+                    // Returns here when this CPU idles again
+                }
+            }
+            continue;
+        }
+
+        // Check for new threads in the queue
+        let next = {
+            let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
+            unsafe { CPU_QUEUES[cpu].queue.pop_front() }
+        };
+        if let Some(next_tid) = next {
+            let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
+            unsafe {
+                CPU_QUEUES[cpu].current = Some(next_tid);
+                CPU_QUEUES[cpu].idle = false;
+            }
+            let next_idx = next_tid as usize;
+            if let Some(next) = unsafe { THREADS[next_idx].as_ref() } {
+                unsafe {
+                    crate::syscall::set_current_kernel_stack(next.kernel_stack_top);
+                    drop(_qlock);
+                    // Switch to the new thread. When it yields, we return here.
+                    context_switch(
+                        &raw mut IDLE_CTX[cpu] as *mut ThreadCtx,
+                        &raw const next.ctx as *const ThreadCtx,
+                    );
+                    // Back from the new thread — set idle again
+                    let _q = CPU_QUEUE_LOCKS[cpu].lock();
+                    CPU_QUEUES[cpu].current = None;
+                    CPU_QUEUES[cpu].idle = true;
+                }
+            }
+        }
+    }
+}
+
 pub fn init(num_cpus: usize) {
     NUM_CPUS.store(num_cpus, Ordering::Release);
+
+    // Initialize per-CPU idle contexts
+    for cpu in 0..num_cpus {
+        unsafe {
+            let stack_top = IDLE_STACKS[cpu].as_mut_ptr().add(4096) as u64;
+            // Push cpu_idle_loop as the return address
+            let rsp = stack_top - 8;
+            *(rsp as *mut u64) = cpu_idle_loop as u64;
+            IDLE_CTX[cpu].rsp = rsp;
+        }
+    }
 
     // Register the main thread (tid 0) on CPU 0
     let _lock = THREAD_LOCK.lock();
@@ -337,6 +437,8 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
             return -11; // -EAGAIN
         }
 
+        // (futex_wait blocking log removed for clean output)
+
         let cpu = current_cpu() as usize;
         unsafe {
             let cur_tid = match CPU_QUEUES[cpu].current {
@@ -393,43 +495,24 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
             0 // woken
         }
         None => {
-            // No other thread on this CPU — go idle and wait for IPI wakeup.
-            // When woken, check if the blocked thread's futex was signaled.
-            // Also handle new threads arriving in the queue (return spurious
-            // wakeup so the thread retries its blocking call).
-            x86_64::instructions::interrupts::enable();
+            // No other thread on this CPU. Context-switch to the per-CPU
+            // idle loop. This properly saves the blocked thread's register
+            // state so that futex_wake can later resume it on any CPU.
             let cpu = current_cpu() as usize;
-            loop {
-                x86_64::instructions::hlt();
-                // Check if our blocked thread was woken by futex_wake
-                if let Some(thread) = unsafe { THREADS[blocked_tid].as_ref() } {
-                    if thread.state == State::Ready {
-                        let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
-                        unsafe {
-                            CPU_QUEUES[cpu].current = Some(blocked_tid as u32);
-                            CPU_QUEUES[cpu].idle = false;
-                        }
-                        return 0;
-                    }
+            unsafe {
+                IDLE_BLOCKED_TID[cpu] = blocked_tid;
+                // context_switch saves our regs to the blocked thread's ctx
+                // and loads the idle context. When we're woken, context_switch
+                // restores our regs and we return here.
+                if let Some(thread) = THREADS[blocked_tid].as_mut() {
+                    context_switch(
+                        &raw mut thread.ctx as *mut ThreadCtx,
+                        &raw const IDLE_CTX[cpu] as *const ThreadCtx,
+                    );
                 }
-                // Check for new threads — return spurious wakeup so the
-                // blocked thread retries and yields to the new thread.
-                {
-                    let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
-                    if !unsafe { CPU_QUEUES[cpu].queue.is_empty() } {
-                        unsafe {
-                            // Unblock and resume as current (NOT in queue —
-                            // being both current and queued causes dual scheduling)
-                            if let Some(t) = THREADS[blocked_tid].as_mut() {
-                                t.state = State::Ready;
-                            }
-                            CPU_QUEUES[cpu].current = Some(blocked_tid as u32);
-                            CPU_QUEUES[cpu].idle = false;
-                        }
-                        return 0; // spurious wakeup — thread retries + yields
-                    }
-                }
+                // We were woken and context_switched back. Return 0.
             }
+            0
         }
     }
 }
@@ -456,14 +539,11 @@ pub fn futex_wake(addr: u64, count: u32) -> i64 {
                         crate::serial_println!("[wake] tid={} addr={:#x}", thread.tid, addr);
                     }
 
-                    // Add to a CPU's run queue
+                    // DON'T add to queue — the idle loop on the thread's CPU
+                    // detects state=Ready via read_volatile and resumes via
+                    // context_switch. Adding to queue causes dual scheduling.
+                    // Just send an IPI to wake the CPU from HLT.
                     let target_cpu = (i % NUM_CPUS.load(Ordering::Relaxed)) as u32;
-                    {
-                        let _qlock = CPU_QUEUE_LOCKS[target_cpu as usize].lock();
-                        CPU_QUEUES[target_cpu as usize].queue.push_back(thread.tid);
-                    }
-
-                    // Wake idle CPU via IPI
                     if CPU_QUEUES[target_cpu as usize].idle && target_cpu != current_cpu() {
                         crate::apic::send_ipi(target_cpu as u8);
                     }
@@ -500,24 +580,17 @@ pub fn watchdog_wake() {
                     }
                     // Force-wake threads stuck on ERTS init sync (val=0x2)
                     // after 3 seconds. ERTS handles spurious wakeups via recheck.
-                    let force = thread.futex_val == 0x2 && check_num >= 3;
+                    let force = check_num >= 2; // force-wake ALL stuck threads after 2 seconds
                     if current != thread.futex_val || force {
-                        // Value changed or force-wake timeout
+                        // Value changed or force-wake timeout.
+                        // Just set state=Ready — DON'T add to queue.
+                        // The idle loop on the thread's CPU detects the state
+                        // change and resumes via context_switch. Adding to queue
+                        // would cause dual scheduling.
                         thread.state = State::Ready;
                         let addr = thread.futex_addr;
                         thread.futex_addr = 0;
                         let tid = thread.tid;
-
-                        // Add to a CPU's run queue
-                        let ncpus = NUM_CPUS.load(Ordering::Relaxed);
-                        let target_cpu = (i % ncpus) as u32;
-                        {
-                            let _qlock = CPU_QUEUE_LOCKS[target_cpu as usize].lock();
-                            CPU_QUEUES[target_cpu as usize].queue.push_back(tid);
-                        }
-                        if CPU_QUEUES[target_cpu as usize].idle && target_cpu != current_cpu() {
-                            crate::apic::send_ipi(target_cpu as u8);
-                        }
 
                         static WD_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
                         let c = WD_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
