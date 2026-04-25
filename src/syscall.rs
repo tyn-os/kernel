@@ -992,18 +992,124 @@ fn sys_readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
 /// Last returned nanosecond value — ensures monotonicity.
 static LAST_TIME_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Return a monotonically increasing nanosecond value. Used by both
-/// clock_gettime and the RDTSC trap handler. Guaranteed to return a
-/// value strictly greater than any previously returned value (across
-/// all threads, even with preemptive scheduling).
+/// TSC frequency in Hz, calibrated against PIT at boot.
+static TSC_FREQ_HZ: AtomicU64 = AtomicU64::new(2_000_000_000); // default 2 GHz
+
+/// Per-CPU TSC offset (signed). TSC_offset[cpu] = BSP_TSC - AP_TSC at sync point.
+/// Adding this to an AP's raw TSC normalizes it to the BSP's epoch.
+static TSC_OFFSETS: [core::sync::atomic::AtomicI64; 16] = {
+    const ZERO: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+    [ZERO; 16]
+};
+
+/// Calibrate TSC frequency against PIT channel 2. Call once at boot (BSP only).
+pub fn calibrate_tsc() {
+    unsafe {
+        // PIT frequency = 1,193,182 Hz. 10ms = 11932 PIT ticks.
+        let pit_count: u16 = 11932;
+
+        // Program PIT channel 2 in one-shot mode
+        let val = x86_64::instructions::port::Port::<u8>::new(0x61).read();
+        x86_64::instructions::port::Port::<u8>::new(0x61).write(val & 0xFC);
+        x86_64::instructions::port::Port::<u8>::new(0x43).write(0xB0);
+        x86_64::instructions::port::Port::<u8>::new(0x42).write((pit_count & 0xFF) as u8);
+        x86_64::instructions::port::Port::<u8>::new(0x42).write((pit_count >> 8) as u8);
+        x86_64::instructions::port::Port::<u8>::new(0x61).write((val & 0xFC) | 0x01);
+
+        let tsc_start = core::arch::x86_64::_rdtsc();
+
+        while (x86_64::instructions::port::Port::<u8>::new(0x61).read() & 0x20) == 0 {
+            core::hint::spin_loop();
+        }
+
+        let tsc_end = core::arch::x86_64::_rdtsc();
+        let tsc_ticks = tsc_end - tsc_start;
+
+        // tsc_freq = tsc_ticks * pit_hz / pit_count
+        let freq = tsc_ticks * 1_193_182 / pit_count as u64;
+        TSC_FREQ_HZ.store(freq, Ordering::Release);
+
+        crate::serial_println!("[time] TSC frequency: {} MHz ({} ticks/10ms)",
+            freq / 1_000_000, tsc_ticks);
+    }
+}
+
+/// Measure and store the TSC offset for an AP relative to BSP.
+/// Uses trampoline memory at 0x8030/0x8038 as shared sync vars.
+/// Call from BSP after AP has called ap_tsc_sync().
+pub fn measure_tsc_offset(cpu_id: usize) {
+    let sync_state = 0x8030u64 as *mut u64;
+    let ap_tsc_ptr = 0x8038u64 as *mut u64;
+
+    let mut offsets = [0i64; 3];
+    for round in 0..3 {
+        unsafe { core::ptr::write_volatile(sync_state, 0); }
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        // Signal AP to read its TSC
+        unsafe { core::ptr::write_volatile(sync_state, 1); }
+        let bsp_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+
+        // Wait for AP
+        while unsafe { core::ptr::read_volatile(sync_state) } != 2 {
+            core::hint::spin_loop();
+        }
+
+        let ap_tsc = unsafe { core::ptr::read_volatile(ap_tsc_ptr) };
+        offsets[round] = bsp_tsc as i64 - ap_tsc as i64;
+    }
+
+    offsets.sort();
+    let offset = offsets[1]; // median
+
+    TSC_OFFSETS[cpu_id].store(offset, Ordering::Release);
+    crate::serial_println!("[time] CPU {} TSC offset: {} ticks", cpu_id, offset);
+
+    // Signal done
+    unsafe { core::ptr::write_volatile(sync_state, 3); }
+}
+
+/// AP side of TSC offset measurement. Call from AP after GDT/IDT setup.
+pub fn ap_tsc_sync() {
+    let sync_state = 0x8030u64 as *mut u64;
+    let ap_tsc_ptr = 0x8038u64 as *mut u64;
+
+    for _round in 0..3 {
+        while unsafe { core::ptr::read_volatile(sync_state) } != 1 {
+            core::hint::spin_loop();
+        }
+
+        let my_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+        unsafe { core::ptr::write_volatile(ap_tsc_ptr, my_tsc); }
+        unsafe { core::ptr::write_volatile(sync_state, 2); }
+
+        // Wait for BSP to reset for next round
+        while unsafe { core::ptr::read_volatile(sync_state) } == 2 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Return a monotonically increasing nanosecond value.
+/// Uses per-CPU TSC offset correction and a global ratchet.
 pub fn monotonic_ns() -> u64 {
-    // Read RDTSC with interrupts disabled to prevent preemption
-    // between TSC read and CAS — this is the key to preventing
-    // apparent time reversals.
     let were_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
-    let tsc = unsafe { core::arch::x86_64::_rdtsc() };
-    let total_ns = tsc / 2;
+
+    let raw_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+
+    // Apply per-CPU TSC offset to normalize to BSP epoch
+    let cpu = unsafe { *((0xFEE0_0020u64) as *const u32) >> 24 } as usize;
+    let offset = if cpu < 16 { TSC_OFFSETS[cpu].load(Ordering::Relaxed) } else { 0 };
+    let corrected_tsc = (raw_tsc as i64 + offset) as u64;
+
+    // Convert to nanoseconds: ns = tsc * 1_000_000_000 / freq
+    // To avoid overflow, use: ns = tsc / (freq / 1_000_000_000)
+    // But freq/1B might be < 1 for GHz clocks. Use: ns = tsc * 1000 / (freq / 1_000_000)
+    let freq_mhz = TSC_FREQ_HZ.load(Ordering::Relaxed) / 1_000_000;
+    let total_ns = if freq_mhz > 0 { corrected_tsc * 1000 / freq_mhz } else { corrected_tsc / 2 };
+
+    // Ratchet: never go backwards
     let mut last = LAST_TIME_NS.load(Ordering::SeqCst);
     let result = loop {
         let new = total_ns.max(last + 1);

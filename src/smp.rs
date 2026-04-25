@@ -96,6 +96,8 @@ fn boot_ap(cpu_id: u32, apic_id: u8, cr3: u64) {
                 while AP_STARTED_COUNT.load(Ordering::Acquire) < cpu_id {
                     core::hint::spin_loop();
                 }
+                // Measure TSC offset between BSP and this AP
+                crate::syscall::measure_tsc_offset(cpu_id as usize);
                 return;
             }
         }
@@ -152,6 +154,9 @@ extern "C" fn ap_main(cpu_id: u32) -> ! {
 
     // Signal BSP that we're fully initialized
     AP_STARTED_COUNT.fetch_add(1, Ordering::Release);
+
+    // TSC synchronization with BSP (after signaling ready)
+    crate::syscall::ap_tsc_sync();
 
     crate::serial::raw_str(b"[smp] AP fully initialized\n");
 

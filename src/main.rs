@@ -31,6 +31,9 @@ extern "C" fn main(_mbi: *const u8) -> ! {
     // NOTE: CR4.TSD can't trap RDTSC in ring 0 (we run everything in ring 0).
     // The ERTS time-backwards issue from timer preemption needs a different fix.
 
+    // Calibrate TSC frequency against PIT (before APIC takes over PIT)
+    tyn_kernel::syscall::calibrate_tsc();
+
     // Discover CPUs via ACPI MADT and initialize APIC
     let acpi_info = tyn_kernel::acpi::discover_cpus();
     if let Some(ref info) = acpi_info {
