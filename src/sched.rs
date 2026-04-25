@@ -52,6 +52,7 @@ struct Thread {
     child_tid_ptr: u64,
     futex_addr: u64,   // address being waited on (if Blocked)
     futex_val: u32,     // expected value (if Blocked)
+    in_idle_ctx: bool, // true if blocked via idle context (don't add to queue on wake)
     clone_r9: u64,     // saved R9 for child (musl's fn pointer)
     clone_rip: u64,    // saved return RIP for child
 }
@@ -227,6 +228,7 @@ pub fn init(num_cpus: usize) {
             child_tid_ptr: 0,
             futex_addr: 0,
             futex_val: 0,
+            in_idle_ctx: false,
             clone_r9: 0,
             clone_rip: 0,
         });
@@ -289,6 +291,7 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
             child_tid_ptr: child_tid,
             futex_addr: 0,
             futex_val: 0,
+            in_idle_ctx: false,
             clone_r9,
             clone_rip,
         });
@@ -501,6 +504,9 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
             let cpu = current_cpu() as usize;
             unsafe {
                 IDLE_BLOCKED_TID[cpu] = blocked_tid;
+                if let Some(t) = THREADS[blocked_tid].as_mut() {
+                    t.in_idle_ctx = true;
+                }
                 // context_switch saves our regs to the blocked thread's ctx
                 // and loads the idle context. When we're woken, context_switch
                 // restores our regs and we return here.
@@ -539,11 +545,16 @@ pub fn futex_wake(addr: u64, count: u32) -> i64 {
                         crate::serial_println!("[wake] tid={} addr={:#x}", thread.tid, addr);
                     }
 
-                    // DON'T add to queue — the idle loop on the thread's CPU
-                    // detects state=Ready via read_volatile and resumes via
-                    // context_switch. Adding to queue causes dual scheduling.
-                    // Just send an IPI to wake the CPU from HLT.
                     let target_cpu = (i % NUM_CPUS.load(Ordering::Relaxed)) as u32;
+                    if thread.in_idle_ctx {
+                        // Thread is in per-CPU idle context — don't add to queue.
+                        // The idle loop detects state=Ready and resumes via context_switch.
+                        thread.in_idle_ctx = false;
+                    } else {
+                        // Thread was context_switched normally — add to queue.
+                        let _qlock = CPU_QUEUE_LOCKS[target_cpu as usize].lock();
+                        CPU_QUEUES[target_cpu as usize].queue.push_back(thread.tid);
+                    }
                     if CPU_QUEUES[target_cpu as usize].idle && target_cpu != current_cpu() {
                         crate::apic::send_ipi(target_cpu as u8);
                     }
