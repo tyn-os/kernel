@@ -440,7 +440,12 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
             return -11; // -EAGAIN
         }
 
-        // (futex_wait blocking log removed for clean output)
+        // Never block — return 0 (spurious wakeup). With the corrected
+        // scheduler, 8 CPUs, and trampoline preemption, all threads get
+        // fair CPU time as spinners. This eliminates the thread-progress
+        // init deadlock where blocked threads prevent progress counters
+        // from advancing.
+        return 0;
 
         let cpu = current_cpu() as usize;
         unsafe {
