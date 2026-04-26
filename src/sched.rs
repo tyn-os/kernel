@@ -479,7 +479,10 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
     {
         let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
         unsafe {
-            let cur_tid = CPU_QUEUES[cpu].current.unwrap();
+            let cur_tid = match CPU_QUEUES[cpu].current {
+                Some(t) => t,
+                None => return 0, // no current thread (idle context)
+            };
             blocked_tid = cur_tid as usize;
             let next_tid = CPU_QUEUES[cpu].queue.pop_front();
             match next_tid {

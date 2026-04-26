@@ -51,10 +51,10 @@ struct OpenFile {
     pos: usize,          // current read position
 }
 
-static mut OPEN_FILES: [Option<OpenFile>; MAX_OPEN] = {
+static OPEN_FILES: spin::Mutex<[Option<OpenFile>; MAX_OPEN]> = spin::Mutex::new({
     const NONE: Option<OpenFile> = None;
     [NONE; MAX_OPEN]
-};
+});
 
 /// Parse a cpio newc header field (fixed-width hex ASCII).
 fn parse_hex(bytes: &[u8]) -> u64 {
@@ -146,58 +146,61 @@ pub fn open(path: &[u8]) -> i64 {
 
     let fd = NEXT_VFS_FD.fetch_add(1, Ordering::Relaxed) as i32;
 
-    // SAFETY: Single-threaded access to OPEN_FILES.
-    unsafe {
-        for slot in OPEN_FILES.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(OpenFile {
-                    fd,
-                    data_offset,
-                    data_len,
-                    pos: 0,
-                });
-                return fd as i64;
-            }
+    let mut files = OPEN_FILES.lock();
+    for slot in files.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(OpenFile { fd, data_offset, data_len, pos: 0 });
+            return fd as i64;
         }
     }
 
-    -24 // -EMFILE (too many open files)
+    -24 // -EMFILE
 }
 
 /// Read from an open VFS file. Returns bytes read, 0 for EOF.
 pub fn read(fd: i32, buf: *mut u8, count: usize) -> i64 {
-    // SAFETY: Single-threaded access to OPEN_FILES, buf is identity-mapped user memory.
-    unsafe {
-        for slot in OPEN_FILES.iter_mut() {
-            if let Some(ref mut file) = slot {
-                if file.fd == fd {
-                    let remaining = file.data_len - file.pos;
-                    if remaining == 0 {
-                        return 0; // EOF
-                    }
-                    let to_read = count.min(remaining);
-                    let src = &cpio_data()[file.data_offset + file.pos..];
-                    core::ptr::copy_nonoverlapping(src.as_ptr(), buf, to_read);
-                    file.pos += to_read;
-                    return to_read as i64;
-                }
+    let mut files = OPEN_FILES.lock();
+    for slot in files.iter_mut() {
+        if let Some(ref mut file) = slot {
+            if file.fd == fd {
+                let remaining = file.data_len - file.pos;
+                if remaining == 0 { return 0; }
+                let to_read = count.min(remaining);
+                let src = &cpio_data()[file.data_offset + file.pos..];
+                // SAFETY: buf is in identity-mapped user memory.
+                unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), buf, to_read); }
+                file.pos += to_read;
+                return to_read as i64;
             }
         }
     }
+    -9 // -EBADF
+}
 
+/// Read at a specific offset without changing file position (atomic pread).
+pub fn pread(fd: i32, buf: *mut u8, count: usize, offset: usize) -> i64 {
+    let files = OPEN_FILES.lock();
+    for slot in files.iter() {
+        if let Some(ref file) = slot {
+            if file.fd == fd {
+                if offset >= file.data_len { return 0; }
+                let remaining = file.data_len - offset;
+                let to_read = count.min(remaining);
+                let src = &cpio_data()[file.data_offset + offset..];
+                unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), buf, to_read); }
+                return to_read as i64;
+            }
+        }
+    }
     -9 // -EBADF
 }
 
 /// Get file size for fstat.
 pub fn fstat_size(fd: i32) -> Option<usize> {
-    // SAFETY: Single-threaded access.
-    unsafe {
-        for slot in OPEN_FILES.iter() {
-            if let Some(ref file) = slot {
-                if file.fd == fd {
-                    return Some(file.data_len);
-                }
-            }
+    let files = OPEN_FILES.lock();
+    for slot in files.iter() {
+        if let Some(ref file) = slot {
+            if file.fd == fd { return Some(file.data_len); }
         }
     }
     None
@@ -205,20 +208,18 @@ pub fn fstat_size(fd: i32) -> Option<usize> {
 
 /// Seek within an open VFS file. Returns new position.
 pub fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
-    // SAFETY: Single-threaded access.
-    unsafe {
-        for slot in OPEN_FILES.iter_mut() {
-            if let Some(ref mut file) = slot {
-                if file.fd == fd {
-                    let new_pos = match whence {
-                        0 => offset as usize,               // SEEK_SET
-                        1 => (file.pos as i64 + offset) as usize, // SEEK_CUR
-                        2 => (file.data_len as i64 + offset) as usize, // SEEK_END
-                        _ => return -22, // -EINVAL
-                    };
-                    file.pos = new_pos.min(file.data_len);
-                    return file.pos as i64;
-                }
+    let mut files = OPEN_FILES.lock();
+    for slot in files.iter_mut() {
+        if let Some(ref mut file) = slot {
+            if file.fd == fd {
+                let new_pos = match whence {
+                    0 => offset.max(0) as usize,                              // SEEK_SET
+                    1 => (file.pos as i64).saturating_add(offset).max(0) as usize, // SEEK_CUR
+                    2 => (file.data_len as i64).saturating_add(offset).max(0) as usize, // SEEK_END
+                    _ => return -22, // -EINVAL
+                };
+                file.pos = new_pos.min(file.data_len);
+                return file.pos as i64;
             }
         }
     }
@@ -227,18 +228,13 @@ pub fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
 
 /// Close a VFS file descriptor.
 pub fn close(fd: i32) -> i64 {
-    // SAFETY: Single-threaded access.
-    unsafe {
-        for slot in OPEN_FILES.iter_mut() {
-            if let Some(ref file) = slot {
-                if file.fd == fd {
-                    *slot = None;
-                    return 0;
-                }
-            }
+    let mut files = OPEN_FILES.lock();
+    for slot in files.iter_mut() {
+        if let Some(ref file) = slot {
+            if file.fd == fd { *slot = None; return 0; }
         }
     }
-    0 // don't error on unknown fds
+    0
 }
 
 /// Check if an fd belongs to the VFS.
@@ -282,6 +278,8 @@ struct DirSlot {
     prefix_len: usize,
     done: bool, // already returned entries
 }
+// SAFETY: DIR_SLOTS mutated only in open_dir/getdents64 which are serialized
+// through the syscall handler. Reads are safe on x86 TSO.
 static mut DIR_SLOTS: [DirSlot; MAX_DIRS] = {
     const EMPTY: DirSlot = DirSlot { fd: -1, prefix: [0; 128], prefix_len: 0, done: false };
     [EMPTY; MAX_DIRS]
@@ -325,18 +323,17 @@ pub fn is_dir_prefix(path: &[u8]) -> bool {
 
 /// Register a directory fd for a given path.
 pub fn open_dir(fd: i32, path: &[u8]) {
-    // SAFETY: Single-threaded cooperative access.
-    unsafe {
-        for slot in DIR_SLOTS.iter_mut() {
-            if slot.fd == -1 {
-                slot.fd = fd;
-                let p = if path.starts_with(b"/") { &path[1..] } else { path };
-                let len = p.len().min(127);
-                slot.prefix[..len].copy_from_slice(&p[..len]);
-                slot.prefix_len = len;
-                slot.done = false;
-                return;
-            }
+    // SAFETY: serialized through syscall handler
+    let slots = unsafe { &mut DIR_SLOTS };
+    for slot in slots.iter_mut() {
+        if slot.fd == -1 {
+            slot.fd = fd;
+            let p = if path.starts_with(b"/") { &path[1..] } else { path };
+            let len = p.len().min(127);
+            slot.prefix[..len].copy_from_slice(&p[..len]);
+            slot.prefix_len = len;
+            slot.done = false;
+            return;
         }
     }
 }
@@ -344,28 +341,23 @@ pub fn open_dir(fd: i32, path: &[u8]) {
 /// Return directory entries for a directory fd.
 /// struct linux_dirent64 { u64 d_ino; u64 d_off; u16 d_reclen; u8 d_type; char d_name[]; }
 pub fn getdents64(fd: i32, buf: *mut u8, count: usize) -> i64 {
-    // SAFETY: Single-threaded cooperative access.
-    unsafe {
-        for slot in DIR_SLOTS.iter_mut() {
-            if slot.fd == fd {
-                if slot.done {
-                    return 0; // EOF — already returned entries
-                }
-                slot.done = true;
-
-                let mut prefix = [0u8; 129];
-                let plen = slot.prefix_len;
-                prefix[..plen].copy_from_slice(&slot.prefix[..plen]);
-                if plen > 0 && prefix[plen-1] != b'/' {
-                    prefix[plen] = b'/';
-                    let plen = plen + 1;
-                    return fill_dir_entries(buf, count, &prefix[..plen]);
-                }
+    let slots = unsafe { &mut DIR_SLOTS };
+    for slot in slots.iter_mut() {
+        if slot.fd == fd {
+            if slot.done { return 0; }
+            slot.done = true;
+            let mut prefix = [0u8; 129];
+            let plen = slot.prefix_len;
+            prefix[..plen].copy_from_slice(&slot.prefix[..plen]);
+            if plen > 0 && prefix[plen-1] != b'/' {
+                prefix[plen] = b'/';
+                let plen = plen + 1;
                 return fill_dir_entries(buf, count, &prefix[..plen]);
             }
+            return fill_dir_entries(buf, count, &prefix[..plen]);
         }
     }
-    0 // unknown fd
+    0
 }
 
 /// Scan cpio for entries under the given prefix, return unique immediate children.

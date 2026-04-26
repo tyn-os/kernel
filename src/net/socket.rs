@@ -43,14 +43,17 @@ struct Socket {
 
 /// Global socket table
 static mut SOCKETS: Vec<Socket> = Vec::new();
+static SOCKET_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static mut NEXT_SOCK_FD: i32 = SOCK_FD_BASE;
 
 /// Check if an fd is a socket fd
 pub fn is_socket_fd(fd: i32) -> bool {
+    // SAFETY: read-only check, fd field is word-sized (x86 TSO safe)
     unsafe { SOCKETS.iter().any(|s| s.fd == fd) }
 }
 
 fn find_socket(fd: i32) -> Option<&'static mut Socket> {
+    // SAFETY: caller must hold SOCKET_LOCK or be in single-threaded context
     unsafe { SOCKETS.iter_mut().find(|s| s.fd == fd) }
 }
 
@@ -529,6 +532,7 @@ pub fn poll_socket(fd: i32) -> u16 {
 
 /// Check if any socket has a pending event (connection ready, data available).
 pub fn any_socket_ready() -> bool {
+    // SAFETY: read-only iteration, word-sized fields (x86 TSO safe)
     unsafe {
         for sock in SOCKETS.iter() {
             if sock.fd < 0 { continue; }

@@ -373,6 +373,8 @@ fn syscall_dispatch_inner(
         }
         SYS_STAT => sys_stat(a0 as *const u8, a1 as *mut u8),
         SYS_FSTAT => sys_fstat(a0 as i32, a1 as *mut u8),
+        // TODO: newfstatat(dirfd, pathname, statbuf, flags) — currently ignores pathname (a1)
+        // and treats a0 as fd for fstat. Works because ERTS uses it for open fds only.
         SYS_NEWFSTATAT => sys_fstat(a0 as i32, a2 as *mut u8),
         SYS_LSEEK => {
             if crate::vfs::is_vfs_fd(a0 as i32) {
@@ -397,9 +399,8 @@ fn syscall_dispatch_inner(
         SYS_IOCTL => -25, // -ENOTTY
         SYS_PREAD64 => {
             if crate::vfs::is_vfs_fd(a0 as i32) {
-                // pread64(fd, buf, count, offset)
-                crate::vfs::lseek(a0 as i32, a3 as i64, 0); // SEEK_SET
-                crate::vfs::read(a0 as i32, a1 as *mut u8, a2 as usize)
+                // pread64(fd, buf, count, offset) — atomic seek+read
+                crate::vfs::pread(a0 as i32, a1 as *mut u8, a2 as usize, a3 as usize)
             } else {
                 0
             }
