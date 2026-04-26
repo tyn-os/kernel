@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" font-family="monospace" font-size="11">
+  <style>
+    rect.cpu { fill: #f0f4ff; stroke: #4466aa; stroke-width: 1.5; rx: 6; }
+    rect.shared { fill: #fff9f0; stroke: #aa8844; stroke-width: 1.5; rx: 6; }
+    rect.hw { fill: #f0fff4; stroke: #44aa66; stroke-width: 1.5; rx: 6; }
+    rect.idle { fill: #f8f8f8; stroke: #bbb; stroke-width: 1; rx: 4; }
+    text.title { font-size: 14; font-weight: bold; fill: #333; }
+    text.section { font-size: 12; font-weight: bold; fill: #555; }
+    text.small { font-size: 10; fill: #666; }
+    line.conn { stroke: #88a; stroke-width: 1.2; marker-end: url(#ar2); }
+  </style>
+  <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#88a"/></marker></defs>
+
+  <text x="480" y="22" text-anchor="middle" class="title">Runtime Architecture: Serving TCP on 8 CPUs</text>
+
+  <!-- CPU 0 -->
+  <rect x="20" y="40" width="210" height="180" class="cpu"/>
+  <text x="30" y="60" class="section">CPU 0 (BSP)</text>
+  <text x="30" y="80" class="small">ERTS main thread (tid 0)</text>
+  <text x="30" y="95" class="small">  select() idle poll loop</text>
+  <text x="30" y="115" class="small">Kernel services:</text>
+  <text x="30" y="130" class="small">  APIC timer (100Hz)</text>
+  <text x="30" y="145" class="small">  Trampoline preemption</text>
+  <text x="30" y="160" class="small">  virtio-net IRQ → smoltcp</text>
+  <text x="30" y="175" class="small">  Syscall dispatch</text>
+  <text x="30" y="195" class="small">Per-CPU: GDT/TSS, GS_BASE</text>
+  <text x="30" y="210" class="small">         IST1, idle context</text>
+
+  <!-- CPU 1 -->
+  <rect x="250" y="40" width="210" height="180" class="cpu"/>
+  <text x="260" y="60" class="section">CPU 1</text>
+  <text x="260" y="80" class="small">ERTS scheduler 1</text>
+  <text x="260" y="95" class="small">  Erlang process execution</text>
+  <text x="260" y="115" class="small">  gen_tcp:accept/send</text>
+  <text x="260" y="135" class="small">Kernel services:</text>
+  <text x="260" y="150" class="small">  APIC timer (100Hz)</text>
+  <text x="260" y="165" class="small">  Trampoline preemption</text>
+  <text x="260" y="180" class="small">  Syscall dispatch</text>
+  <text x="260" y="200" class="small">Per-CPU: GDT/TSS, GS_BASE</text>
+  <text x="260" y="215" class="small">         IST1, idle context</text>
+
+  <!-- CPU 2-3 -->
+  <rect x="480" y="40" width="210" height="120" class="cpu"/>
+  <text x="490" y="60" class="section">CPUs 2-3</text>
+  <text x="490" y="80" class="small">ERTS dirty schedulers</text>
+  <text x="490" y="95" class="small">  Long-running BIFs</text>
+  <text x="490" y="115" class="small">Mostly idle (HLT)</text>
+  <text x="490" y="135" class="small">  Blocking futex → sleep</text>
+  <text x="490" y="150" class="small">  IPI wake on work</text>
+
+  <!-- CPU 4-7 -->
+  <rect x="710" y="40" width="230" height="120" class="idle"/>
+  <text x="720" y="60" class="section">CPUs 4-7</text>
+  <text x="720" y="80" class="small">ERTS aux/poll/signal threads</text>
+  <text x="720" y="95" class="small">  epoll_pwait, pipe read</text>
+  <text x="720" y="115" class="small">Idle: HLT (blocking futex)</text>
+  <text x="720" y="135" class="small">  Wake on IPI / timer</text>
+  <text x="720" y="150" class="small">  ~0% CPU when idle</text>
+
+  <!-- Shared state -->
+  <rect x="20" y="250" width="660" height="100" class="shared"/>
+  <text x="30" y="270" class="section">Shared State (all CPUs)</text>
+  <text x="30" y="290" class="small">Page tables: 4x 1GiB huge pages (identity-mapped, RWX)</text>
+  <text x="30" y="305" class="small">Heap: 2 MiB (linked_list_allocator, spinlock)</text>
+  <text x="30" y="320" class="small">Futex table: 64 buckets (per-bucket spinlock)</text>
+  <text x="30" y="335" class="small">VFS: cpio archive (500+ files), fd table (256 slots)</text>
+  <text x="400" y="290" class="small">Pipe table: 16 pipes (spinlock)</text>
+  <text x="400" y="305" class="small">Socket table: 32 sockets</text>
+  <text x="400" y="320" class="small">Thread table: 24 threads (spinlock)</text>
+  <text x="400" y="335" class="small">TSC: calibrated freq, per-CPU offsets</text>
+
+  <!-- Hardware -->
+  <rect x="700" y="250" width="240" height="100" class="hw"/>
+  <text x="710" y="270" class="section">Hardware (virtio/QEMU)</text>
+  <text x="710" y="290" class="small">virtio-net PCI</text>
+  <text x="710" y="305" class="small">  ↕ smoltcp TCP/IP stack</text>
+  <text x="710" y="320" class="small">  ↕ QEMU user-mode net</text>
+  <text x="710" y="335" class="small">  ↕ host: nc localhost 5555</text>
+
+  <!-- Connections -->
+  <line x1="125" y1="220" x2="125" y2="250" class="conn"/>
+  <line x1="355" y1="220" x2="355" y2="250" class="conn"/>
+  <line x1="585" y1="160" x2="585" y2="250" class="conn"/>
+  <line x1="820" y1="160" x2="820" y2="250" class="conn"/>
+  <line x1="680" y1="300" x2="700" y2="300" class="conn"/>
+
+  <!-- Futex phases -->
+  <rect x="20" y="380" width="920" height="55" class="shared"/>
+  <text x="30" y="400" class="section">Futex Strategy</text>
+  <text x="30" y="420" class="small">Init phase (0-2s): spin-yield (non-blocking) — resolves thread-progress registration barrier</text>
+  <text x="30" y="430" class="small">Post-init: proper blocking — threads sleep via per-CPU idle context, CPUs HLT, IPI wake on futex_wake</text>
+
+  <!-- Memory layout -->
+  <rect x="20" y="450" width="920" height="55" class="shared"/>
+  <text x="30" y="470" class="section">Memory Layout</text>
+  <text x="30" y="488" class="small">0x000000-0x400000: zero page + IVT    0x400000-0x1060000: ERTS segments    0x7000000: kernel stacks    0x8000000: mmap bump</text>
+  <text x="30" y="500" class="small">0xE000000: user stack (2MiB)    0xF000000: kernel .text/.rodata/.bss    0x12000000: ELF/CPIO copy buffers    2560 MiB RAM total</text>
+</svg>

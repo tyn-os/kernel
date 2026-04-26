@@ -197,6 +197,12 @@ cp elixir/lib/iex/ebin/*.beam staging/
 cd staging && find . -type f | sed 's|^\./||' | cpio -o -H newc > ../src/otp-rootfs.cpio
 ```
 
+## Architecture Diagrams
+
+- [Module structure](docs/module-structure.svg) — source file dependencies and line counts
+- [Boot flow](docs/boot-flow.svg) — from power-on to Erlang shell
+- [Runtime architecture](docs/runtime-arch.svg) — CPU layout and shared state when serving TCP
+
 ## Design Principles
 
 **Run the real BEAM.** Not a reimplementation — the actual ERTS, cross-compiled for Tyn's host interface.

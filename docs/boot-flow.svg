@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 680" font-family="monospace" font-size="11">
+  <style>
+    rect.step { fill: #f0f4ff; stroke: #4466aa; stroke-width: 1.5; rx: 4; }
+    rect.asm { fill: #fff4f0; stroke: #aa6644; stroke-width: 1.5; rx: 4; }
+    rect.user { fill: #f0fff4; stroke: #44aa66; stroke-width: 1.5; rx: 4; }
+    text.title { font-size: 14; font-weight: bold; fill: #333; }
+    text.phase { font-size: 12; font-weight: bold; fill: #666; }
+    line.flow { stroke: #88a; stroke-width: 1.5; marker-end: url(#arr); }
+    line.sys { stroke: #a86; stroke-width: 1.5; marker-end: url(#arr); stroke-dasharray: 4; }
+  </style>
+  <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#88a"/></marker></defs>
+
+  <text x="450" y="22" text-anchor="middle" class="title">Boot Flow: Power On to Erlang Shell</text>
+
+  <!-- Phase 1: Assembly boot -->
+  <text x="30" y="52" class="phase">1. Assembly Boot</text>
+  <rect x="30" y="60" width="180" height="35" class="asm"/><text x="40" y="82">multiboot.S: real mode</text>
+  <line x1="120" y1="95" x2="120" y2="108" class="flow"/>
+  <rect x="30" y="108" width="180" height="35" class="asm"/><text x="40" y="130">protected → long mode</text>
+  <line x1="120" y1="143" x2="120" y2="156" class="flow"/>
+  <rect x="30" y="156" width="180" height="35" class="asm"/><text x="40" y="178">GDT, page tables (4GiB)</text>
+  <line x1="120" y1="191" x2="120" y2="204" class="flow"/>
+  <rect x="30" y="204" width="180" height="35" class="asm"/><text x="40" y="226">jump to Rust main()</text>
+
+  <!-- Phase 2: Kernel init -->
+  <text x="250" y="52" class="phase">2. Kernel Init (main.rs)</text>
+  <rect x="250" y="60" width="200" height="28" class="step"/><text x="260" y="80">heap init (2 MiB)</text>
+  <rect x="250" y="95" width="200" height="28" class="step"/><text x="260" y="115">TSC calibrate (PIT ref)</text>
+  <rect x="250" y="130" width="200" height="28" class="step"/><text x="260" y="150">IDT + GDT/TSS (percpu)</text>
+  <rect x="250" y="165" width="200" height="28" class="step"/><text x="260" y="185">ACPI → MADT → 8 CPUs</text>
+  <rect x="250" y="200" width="200" height="28" class="step"/><text x="260" y="220">APIC init + timer cal</text>
+  <rect x="250" y="235" width="200" height="28" class="step"/><text x="260" y="255">boot 7 APs (trampoline)</text>
+  <rect x="250" y="270" width="200" height="28" class="step"/><text x="260" y="290">TSC sync (per-CPU offset)</text>
+  <rect x="250" y="305" width="200" height="28" class="step"/><text x="260" y="325">PCI scan → virtio-net</text>
+  <rect x="250" y="340" width="200" height="28" class="step"/><text x="260" y="360">smoltcp TCP/IP init</text>
+  <rect x="250" y="375" width="200" height="28" class="step"/><text x="260" y="395">VFS: cpio → 500+ files</text>
+  <rect x="250" y="410" width="200" height="28" class="step"/><text x="260" y="430">LSTAR MSRs (all CPUs)</text>
+  <rect x="250" y="445" width="200" height="28" class="step"/><text x="260" y="465">ELF load beam.smp</text>
+  <rect x="250" y="480" width="200" height="28" class="step"/><text x="260" y="500">build user stack + auxv</text>
+  <rect x="250" y="515" width="200" height="35" class="asm"/><text x="260" y="537">jmp to ERTS entry</text>
+
+  <!-- Phase 3: ERTS boot -->
+  <text x="490" y="52" class="phase">3. ERTS Boot (user mode)</text>
+  <rect x="490" y="60" width="200" height="28" class="user"/><text x="500" y="80">musl CRT → TLS init</text>
+  <rect x="490" y="95" width="200" height="28" class="user"/><text x="500" y="115">clone 9 threads</text>
+  <rect x="490" y="130" width="200" height="28" class="user"/><text x="500" y="150">thread-progress barrier</text>
+  <rect x="490" y="165" width="200" height="28" class="user"/><text x="500" y="185">open start.boot</text>
+  <rect x="490" y="200" width="200" height="28" class="user"/><text x="500" y="220">load 90+ .beam files</text>
+  <rect x="490" y="235" width="200" height="28" class="user"/><text x="500" y="255">kernel app + supervisor</text>
+  <rect x="490" y="270" width="200" height="28" class="user"/><text x="500" y="290">code_server, logger</text>
+  <rect x="490" y="305" width="200" height="28" class="user"/><text x="500" y="325">→ blocking futex enabled</text>
+  <rect x="490" y="340" width="200" height="28" class="user"/><text x="500" y="360">eval: gen_tcp:listen</text>
+  <rect x="490" y="375" width="200" height="35" class="user"/><text x="500" y="397">accept loop → serving TCP</text>
+
+  <!-- Phase 4: Syscall flow -->
+  <text x="730" y="52" class="phase">4. Syscall Flow</text>
+  <rect x="720" y="60" width="160" height="28" class="user"/><text x="730" y="80">ERTS calls libc fn</text>
+  <line x1="800" y1="88" x2="800" y2="98" class="sys"/>
+  <rect x="720" y="98" width="160" height="28" class="user"/><text x="730" y="118">musl → syscall insn</text>
+  <line x1="800" y1="126" x2="800" y2="136" class="sys"/>
+  <rect x="720" y="136" width="160" height="28" class="asm"/><text x="730" y="156">LSTAR → syscall_entry</text>
+  <line x1="800" y1="164" x2="800" y2="174" class="flow"/>
+  <rect x="720" y="174" width="160" height="28" class="step"/><text x="730" y="194">save regs, gs:[0] stack</text>
+  <line x1="800" y1="202" x2="800" y2="212" class="flow"/>
+  <rect x="720" y="212" width="160" height="28" class="step"/><text x="730" y="232">Rust dispatch (match)</text>
+  <line x1="800" y1="240" x2="800" y2="250" class="flow"/>
+  <rect x="720" y="250" width="160" height="28" class="step"/><text x="730" y="270">handle (futex/mmap/...)</text>
+  <line x1="800" y1="278" x2="800" y2="288" class="flow"/>
+  <rect x="720" y="288" width="160" height="28" class="step"/><text x="730" y="308">check_resched</text>
+  <line x1="800" y1="316" x2="800" y2="326" class="flow"/>
+  <rect x="720" y="326" width="160" height="28" class="asm"/><text x="730" y="346">restore regs, jmp rcx</text>
+  <line x1="800" y1="354" x2="800" y2="364" class="sys"/>
+  <rect x="720" y="364" width="160" height="28" class="user"/><text x="730" y="384">back in ERTS</text>
+
+  <!-- Legend -->
+  <rect x="720" y="430" width="16" height="12" class="asm"/><text x="742" y="441">Assembly/hardware</text>
+  <rect x="720" y="450" width="16" height="12" class="step"/><text x="742" y="461">Kernel (Rust)</text>
+  <rect x="720" y="470" width="16" height="12" class="user"/><text x="742" y="481">User mode (ERTS)</text>
+</svg>

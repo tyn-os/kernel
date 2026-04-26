@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 750" font-family="monospace" font-size="11">
+  <style>
+    rect.mod { fill: #f0f4ff; stroke: #4466aa; stroke-width: 1.5; rx: 4; }
+    rect.grp { fill: none; stroke: #aab; stroke-width: 1; stroke-dasharray: 4; rx: 6; }
+    text.title { font-size: 13; font-weight: bold; fill: #333; }
+    text.lines { font-size: 10; fill: #888; }
+    line.dep { stroke: #88a; stroke-width: 1; marker-end: url(#arrow); }
+    text.label { font-size: 9; fill: #666; }
+  </style>
+  <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#88a"/></marker></defs>
+
+  <text x="550" y="24" text-anchor="middle" class="title" font-size="15">Tyn Kernel Module Structure (5,739 lines)</text>
+
+  <!-- Boot -->
+  <rect x="20" y="45" width="200" height="110" class="grp"/>
+  <text x="30" y="62" class="label">Boot</text>
+  <rect x="30" y="70" width="85" height="30" class="mod"/><text x="40" y="90">multiboot.S</text><text x="125" y="90" class="lines">113</text>
+  <rect x="125" y="70" width="85" height="30" class="mod"/><text x="135" y="90">boot.rs</text><text x="210" y="90" class="lines">38</text>
+  <rect x="30" y="110" width="85" height="30" class="mod"/><text x="40" y="130">main.rs</text><text x="115" y="130" class="lines">263</text>
+  <rect x="125" y="110" width="85" height="30" class="mod"/><text x="135" y="130">lib.rs</text><text x="210" y="130" class="lines">30</text>
+
+  <!-- SMP -->
+  <rect x="240" y="45" width="240" height="150" class="grp"/>
+  <text x="250" y="62" class="label">SMP &amp; Scheduling</text>
+  <rect x="250" y="70" width="100" height="30" class="mod"/><text x="258" y="90">sched.rs</text><text x="345" y="90" class="lines">747</text>
+  <rect x="360" y="70" width="110" height="30" class="mod"/><text x="368" y="90">interrupts.rs</text><text x="465" y="90" class="lines">205</text>
+  <rect x="250" y="110" width="100" height="30" class="mod"/><text x="258" y="130">smp.rs</text><text x="345" y="130" class="lines">179</text>
+  <rect x="360" y="110" width="110" height="30" class="mod"/><text x="368" y="130">percpu.rs</text><text x="465" y="130" class="lines">116</text>
+  <rect x="250" y="150" width="100" height="30" class="mod"/><text x="258" y="170">acpi.rs</text><text x="345" y="170" class="lines">179</text>
+  <rect x="360" y="150" width="110" height="30" class="mod"/><text x="368" y="170">apic.rs</text><text x="465" y="170" class="lines">254</text>
+
+  <!-- Syscall -->
+  <rect x="500" y="45" width="160" height="70" class="grp"/>
+  <text x="510" y="62" class="label">Syscall Interface</text>
+  <rect x="510" y="70" width="140" height="30" class="mod"/><text x="518" y="90">syscall.rs</text><text x="635" y="90" class="lines">1242</text>
+
+  <!-- I/O -->
+  <rect x="680" y="45" width="180" height="110" class="grp"/>
+  <text x="690" y="62" class="label">I/O &amp; Storage</text>
+  <rect x="690" y="70" width="80" height="30" class="mod"/><text x="698" y="90">serial.rs</text><text x="770" y="90" class="lines">111</text>
+  <rect x="780" y="70" width="70" height="30" class="mod"/><text x="788" y="90">pipe.rs</text><text x="850" y="90" class="lines">240</text>
+  <rect x="690" y="110" width="80" height="30" class="mod"/><text x="698" y="130">vfs.rs</text><text x="770" y="130" class="lines">445</text>
+  <rect x="780" y="110" width="70" height="30" class="mod"/><text x="788" y="130">elf.rs</text><text x="850" y="130" class="lines">175</text>
+
+  <!-- Memory -->
+  <rect x="880" y="45" width="200" height="70" class="grp"/>
+  <text x="890" y="62" class="label">Memory</text>
+  <rect x="890" y="70" width="85" height="30" class="mod"/><text x="898" y="90">heap.rs</text><text x="970" y="90" class="lines">26</text>
+  <rect x="985" y="70" width="85" height="30" class="mod"/><text x="993" y="90">thread.rs</text><text x="1065" y="90" class="lines">404</text>
+
+  <!-- Networking -->
+  <rect x="240" y="220" width="520" height="110" class="grp"/>
+  <text x="250" y="237" class="label">Networking (net/)</text>
+  <rect x="250" y="245" width="85" height="30" class="mod"/><text x="258" y="265">mod.rs</text><text x="330" y="265" class="lines">100</text>
+  <rect x="345" y="245" width="105" height="30" class="mod"/><text x="353" y="265">socket.rs</text><text x="445" y="265" class="lines">565</text>
+  <rect x="460" y="245" width="95" height="30" class="mod"/><text x="468" y="265">device.rs</text><text x="550" y="265" class="lines">135</text>
+  <rect x="565" y="245" width="95" height="30" class="mod"/><text x="573" y="265">interface.rs</text><text x="655" y="265" class="lines">38</text>
+  <rect x="670" y="245" width="80" height="30" class="mod"/><text x="678" y="265">tcp_echo</text><text x="745" y="265" class="lines">73</text>
+  <rect x="250" y="285" width="85" height="30" class="mod"/><text x="258" y="305">hal.rs</text><text x="330" y="305" class="lines">52</text>
+
+  <!-- Dependency arrows -->
+  <line x1="120" y1="140" x2="250" y2="85" class="dep"/><!-- main→sched -->
+  <line x1="120" y1="140" x2="510" y2="85" class="dep"/><!-- main→syscall -->
+  <line x1="120" y1="140" x2="690" y2="85" class="dep"/><!-- main→vfs -->
+  <line x1="120" y1="140" x2="250" y2="265" class="dep"/><!-- main→net -->
+  <line x1="580" y1="100" x2="300" y2="85" class="dep"/><!-- syscall→sched -->
+  <line x1="580" y1="100" x2="730" y2="130" class="dep"/><!-- syscall→vfs -->
+  <line x1="580" y1="100" x2="815" y2="85" class="dep"/><!-- syscall→pipe -->
+  <line x1="580" y1="100" x2="397" y2="265" class="dep"/><!-- syscall→socket -->
+  <line x1="300" y1="140" x2="300" y2="85" class="dep"/><!-- smp→sched (via init_ap) -->
+  <line x1="410" y1="85" x2="300" y2="85" class="dep"/><!-- interrupts→sched -->
+  <line x1="250" y1="265" x2="340" y2="265" class="dep"/><!-- net/mod→socket -->
+  <line x1="250" y1="305" x2="460" y2="265" class="dep"/><!-- hal→device -->
+</svg>
