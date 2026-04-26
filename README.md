@@ -79,18 +79,15 @@ done
 
 ERTS is built with one compile-time change: `ETHR_YIELD_AFTER_BUSY_LOOPS=1` in `erts/lib_src/pthread/ethr_event.c` (default: 50). This directs the threading library to yield after a single spin iteration rather than busy-waiting.
 
-At the kernel level, Tyn's `futex_wait` returns immediately (spurious wakeup) rather than blocking the calling thread. ERTS and musl always recheck lock conditions in CAS loops after futex returns, so this is functionally correct. The combination means threads never sleep — they spin-yield on contention, relying on the 8-CPU preemptive scheduler for fairness.
+Tyn uses a hybrid futex strategy:
 
-**Trade-offs of non-blocking futex:**
-- CPU usage is 100% even when idle (threads spin-yield instead of sleeping)
-- Higher power consumption (no HLT during idle waits)
-- Workloads with genuine long waits burn CPU spinning instead of sleeping
+- **During ERTS init** (~first 2 seconds): `futex_wait` returns immediately (spin-yield) to avoid a thread-progress registration deadlock where blocked threads prevent other threads from registering with the progress system.
+- **After init**: `futex_wait` blocks properly — threads sleep and consume zero CPU until woken by `futex_wake`. Idle CPUs enter HLT.
 
-This is a workaround for a thread-progress init deadlock in ERTS's startup sequence, where blocked threads prevent other threads from registering with the progress system. Implementing proper blocking futex semantics (with the idle context infrastructure already in place) is planned — the current approach prioritizes correctness and stability over efficiency.
+The switch happens automatically after ERTS finishes loading boot modules. Normal operation uses real blocking semantics with proper sleep/wake.
 
 ### What's next
 
-- **Blocking futex** — proper sleep/wake semantics using the per-CPU idle context, eliminating the spin-yield workaround
 - **BEAM JIT** — BeamAsm support (requires IST-safe preemption for clone child stacks)
 - **Phoenix/Bandit** — run a web framework on Tyn
 - **Interactive shell** — IEx/Erlang shell with full stdin support
