@@ -199,9 +199,9 @@ cd staging && find . -type f | sed 's|^\./||' | cpio -o -H newc > ../src/otp-roo
 
 ## Architecture Diagrams
 
-- [Module structure](docs/module-structure.svg) — source file dependencies and line counts
-- [Boot flow](docs/boot-flow.svg) — from power-on to Erlang shell
-- [Runtime architecture](docs/runtime-arch.svg) — CPU layout and shared state when serving TCP
+- [Module structure](docs/module-structure.md) — source file dependencies and line counts
+- [Boot flow](docs/boot-flow.md) — from power-on to Erlang shell, syscall sequence
+- [Runtime architecture](docs/runtime-arch.md) — CPU layout, futex strategy, memory map
 
 ## Design Principles
 
