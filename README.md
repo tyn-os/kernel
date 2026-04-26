@@ -77,7 +77,7 @@ done
 
 ### ERTS build configuration
 
-ERTS is built with one compile-time change: `ETHR_YIELD_AFTER_BUSY_LOOPS=1` in `erts/lib_src/pthread/ethr_event.c` (default: 50). This directs the threading library to yield after a single spin iteration rather than busy-waiting.
+ERTS is built from unmodified OTP 27 source — no patches, no special defines. The only non-default configure flags are `--disable-jit` and `--without-*` for unused applications.
 
 Tyn uses a hybrid futex strategy:
 
@@ -137,10 +137,6 @@ Tyn embeds a statically-linked ERTS binary and a cpio archive of .beam files dir
 # On an x86_64 Linux host with musl-gcc installed:
 git clone --branch OTP-27.3.4.2 https://github.com/erlang/otp.git otp27
 cd otp27
-
-# Reduce ethr yield loop for unikernel environment (default: 50)
-sed -i 's/ETHR_YIELD_AFTER_BUSY_LOOPS 50/ETHR_YIELD_AFTER_BUSY_LOOPS 1/' \
-  erts/lib_src/pthread/ethr_event.c
 
 # Configure for static musl (no JIT, minimal dependencies)
 ./configure --disable-jit --without-javac --without-odbc --without-wx \
