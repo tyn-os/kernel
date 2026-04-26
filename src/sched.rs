@@ -109,6 +109,17 @@ static FUTEX_LOCKS: [Mutex<()>; FUTEX_BUCKETS] = {
 
 static NUM_CPUS: AtomicUsize = AtomicUsize::new(1);
 
+/// When false, futex_wait returns immediately (spin-yield mode for ERTS init).
+/// Switched to true once ERTS finishes thread-progress registration.
+static FUTEX_BLOCKING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Enable blocking futex. Called once ERTS init is past the thread-progress barrier.
+pub fn enable_blocking_futex() {
+    FUTEX_BLOCKING.store(true, core::sync::atomic::Ordering::Release);
+    crate::serial_println!("[sched] blocking futex enabled");
+}
+
 fn futex_bucket(addr: u64) -> usize {
     (addr as usize / 4) % FUTEX_BUCKETS
 }
@@ -440,12 +451,11 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
             return -11; // -EAGAIN
         }
 
-        // Never block — return 0 (spurious wakeup). With the corrected
-        // scheduler, 8 CPUs, and trampoline preemption, all threads get
-        // fair CPU time as spinners. This eliminates the thread-progress
-        // init deadlock where blocked threads prevent progress counters
-        // from advancing.
-        return 0;
+        // During ERTS init, return immediately (spin-yield) to avoid
+        // the thread-progress registration deadlock. After init, block properly.
+        if !FUTEX_BLOCKING.load(core::sync::atomic::Ordering::Acquire) {
+            return 0;
+        }
 
         let cpu = current_cpu() as usize;
         unsafe {

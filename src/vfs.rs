@@ -130,6 +130,15 @@ pub fn open(path: &[u8]) -> i64 {
             if let Ok(s) = core::str::from_utf8(path) {
                 serial_println!("[vfs] open {} ({} bytes)", s, x.1);
             }
+            // After enough modules are loaded, switch from spin-yield to
+            // blocking futex. The init phase loads ~80 .beam files; after
+            // that, lock contention is brief and blocking is safe.
+            static OPEN_COUNT: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0);
+            let n = OPEN_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n == 91 { // switch at the end of init (92 opens during boot)
+                crate::sched::enable_blocking_futex();
+            }
             x
         }
         None => return -2, // -ENOENT
