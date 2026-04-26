@@ -75,11 +75,25 @@ done
 - **Threading** — up to 16 CPUs, per-thread kernel stacks, atomic futex, preemptive + deferred scheduling
 - **I/O** — COM1 serial (stdin/stdout/stderr), PCI ECAM, virtio-net
 
+### ERTS build configuration
+
+ERTS is built with one compile-time change: `ETHR_YIELD_AFTER_BUSY_LOOPS=1` in `erts/lib_src/pthread/ethr_event.c` (default: 50). This directs the threading library to yield after a single spin iteration rather than busy-waiting.
+
+At the kernel level, Tyn's `futex_wait` returns immediately (spurious wakeup) rather than blocking the calling thread. ERTS and musl always recheck lock conditions in CAS loops after futex returns, so this is functionally correct. The combination means threads never sleep — they spin-yield on contention, relying on the 8-CPU preemptive scheduler for fairness.
+
+**Trade-offs of non-blocking futex:**
+- CPU usage is 100% even when idle (threads spin-yield instead of sleeping)
+- Higher power consumption (no HLT during idle waits)
+- Workloads with genuine long waits burn CPU spinning instead of sleeping
+
+This is a workaround for a thread-progress init deadlock in ERTS's startup sequence, where blocked threads prevent other threads from registering with the progress system. Implementing proper blocking futex semantics (with the idle context infrastructure already in place) is planned — the current approach prioritizes correctness and stability over efficiency.
+
 ### What's next
 
+- **Blocking futex** — proper sleep/wake semantics using the per-CPU idle context, eliminating the spin-yield workaround
+- **BEAM JIT** — BeamAsm support (requires IST-safe preemption for clone child stacks)
 - **Phoenix/Bandit** — run a web framework on Tyn
 - **Interactive shell** — IEx/Erlang shell with full stdin support
-- **Formal verification** — Verus proofs for critical kernel paths
 
 ## Building & Running
 
@@ -126,6 +140,10 @@ Tyn embeds a statically-linked ERTS binary and a cpio archive of .beam files dir
 # On an x86_64 Linux host with musl-gcc installed:
 git clone --branch OTP-27.3.4.2 https://github.com/erlang/otp.git otp27
 cd otp27
+
+# Reduce ethr yield loop for unikernel environment (default: 50)
+sed -i 's/ETHR_YIELD_AFTER_BUSY_LOOPS 50/ETHR_YIELD_AFTER_BUSY_LOOPS 1/' \
+  erts/lib_src/pthread/ethr_event.c
 
 # Configure for static musl (no JIT, minimal dependencies)
 ./configure --disable-jit --without-javac --without-odbc --without-wx \
