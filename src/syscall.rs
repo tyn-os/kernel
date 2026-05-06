@@ -291,8 +291,9 @@ const SYS_TGKILL: u64 = 234;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Next available mmap address (bump allocator for anonymous mappings).
-/// Must stay within the 4 GiB identity-mapped region and 256M RAM.
-static MMAP_NEXT: AtomicU64 = AtomicU64::new(0x0800_0000); // Start at 128 MiB
+/// Must stay within the 4 GiB identity-mapped region and 2560M RAM.
+/// Start above: ELF copy (288 MiB), CPIO copy (314 MiB + ~30 MiB = 344 MiB).
+static MMAP_NEXT: AtomicU64 = AtomicU64::new(0x1600_0000); // Start at 352 MiB
 
 /// brk heap top.
 static BRK_TOP: AtomicU64 = AtomicU64::new(0);
@@ -328,7 +329,14 @@ extern "C" fn syscall_dispatch(
     {
         static SC: AtomicU64 = AtomicU64::new(0);
         let c = SC.fetch_add(1, Ordering::Relaxed);
-        let _ = c;
+        // Per-thread trace — first 50 syscalls for each thread except tid 0
+        if idx > 0 && idx < 24 {
+            static T_COUNT: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+            let tc = T_COUNT[idx].fetch_add(1, Ordering::Relaxed);
+            if tc < 50 {
+                serial_println!("[t{}#{}] nr={} a0={:#x}", idx, tc, nr, a0);
+            }
+        }
     }
     if idx < 24 { IN_SYSCALL[idx].store(true, Ordering::Relaxed); }
     let result = syscall_dispatch_inner(nr, a0, a1, a2, a3, _a4);
@@ -348,7 +356,7 @@ fn syscall_dispatch_inner(
         SYS_READ => sys_read(a0 as i32, a1 as *mut u8, a2 as usize),
         SYS_EXIT_GROUP => sys_exit_group(a0 as i32),
         SYS_BRK => sys_brk(a0),
-        SYS_MMAP => sys_mmap(a0, a1, a2 as i32),
+        SYS_MMAP => sys_mmap(a0, a1, a2 as i32, a3 as i32),
         SYS_MUNMAP => 0, // no-op
         SYS_MPROTECT => 0, // no-op
         SYS_MADVISE => 0, // no-op
@@ -390,8 +398,11 @@ fn syscall_dispatch_inner(
         SYS_GETDENTS64 => sys_getdents64(a0 as i32, a1 as *mut u8, a2 as usize),
         SYS_PIPE | SYS_PIPE2 => sys_pipe(a0 as *mut i32),
         SYS_EPOLL_CREATE1 | 213 => 50, // fake epoll fd (213=epoll_create, 291=epoll_create1)
-        SYS_TIMERFD_CREATE => 51, // fake timerfd
-        SYS_EPOLL_CTL => 0,
+        SYS_TIMERFD_CREATE => {
+            serial_println!("[timerfd_create] flags={:#x} returning fd=51", a1);
+            51
+        }
+        SYS_EPOLL_CTL => sys_epoll_ctl(a1 as i32, a2 as i32, a3),
         SYS_EPOLL_WAIT | SYS_EPOLL_PWAIT => sys_epoll_wait(a0, a1, a2),
         SYS_RT_SIGACTION => 0, // record but no-op
         SYS_RT_SIGPROCMASK => 0,
@@ -441,31 +452,54 @@ fn syscall_dispatch_inner(
         SYS_SOCKETPAIR => sys_pipe(a3 as *mut i32), // fake as pipe pair
         SYS_PRCTL => 0, // no-op
         SYS_FUTEX => sys_futex(a0, a1, a2),
-        SYS_PPOLL => sys_ppoll(a0, a1),
+        SYS_PPOLL => sys_ppoll(a0, a1, a2),
         SYS_SELECT => {
-            // select(0, NULL, NULL, NULL, ...) is ERTS's idle poll.
-            // Don't yield — just return immediately so the scheduler loop runs fast.
-            if a0 == 0 {
-                0
+            // select(nfds, readfds, writefds, exceptfds, *timeval)
+            // a4 is *timeval — if non-NULL, sleep for that duration.
+            // ERTS uses select(0, NULL, NULL, NULL, &t) as a precise sleep;
+            // without honoring the timeout, ERTS spins in a tight loop.
+            crate::net::poll();
+            let timeout_ptr = _a4 as *const u64;
+            let target_ns = if !timeout_ptr.is_null() {
+                let tv_sec = unsafe { *timeout_ptr };
+                let tv_usec = unsafe { *timeout_ptr.add(1) };
+                let ns = tv_sec.saturating_mul(1_000_000_000)
+                    .saturating_add(tv_usec.saturating_mul(1_000));
+                Some(crate::syscall::monotonic_ns().saturating_add(ns))
             } else {
-                crate::net::poll();
+                None
+            };
+            // Yield repeatedly until the timeout expires (or just once if no timeout).
+            loop {
                 crate::sched::yield_current();
-                0
+                match target_ns {
+                    Some(deadline) => {
+                        if crate::syscall::monotonic_ns() >= deadline {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
             }
+            0
         }
-        SYS_TIMERFD_SETTIME => 0,
+        SYS_TIMERFD_SETTIME => sys_timerfd_settime(a0 as i32, a1 as i32, a2),
         SYS_SCHED_YIELD => {
             crate::sched::yield_current();
             0
         }
         SYS_NANOSLEEP => { crate::sched::yield_current(); 0 }
-        SYS_FORK => -38, // -ENOSYS
+        SYS_FORK => 42, // fake child PID — unikernel has no child processes
         SYS_CLONE => {
             // Allow clone but log. With our single-scheduler ERTS patch,
             // only 2 auxiliary threads are created (signal handler + poll).
             sys_clone(a0, a1, a2, a3, _a4)
         }
-        SYS_EXIT => sys_exit_group(a0 as i32),
+        SYS_EXIT => {
+            // Single thread exit — mark thread as dead and yield
+            crate::sched::thread_exit();
+            0 // unreachable
+        }
         // Socket syscalls
         41 => crate::net::socket::sys_socket(a0 as i32, a1 as i32, a2 as i32),
         42 => -115, // connect → -EINPROGRESS (TODO)
@@ -490,7 +524,25 @@ fn syscall_dispatch_inner(
             }
             total
         }
-        47 => -11, // recvmsg → -EAGAIN
+        47 => { // recvmsg — parse msghdr and read into first iov buffer
+            let fd = a0 as i32;
+            if crate::net::socket::is_socket_fd(fd) {
+                // struct msghdr { void *name; socklen_t namelen; struct iovec *iov;
+                //                 size_t iovlen; void *control; size_t controllen; int flags; }
+                let iov_ptr = unsafe { *((a1 + 16) as *const u64) };
+                let iov_len = unsafe { *((a1 + 24) as *const u64) };
+                if iov_len > 0 {
+                    let base = unsafe { *(iov_ptr as *const u64) } as *mut u8;
+                    let len = unsafe { *((iov_ptr + 8) as *const u64) } as usize;
+                    crate::net::socket::sys_recvfrom(fd, base, len, a2 as i32,
+                        core::ptr::null_mut(), core::ptr::null_mut())
+                } else {
+                    0
+                }
+            } else {
+                -11 // -EAGAIN for non-socket fds
+            }
+        }
         48 => 0,   // shutdown → success
         49 => crate::net::socket::sys_bind(a0 as i32, a1 as *const u8, a2 as u32),
         50 => crate::net::socket::sys_listen(a0 as i32, a1 as i32),
@@ -530,14 +582,9 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
                 serial_println!("[pipe] write fd={} count={} result={}", fd, count, result);
             }
         }
-        // Auto-respond on erl_child_setup response pipe.
-        // When writing to the command pipe (odd fd like 205, 207, ...),
-        // simulate erl_child_setup by writing a 0 byte to the response
-        // pipe (fd - 2, which is the write end of the response pipe).
-        if fd >= 205 && fd % 2 == 1 && crate::pipe::is_pipe_fd(fd - 2) {
-            let r = crate::pipe::write(fd - 2, [0u8].as_ptr(), 1);
-            serial_println!("[auto-resp] wrote {} byte(s) to fd {}", r, fd - 2);
-        }
+        // No auto-respond — Linux strace confirms the 4-byte write to a pipe
+        // is normal inter-thread coordination, not a request for response.
+        // The OTP 20 era auto-respond for erl_child_setup was misguided for OTP 27.
         result
     } else if crate::net::socket::is_socket_fd(fd) {
         let r = crate::net::socket::sys_sendto(fd, buf, count, 0, core::ptr::null(), 0);
@@ -559,11 +606,25 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     if crate::pipe::is_pipe_fd(fd) {
         return crate::pipe::read(fd, buf, count);
     }
-    // timerfd read: return expiration count (1).
+    // Synthetic /sys files: return "0\n" once, then EOF
+    if fd as i64 == FD_SYNTH_ZERO {
+        if count >= 2 {
+            unsafe {
+                *buf = b'0';
+                *buf.add(1) = b'\n';
+            }
+            return 2;
+        }
+        return 0;
+    }
+    // timerfd read: return expiration count from current state.
     if fd == 51 {
-        crate::sched::yield_current();
+        let n = timerfd_consume();
+        if n == 0 {
+            return -11; // -EAGAIN: nothing to read yet
+        }
         if count >= 8 {
-            unsafe { *(buf as *mut u64) = 1; }
+            unsafe { *(buf as *mut u64) = n; }
         }
         return 8;
     }
@@ -612,17 +673,21 @@ fn sys_brk(addr: u64) -> i64 {
     }
 }
 
-fn sys_mmap(addr: u64, length: u64, _prot: i32) -> i64 {
+fn sys_mmap(addr: u64, length: u64, _prot: i32, flags: i32) -> i64 {
+    const MAP_FIXED: i32 = 0x10;
     let aligned = (length + 0xFFF) & !0xFFF; // page-align
-    if addr != 0 {
-        // Fixed address — zero it
+
+    // Only honor `addr` if MAP_FIXED is set. Otherwise it's just a hint —
+    // using it blindly can zero out memory that's already in use (e.g., the
+    // loaded ELF's .rodata containing preloaded BEAM modules).
+    if addr != 0 && (flags & MAP_FIXED) != 0 {
         // SAFETY: addr is identity-mapped within our 4 GiB region.
         if aligned <= 0x400_0000 { // up to 64 MiB
             unsafe { core::ptr::write_bytes(addr as *mut u8, 0, aligned as usize) };
         }
         addr as i64
     } else {
-        // Allocate from bump allocator and zero
+        // Allocate from bump allocator (ignore non-FIXED hint addresses).
         let result = MMAP_NEXT.fetch_add(aligned, Ordering::Relaxed);
         // SAFETY: result is identity-mapped within RAM.
         // QEMU zeros all RAM on boot, so only re-zero allocations that
@@ -666,14 +731,16 @@ fn sys_uname(buf: *mut u8) -> i64 {
 }
 
 fn sys_sched_getaffinity(len: usize, mask: *mut u8) -> i64 {
-    // Report 1 CPU (bit 0 set)
+    // Report all configured CPUs. NUM_CPUS is set during sched::init.
+    // The 1-CPU bug from earlier was fixed in session 5.
     if len >= 8 {
-        // SAFETY: mask points to user memory.
+        let ncpus = crate::sched::num_cpus().min(64);
+        let mask_val: u64 = if ncpus >= 64 { !0u64 } else { (1u64 << ncpus) - 1 };
         unsafe {
             core::ptr::write_bytes(mask, 0, len);
-            *mask = 1; // CPU 0
+            *(mask as *mut u64) = mask_val;
         }
-        8 // return size of mask written
+        8
     } else {
         -22 // -EINVAL
     }
@@ -704,6 +771,8 @@ fn sys_prlimit64(_new: *const u8, old: *mut u8) -> i64 {
 
 /// Fake fd for /dev/null.
 const FD_DEVNULL: i64 = 100;
+const FD_SYNTH_ZERO: i64 = 101; // synthetic file: read returns "0\n"
+const FD_SYNTH_DIR: i64 = 102;  // synthetic empty directory: getdents64 returns 0
 
 fn sys_open(a0: u64, a1: u64, nr: u64) -> i64 {
     // For SYS_OPENAT, the filename is in a1 (a0 is dirfd).
@@ -729,10 +798,42 @@ fn sys_open(a0: u64, a1: u64, nr: u64) -> i64 {
         return FD_DEVNULL;
     }
 
+    // Synthetic /sys files for CPU topology — ERTS reads these to detect cores.
+    // Returning a fake fd whose read yields "0\n" lets ERTS proceed past
+    // its CPU topology detection phase (without these, ERTS hangs).
+    if path.starts_with(b"/sys/devices/system/cpu/cpu")
+        && (path.ends_with(b"/topology/physical_package_id")
+            || path.ends_with(b"/topology/core_id")
+            || path.ends_with(b"/topology/thread_siblings_list")
+            || path.ends_with(b"/topology/core_siblings_list"))
+    {
+        return FD_SYNTH_ZERO;
+    }
+    // Synthetic /sys directories — empty dirs so ERTS's getdents64 returns 0 entries
+    // and ERTS proceeds with default topology assumptions.
+    if path == b"/sys/devices/system/node"
+        || path == b"/sys/devices/system/cpu"
+        || path.starts_with(b"/sys/devices/system/node/node")
+        || path.starts_with(b"/sys/devices/system/cpu/cpu")
+    {
+        return FD_SYNTH_DIR;
+    }
+
     // Try the VFS (cpio archive)
     let vfs_fd = crate::vfs::open(path);
     if vfs_fd >= 0 {
         return vfs_fd;
+    }
+
+    // Trace failed opens to see what ERTS is looking for
+    {
+        static FAIL_LOG: AtomicU64 = AtomicU64::new(0);
+        let n = FAIL_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 100 {
+            if let Ok(s) = core::str::from_utf8(path) {
+                serial_println!("[open ENOENT] {}", s);
+            }
+        }
     }
 
     // Log failed opens for .beam files (debugging standard_error loading)
@@ -756,6 +857,11 @@ fn sys_open(a0: u64, a1: u64, nr: u64) -> i64 {
 }
 
 fn sys_getdents64(fd: i32, buf: *mut u8, count: usize) -> i64 {
+    // Synthetic empty dir: return 0 (no entries)
+    if fd as i64 == FD_SYNTH_DIR {
+        let _ = (buf, count);
+        return 0;
+    }
     crate::vfs::getdents64(fd, buf, count)
 }
 
@@ -798,7 +904,12 @@ fn sys_stat(path_ptr: *const u8, buf: *mut u8) -> i64 {
     }
 
     // Check if it's a known directory prefix
-    if path.starts_with(b"/otp") {
+    if path.starts_with(b"/otp")
+        || path == b"/sys/devices/system/node"
+        || path == b"/sys/devices/system/cpu"
+        || path.starts_with(b"/sys/devices/system/node/node")
+        || path.starts_with(b"/sys/devices/system/cpu/cpu")
+    {
         if !buf.is_null() {
             unsafe {
                 let mode_ptr = buf.add(24) as *mut u32;
@@ -855,6 +966,7 @@ fn sys_pipe(fds: *mut i32) -> i64 {
         return -22; // -EINVAL
     }
     let (read_fd, write_fd) = crate::pipe::create();
+    serial_println!("[sys_pipe] created ({}, {})", read_fd, write_fd);
     // SAFETY: fds points to user memory (two consecutive i32s).
     unsafe {
         *fds = read_fd;
@@ -897,32 +1009,79 @@ fn sys_clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
 /// epoll_wait: yield once, then check for ready events.
 /// Returns 0 (no events / timeout) so the caller runs its housekeeping loop.
 /// struct epoll_event { u32 events; u64 data; } = 12 bytes
+/// Epoll fd registration table. ERTS calls epoll_ctl(epfd, ADD, fd, &event)
+/// where event.data is what we should return when fd becomes ready.
+/// We track (fd, data) pairs so epoll_wait can return the correct user data.
+const EPOLL_MAX: usize = 64;
+#[derive(Copy, Clone)]
+struct EpollEntry { fd: i32, data: u64, events: u32 }
+static mut EPOLL_TABLE: [EpollEntry; EPOLL_MAX] =
+    [EpollEntry { fd: -1, data: 0, events: 0 }; EPOLL_MAX];
+static EPOLL_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+fn sys_epoll_ctl(op: i32, fd: i32, event_ptr: u64) -> i64 {
+    {
+        static LOG: AtomicU64 = AtomicU64::new(0);
+        let n = LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 30 {
+            serial_println!("[epoll_ctl] op={} fd={}", op, fd);
+        }
+    }
+    // op: 1=ADD, 2=DEL, 3=MOD
+    // event struct: { u32 events; u64 data; } (packed, 12 bytes)
+    let _g = EPOLL_LOCK.lock();
+    unsafe {
+        if op == 2 { // DEL
+            for e in EPOLL_TABLE.iter_mut() {
+                if e.fd == fd { e.fd = -1; e.data = 0; e.events = 0; }
+            }
+            return 0;
+        }
+        // ADD or MOD
+        let events = if event_ptr != 0 { *(event_ptr as *const u32) } else { 0 };
+        let data = if event_ptr != 0 { *((event_ptr + 4) as *const u64) } else { 0 };
+        // Find existing or empty slot
+        for e in EPOLL_TABLE.iter_mut() {
+            if e.fd == fd { e.data = data; e.events = events; return 0; }
+        }
+        for e in EPOLL_TABLE.iter_mut() {
+            if e.fd == -1 { e.fd = fd; e.data = data; e.events = events; return 0; }
+        }
+    }
+    0 // table full — silently succeed
+}
+
 fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64) -> i64 {
     crate::net::poll();
     crate::sched::yield_current();
 
-    // Check for pipe data
     let mut count = 0i64;
     let max = maxevents as usize;
     const EPOLLIN: u32 = 0x001;
 
-    if count < max as i64 && crate::pipe::any_has_data() {
-        unsafe {
-            let ev = events_ptr as *mut u8;
-            *(ev as *mut u32) = EPOLLIN;
-            *((ev as u64 + 4) as *mut u64) = 200;
+    // Check each registered fd for readiness; return its registered `data`.
+    let _g = EPOLL_LOCK.lock();
+    unsafe {
+        for e in EPOLL_TABLE.iter() {
+            if count >= max as i64 { break; }
+            if e.fd < 0 { continue; }
+            let ready = if e.fd == 51 {
+                timerfd_ready()
+            } else if crate::pipe::is_pipe_fd(e.fd) {
+                crate::pipe::has_data(e.fd)
+            } else if crate::net::socket::is_socket_fd(e.fd) {
+                crate::net::socket::poll_socket(e.fd) & 0x1 != 0
+            } else {
+                false
+            };
+            if ready {
+                let off = (count as u64) * 12;
+                let ev = (events_ptr + off) as *mut u8;
+                *(ev as *mut u32) = EPOLLIN;
+                *((ev as u64 + 4) as *mut u64) = e.data;
+                count += 1;
+            }
         }
-        count += 1;
-    }
-
-    // Check socket readiness (for gen_tcp accept/recv)
-    if count < max as i64 && crate::net::socket::any_socket_ready() {
-        unsafe {
-            let ev = (events_ptr + (count as u64) * 12) as *mut u8;
-            *(ev as *mut u32) = EPOLLIN;
-            *((ev as u64 + 4) as *mut u64) = 500; // socket fd base
-        }
-        count += 1;
     }
 
     count
@@ -930,10 +1089,22 @@ fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64) -> i64 {
 
 /// ppoll: check pollfds for ready pipe fds.
 /// struct pollfd { int fd; short events; short revents; } — 8 bytes each.
-fn sys_ppoll(fds_ptr: u64, nfds: u64) -> i64 {
+fn sys_ppoll(fds_ptr: u64, nfds: u64, timeout_ptr: u64) -> i64 {
     // Poll the network stack so smoltcp processes packets and updates
     // socket readiness before we check pollfds.
     crate::net::poll();
+
+    // Honor the timeout (struct timespec: { time_t tv_sec; long tv_nsec; }).
+    // Without this, ppoll returns 0 instantly and ERTS spins.
+    let target_ns = if timeout_ptr != 0 {
+        let tv_sec = unsafe { *(timeout_ptr as *const u64) };
+        let tv_nsec = unsafe { *((timeout_ptr + 8) as *const u64) };
+        let ns = tv_sec.saturating_mul(1_000_000_000).saturating_add(tv_nsec);
+        Some(monotonic_ns().saturating_add(ns))
+    } else {
+        None
+    };
+    let _ = target_ns; // initial ready check below; if 0 events, sleep loop
 
     crate::sched::yield_current();
 
@@ -952,39 +1123,59 @@ fn sys_ppoll(fds_ptr: u64, nfds: u64) -> i64 {
         }
     }
 
-    // Check pollfds
-    let mut ready = 0i64;
     const POLLIN: u16 = 0x0001;
 
-    for i in 0..nfds as usize {
-        // SAFETY: fds_ptr is identity-mapped user memory.
-        unsafe {
-            let pfd = (fds_ptr + (i as u64) * 8) as *mut u8;
-            let fd = *(pfd as *const i32);
-            let events = *((pfd as u64 + 4) as *const u16);
-            // Clear revents
-            *((pfd as u64 + 6) as *mut u16) = 0;
-            if events != 0 {
-                let revents = if fd == 0 {
-                    // stdin: check COM1 LSR bit 0
-                    if (events & POLLIN) != 0 && (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 1) != 0 {
-                        POLLIN
-                    } else { 0 }
-                } else if crate::pipe::is_pipe_fd(fd) {
-                    if (events & POLLIN) != 0 && crate::pipe::has_data(fd) { POLLIN } else { 0 }
-                } else if crate::net::socket::is_socket_fd(fd) {
-                    crate::net::socket::poll_socket(fd) & events
-                } else {
-                    0
-                };
-                if revents != 0 {
-                    *((pfd as u64 + 6) as *mut u16) = revents;
-                    ready += 1;
+    // Inner: scan all pollfds, fill revents, return count of ready fds.
+    let scan_once = || -> i64 {
+        let mut ready = 0i64;
+        for i in 0..nfds as usize {
+            unsafe {
+                let pfd = (fds_ptr + (i as u64) * 8) as *mut u8;
+                let fd = *(pfd as *const i32);
+                let events = *((pfd as u64 + 4) as *const u16);
+                *((pfd as u64 + 6) as *mut u16) = 0;
+                if events != 0 {
+                    let revents = if fd == 0 {
+                        if (events & POLLIN) != 0 && (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 1) != 0 {
+                            POLLIN
+                        } else { 0 }
+                    } else if fd == 51 {
+                        if (events & POLLIN) != 0 && timerfd_ready() { POLLIN } else { 0 }
+                    } else if crate::pipe::is_pipe_fd(fd) {
+                        if (events & POLLIN) != 0 && crate::pipe::has_data(fd) { POLLIN } else { 0 }
+                    } else if crate::net::socket::is_socket_fd(fd) {
+                        crate::net::socket::poll_socket(fd) & events
+                    } else { 0 };
+                    if revents != 0 {
+                        *((pfd as u64 + 6) as *mut u16) = revents;
+                        ready += 1;
+                    }
                 }
             }
         }
+        ready
+    };
+
+    let initial = scan_once();
+    if initial > 0 { return initial; }
+
+    // No fds ready — honor timeout by yielding until deadline or fd becomes ready.
+    loop {
+        crate::sched::yield_current();
+        crate::net::poll();
+        let n = scan_once();
+        if n > 0 { return n; }
+        match target_ns {
+            Some(deadline) => {
+                if monotonic_ns() >= deadline { return 0; }
+            }
+            None => {
+                // No timeout — block until something becomes ready.
+                // Since we don't have eventfd-style blocking, just keep yielding.
+                // The yield gives other threads CPU; eventually one writes to a pipe.
+            }
+        }
     }
-    ready // 0 = no ready fds
 }
 
 fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
@@ -1025,25 +1216,49 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
 }
 
 fn sys_readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
-    // Check if it's /proc/self/exe
-    let exe = b"/proc/self/exe";
-    let is_self_exe = unsafe {
-        (0..exe.len()).all(|i| *path.add(i) == exe[i]) && *path.add(exe.len()) == 0
-    };
+    // Read path string for logging/comparison
+    let mut path_buf = [0u8; 256];
+    let mut path_len = 0;
+    unsafe {
+        while path_len < 255 {
+            let b = *path.add(path_len);
+            if b == 0 { break; }
+            path_buf[path_len] = b;
+            path_len += 1;
+        }
+    }
+    let path_slice = &path_buf[..path_len];
 
-    if is_self_exe {
+    if path_slice == b"/proc/self/exe" {
         let target = b"/otp/erts-15.2.7/bin/beam.smp";
         let len = target.len().min(bufsiz);
-        // SAFETY: buf is identity-mapped user memory.
         unsafe { core::ptr::copy_nonoverlapping(target.as_ptr(), buf, len); }
-        len as i64
-    } else {
-        -22 // -EINVAL
+        return len as i64;
     }
+    // Trace failed readlinks
+    {
+        static FAIL: AtomicU64 = AtomicU64::new(0);
+        let n = FAIL.fetch_add(1, Ordering::Relaxed);
+        if n < 30 {
+            if let Ok(s) = core::str::from_utf8(path_slice) {
+                serial_println!("[readlink fail] {}", s);
+            }
+        }
+    }
+    // EINVAL = "not a symlink" (path exists but is a regular file/directory)
+    // ERTS uses readlink to detect symlinks; EINVAL tells it to treat the path
+    // as a regular file/dir and proceed. ENOENT would make ERTS give up.
+    -22 // -EINVAL
 }
 
 /// Last returned nanosecond value — ensures monotonicity.
 static LAST_TIME_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU last returned ns; used to detect kernel-level backwards regressions.
+static LAST_RETURNED_PER_CPU: [AtomicU64; 16] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; 16]
+};
 
 /// TSC frequency in Hz, calibrated against PIT at boot.
 static TSC_FREQ_HZ: AtomicU64 = AtomicU64::new(2_000_000_000); // default 2 GHz
@@ -1143,6 +1358,71 @@ pub fn ap_tsc_sync() {
     }
 }
 
+/// Timerfd state: deadline (monotonic_ns) when the timer fires next.
+/// 0 = disarmed. ERTS uses a single timerfd (we return fd 51 from create).
+static TIMERFD_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
+
+fn sys_timerfd_settime(_fd: i32, flags: i32, new_value_ptr: u64) -> i64 {
+    {
+        static LOG: AtomicU64 = AtomicU64::new(0);
+        let n = LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 5 {
+            if new_value_ptr != 0 {
+                let s = unsafe { *((new_value_ptr + 16) as *const u64) };
+                let ns = unsafe { *((new_value_ptr + 24) as *const u64) };
+                serial_println!("[timerfd_settime] flags={} sec={} nsec={}", flags, s, ns);
+            } else {
+                serial_println!("[timerfd_settime] disarm");
+            }
+        }
+    }
+    // struct itimerspec { struct timespec it_interval; struct timespec it_value; }
+    // struct timespec  { time_t tv_sec; long tv_nsec; }
+    // Layout (16 bytes interval, 16 bytes value):
+    //   off  0: it_interval.tv_sec
+    //   off  8: it_interval.tv_nsec
+    //   off 16: it_value.tv_sec
+    //   off 24: it_value.tv_nsec
+    if new_value_ptr == 0 {
+        TIMERFD_DEADLINE_NS.store(0, Ordering::Release);
+        return 0;
+    }
+    let it_value_sec = unsafe { *((new_value_ptr + 16) as *const u64) };
+    let it_value_nsec = unsafe { *((new_value_ptr + 24) as *const u64) };
+    if it_value_sec == 0 && it_value_nsec == 0 {
+        TIMERFD_DEADLINE_NS.store(0, Ordering::Release);
+        return 0;
+    }
+    let dur_ns = it_value_sec.saturating_mul(1_000_000_000).saturating_add(it_value_nsec);
+    // TFD_TIMER_ABSTIME (flag bit 0) = absolute time; otherwise relative.
+    const TFD_TIMER_ABSTIME: i32 = 1;
+    let deadline = if flags & TFD_TIMER_ABSTIME != 0 {
+        dur_ns
+    } else {
+        monotonic_ns().saturating_add(dur_ns)
+    };
+    TIMERFD_DEADLINE_NS.store(deadline, Ordering::Release);
+    0
+}
+
+/// Has the timerfd's deadline passed? Used by epoll_wait/ppoll.
+pub fn timerfd_ready() -> bool {
+    let deadline = TIMERFD_DEADLINE_NS.load(Ordering::Acquire);
+    deadline != 0 && monotonic_ns() >= deadline
+}
+
+/// Reset the timerfd after read. Returns the expiration count (1 if fired).
+pub fn timerfd_consume() -> u64 {
+    let deadline = TIMERFD_DEADLINE_NS.load(Ordering::Acquire);
+    if deadline != 0 && monotonic_ns() >= deadline {
+        // Disarm — the timer fires once. ERTS will call settime again.
+        TIMERFD_DEADLINE_NS.store(0, Ordering::Release);
+        1
+    } else {
+        0
+    }
+}
+
 /// Return a monotonically increasing nanosecond value.
 /// Uses per-CPU TSC offset correction and a global ratchet.
 pub fn monotonic_ns() -> u64 {
@@ -1162,20 +1442,39 @@ pub fn monotonic_ns() -> u64 {
     let freq_mhz = TSC_FREQ_HZ.load(Ordering::Relaxed) / 1_000_000;
     let total_ns = if freq_mhz > 0 { corrected_tsc * 1000 / freq_mhz } else { corrected_tsc / 2 };
 
-    // Ratchet: never go backwards
-    let mut last = LAST_TIME_NS.load(Ordering::SeqCst);
-    let result = loop {
-        let new = total_ns.max(last + 1);
-        match LAST_TIME_NS.compare_exchange(last, new, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => break new,
-            Err(actual) => last = actual,
+    // Ratchet: atomically advance LAST_TIME_NS to max(prev, total_ns).
+    let prev = LAST_TIME_NS.fetch_max(total_ns, Ordering::SeqCst);
+    let result = prev.max(total_ns);
+
+    // Per-CPU diagnostic: detect any backwards jump from this CPU's POV.
+    if cpu < 16 {
+        let last = LAST_RETURNED_PER_CPU[cpu].load(Ordering::Relaxed);
+        if result < last {
+            // Diagnostic: we're returning a value smaller than a previous return
+            // from the same CPU. This SHOULD be impossible with the global ratchet.
+            static REPORTED: AtomicU64 = AtomicU64::new(0);
+            if REPORTED.fetch_add(1, Ordering::Relaxed) < 5 {
+                serial_println!("[mono-bug] cpu={} prev_last={} result={} prev_ratchet={} total_ns={} raw_tsc={} offset={} freq_mhz={}",
+                    cpu, last, result, prev, total_ns, raw_tsc, offset, freq_mhz);
+            }
         }
-    };
+        // Ratchet per-CPU as well, for paranoia.
+        LAST_RETURNED_PER_CPU[cpu].fetch_max(result, Ordering::Relaxed);
+    }
+
     if were_enabled { x86_64::instructions::interrupts::enable(); }
     result
 }
 
 fn sys_clock_gettime(_clk_id: i32, tp: *mut u64) -> i64 {
+    // Track call rate to verify musl is hitting our syscall (not vDSO bypass).
+    {
+        static CG_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = CG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n == 100 || n == 1000 || n == 10000 {
+            serial_println!("[clock_gettime] called {} times", n);
+        }
+    }
     if tp.is_null() {
         return -22; // -EINVAL
     }

@@ -102,12 +102,12 @@ pub fn read(fd: i32, buf: *mut u8, count: usize) -> i64 {
                     if c < 10 { crate::serial_println!("[pipe] read fd={} got {} bytes", fd, nread); }
                     return nread as i64;
                 }
+                // Write end closed → EOF
+                if pipe.write_fd == -1 { return 0; }
                 if pipe.nonblock { return -11; }
                 drop(_lock);
                 crate::sched::yield_current();
-                x86_64::instructions::interrupts::enable();
-                x86_64::instructions::hlt();
-                return -4; // -EINTR
+                return -4; // -EINTR — let caller retry
             }
         }
     }
@@ -141,13 +141,18 @@ pub fn has_data(fd: i32) -> bool {
 }
 
 /// Close a pipe fd.
+/// Write-end closes are silently ignored — keeps the pipe alive so reads
+/// don't return EOF. This prevents the forker driver from crashing when
+/// the fake fork's write end is "closed" by the parent.
 pub fn close(fd: i32) {
     let _lock = PIPE_LOCK.lock();
     unsafe {
         for pipe in PIPES.iter_mut() {
-            if pipe.read_fd == fd { pipe.read_fd = -1; }
-            if pipe.write_fd == fd { pipe.write_fd = -1; }
-            if pipe.read_fd == -1 && pipe.write_fd == -1 { *pipe = Pipe::empty(); }
+            if pipe.read_fd == fd {
+                pipe.read_fd = -1;
+                if pipe.write_fd == -1 { *pipe = Pipe::empty(); }
+            }
+            // Don't close write ends — keeps pipe alive for forker stub
         }
     }
 }

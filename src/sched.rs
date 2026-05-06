@@ -31,13 +31,14 @@ enum State {
 /// Saved thread context for context switching.
 #[repr(C)]
 struct ThreadCtx {
-    rsp: u64,
-    rbx: u64,
-    rbp: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
+    rsp: u64,    //  0
+    rbx: u64,    //  8
+    rbp: u64,    // 16
+    r12: u64,    // 24
+    r13: u64,    // 32
+    r14: u64,    // 40
+    r15: u64,    // 48
+    fs_base: u64, // 56  — TLS pointer; restored via WRMSR(0xC000_0100)
 }
 
 /// Thread control block.
@@ -55,6 +56,7 @@ struct Thread {
     in_idle_ctx: bool, // true if blocked via idle context (don't add to queue on wake)
     clone_r9: u64,     // saved R9 for child (musl's fn pointer)
     clone_rip: u64,    // saved return RIP for child
+    home_cpu: u32,     // CPU where this thread was created (futex_wake targets this)
 }
 
 /// Per-CPU run queue.
@@ -86,7 +88,7 @@ static mut CPU_QUEUES: [CpuQueue; MAX_CPUS] = {
 /// thread's register state to be properly saved in its ctx, so that
 /// futex_wake can safely resume it on any CPU.
 static mut IDLE_CTX: [ThreadCtx; MAX_CPUS] = {
-    const EMPTY: ThreadCtx = ThreadCtx { rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0 };
+    const EMPTY: ThreadCtx = ThreadCtx { rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, fs_base: 0 };
     [EMPTY; MAX_CPUS]
 };
 /// Per-CPU idle stacks (4 KiB each).
@@ -107,12 +109,83 @@ static FUTEX_LOCKS: [Mutex<()>; FUTEX_BUCKETS] = {
     [M; FUTEX_BUCKETS]
 };
 
+/// Pending wakes per bucket — set of addresses that received a futex_wake
+/// while no waiter was sleeping. The next futex_wait at one of these
+/// addresses consumes the pending wake and returns immediately, even if
+/// the futex value matches the expected value.
+///
+/// This is required for ERTS's TSE event protocol where the waker can call
+/// erts_tse_set (wake) BEFORE the waiter has entered erts_tse_wait. Without
+/// pending wakes, the signal is lost: the wake arrives at an empty queue,
+/// the waiter then resets the event value and blocks expecting a future
+/// wake that was already issued.
+///
+/// One-shot semantics: a pending wake is consumed by the FIRST matching wait.
+const PENDING_WAKES_PER_BUCKET: usize = 8;
+struct PendingWakes {
+    addrs: [u64; PENDING_WAKES_PER_BUCKET], // 0 = empty slot
+}
+static mut PENDING_WAKES: [PendingWakes; FUTEX_BUCKETS] = {
+    const E: PendingWakes = PendingWakes { addrs: [0; PENDING_WAKES_PER_BUCKET] };
+    [E; FUTEX_BUCKETS]
+};
+
+/// Insert a pending wake for `addr` in `bucket`. Caller must hold the bucket lock.
+unsafe fn pending_wake_insert(bucket: usize, addr: u64) {
+    let pw = &mut PENDING_WAKES[bucket];
+    // If already present, no need to add (one-shot)
+    for slot in pw.addrs.iter() {
+        if *slot == addr { return; }
+    }
+    for slot in pw.addrs.iter_mut() {
+        if *slot == 0 { *slot = addr; return; }
+    }
+    // Table full — drop the wake (rare; ERTS uses few addresses).
+}
+
+/// Try to consume a pending wake for `addr` in `bucket`.
+/// Returns true if a pending wake existed and was consumed.
+/// Caller must hold the bucket lock.
+unsafe fn pending_wake_consume(bucket: usize, addr: u64) -> bool {
+    let pw = &mut PENDING_WAKES[bucket];
+    for slot in pw.addrs.iter_mut() {
+        if *slot == addr { *slot = 0; return true; }
+    }
+    false
+}
+
+/// Per-CPU "lock to release after context_switch returns to a new thread".
+/// The thread going to sleep holds the futex bucket lock across the switch;
+/// the next thread that runs on this CPU (after context_switch returns) is
+/// responsible for releasing the lock. -1 = no pending unlock.
+/// This eliminates the wake-loss race where futex_wake fires after the lock
+/// is dropped but before the waiter has actually entered sleep state.
+static PENDING_UNLOCK_BUCKET: [core::sync::atomic::AtomicI32; MAX_CPUS] = {
+    const M: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+    [M; MAX_CPUS]
+};
+
+/// Release a deferred futex bucket lock if one is pending on this CPU.
+/// Called AFTER context_switch returns (we're running as a different thread
+/// or resumed after a wake).
+#[inline]
+fn release_pending_unlock(cpu: usize) {
+    let b = PENDING_UNLOCK_BUCKET[cpu].swap(-1, Ordering::Release);
+    if b >= 0 {
+        unsafe { FUTEX_LOCKS[b as usize].force_unlock(); }
+    }
+}
+
 static NUM_CPUS: AtomicUsize = AtomicUsize::new(1);
+
+pub fn num_cpus() -> usize {
+    NUM_CPUS.load(Ordering::Relaxed)
+}
 
 /// When false, futex_wait returns immediately (spin-yield mode for ERTS init).
 /// Switched to true once ERTS finishes thread-progress registration.
 static FUTEX_BLOCKING: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+    core::sync::atomic::AtomicBool::new(true);
 
 /// Enable blocking futex. Called once ERTS init is past the thread-progress barrier.
 pub fn enable_blocking_futex() {
@@ -140,46 +213,18 @@ fn current_cpu() -> u32 {
 extern "C" fn cpu_idle_loop() -> ! {
     let cpu = current_cpu() as usize;
     loop {
+        // We may have just been context_switched to from a futex_wait.
+        // Release any pending bucket lock the previous thread handed off.
+        // Must be at the TOP of the loop, not before, because every
+        // context_switch back here may hand off a fresh lock.
+        release_pending_unlock(cpu);
+
         x86_64::instructions::interrupts::enable();
         x86_64::instructions::hlt();
 
-        let blocked = unsafe { IDLE_BLOCKED_TID[cpu] };
-
-        // Check if the blocked thread was woken by futex_wake.
-        // Use read_volatile to prevent the compiler from hoisting this
-        // read out of the loop — another CPU modifies the state field.
-        let woken = unsafe {
-            THREADS[blocked].as_ref()
-                .map(|t| core::ptr::read_volatile(&t.state) == State::Ready)
-                .unwrap_or(false)
-        };
-        if woken {
-            unsafe {
-                // Remove the thread from the queue if futex_wake also added it there.
-                // Without this, the thread would be both current AND in the queue.
-                {
-                    let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
-                    CPU_QUEUES[cpu].queue.retain(|&tid| tid != blocked as u32);
-                }
-            }
-            unsafe {
-                let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
-                CPU_QUEUES[cpu].current = Some(blocked as u32);
-                CPU_QUEUES[cpu].idle = false;
-
-                if let Some(thread) = THREADS[blocked].as_ref() {
-                    crate::syscall::set_current_kernel_stack(thread.kernel_stack_top);
-                    context_switch(
-                        &raw mut IDLE_CTX[cpu] as *mut ThreadCtx,
-                        &raw const thread.ctx as *const ThreadCtx,
-                    );
-                    // Returns here when this CPU idles again
-                }
-            }
-            continue;
-        }
-
-        // Check for new threads in the queue
+        // Unified resume: a woken thread is ALWAYS in the run queue.
+        // futex_wake pushes to queue regardless of in_idle_ctx state.
+        // No side channel — single source of truth for what to run next.
         let next = {
             let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
             unsafe { CPU_QUEUES[cpu].queue.pop_front() }
@@ -200,7 +245,8 @@ extern "C" fn cpu_idle_loop() -> ! {
                         &raw mut IDLE_CTX[cpu] as *mut ThreadCtx,
                         &raw const next.ctx as *const ThreadCtx,
                     );
-                    // Back from the new thread — set idle again
+                    // Back from the new thread — release any pending unlock
+                    release_pending_unlock(cpu);
                     let _q = CPU_QUEUE_LOCKS[cpu].lock();
                     CPU_QUEUES[cpu].current = None;
                     CPU_QUEUES[cpu].idle = true;
@@ -231,7 +277,7 @@ pub fn init(num_cpus: usize) {
         THREADS[0] = Some(Thread {
             tid: 0,
             state: State::Running,
-            ctx: ThreadCtx { rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0 },
+            ctx: ThreadCtx { rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, fs_base: 0 },
             kernel_stack_top: &syscall_stack_0_top as *const u8 as u64,
             user_stack: 0,
             fn_ptr: 0,
@@ -242,6 +288,7 @@ pub fn init(num_cpus: usize) {
             in_idle_ctx: false,
             clone_r9: 0,
             clone_rip: 0,
+            home_cpu: 0,
         });
         CPU_QUEUES[0].current = Some(0);
         CPU_QUEUES[0].idle = false;
@@ -294,6 +341,7 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
                 r13: tls,     // child's TLS
                 r14: child_tid,
                 r15: 0,
+                fs_base: tls, // initial FS_BASE — musl/ERTS may overwrite via ARCH_SET_FS
             },
             kernel_stack_top: kstack_top,
             user_stack: stack,
@@ -305,6 +353,7 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
             in_idle_ctx: false,
             clone_r9,
             clone_rip,
+            home_cpu: 0, // updated below to best_cpu
         });
     }
 
@@ -331,6 +380,12 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
     {
         let _qlock = CPU_QUEUE_LOCKS[best_cpu as usize].lock();
         unsafe { CPU_QUEUES[best_cpu as usize].queue.push_back(tid); }
+    }
+    // Record home CPU for futex_wake routing
+    unsafe {
+        if let Some(t) = THREADS[tid as usize].as_mut() {
+            t.home_cpu = best_cpu;
+        }
     }
 
     // If the target CPU is idle, send IPI to wake it
@@ -425,6 +480,9 @@ pub fn yield_current() {
                     &raw mut cur.ctx as *mut ThreadCtx,
                     &raw const next.ctx as *const ThreadCtx,
                 );
+                // After context_switch returns to us, release any pending
+                // futex unlock from the thread that switched TO us.
+                release_pending_unlock(current_cpu() as usize);
             }
         }
     }
@@ -432,6 +490,11 @@ pub fn yield_current() {
 
 /// Futex WAIT — atomically check *addr == val and sleep.
 /// Returns 0 (woken) or -EAGAIN (value changed).
+///
+/// **Lock-handoff protocol:** the bucket lock is acquired before the value
+/// check, and held continuously until AFTER context_switch completes. The
+/// next thread to run on this CPU releases the lock via release_pending_unlock.
+/// This closes the wake-loss race window between marking-blocked and sleeping.
 pub fn futex_wait(addr: u64, val: u32) -> i64 {
     // If only 1 thread exists, yield and return (spurious wakeup).
     // This handles pre-clone musl locks that would otherwise deadlock.
@@ -442,55 +505,78 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
     }
 
     let bucket = futex_bucket(addr);
-
-    // Atomic check under the futex lock
     {
-        let _flock = FUTEX_LOCKS[bucket].lock();
-        let current = unsafe { *(addr as *const u32) };
-        if current != val {
-            return -11; // -EAGAIN
+        static WAIT_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let wc = WAIT_LOG.fetch_add(1, Ordering::Relaxed);
+        if wc < 50 {
+            let cur = unsafe { *(addr as *const u32) };
+            let cpu = current_cpu() as usize;
+            let tid = unsafe { CPU_QUEUES[cpu].current.unwrap_or(0) };
+            crate::serial_println!("[wait] tid={} addr={:#x} expect={:#x} cur={:#x}",
+                tid, addr, val, cur);
         }
+    }
 
-        // During ERTS init, return immediately (spin-yield) to avoid
-        // the thread-progress registration deadlock. After init, block properly.
-        if !FUTEX_BLOCKING.load(core::sync::atomic::Ordering::Acquire) {
-            return 0;
-        }
+    // Acquire the bucket lock. We will NOT explicitly drop it — the next
+    // thread to run on this CPU will release it via release_pending_unlock.
+    let flock_guard = FUTEX_LOCKS[bucket].lock();
 
-        let cpu = current_cpu() as usize;
-        unsafe {
-            let cur_tid = match CPU_QUEUES[cpu].current {
-                Some(t) => t,
-                None => return 0,
-            };
-            // Mark thread as blocked (under futex lock — prevents wake race)
-            if let Some(thread) = THREADS[cur_tid as usize].as_mut() {
-                thread.state = State::Blocked;
-                thread.futex_addr = addr;
-                thread.futex_val = val;
-            }
-        }
-    } // futex lock dropped — safe for other threads to wake us now
+    // Consume any pending wake for this address. This handles wake-before-wait:
+    // ERTS's TSE protocol can fire a wake before the waiter has set TSE_SLEEPING
+    // in the SSI flags, so the wake is "lost" by ssi_flags_set_wake clearing
+    // flags before erts_tse_set is reached. Pending wakes recover this case.
+    if unsafe { pending_wake_consume(bucket, addr) } {
+        drop(flock_guard);
+        return 0;
+    }
 
-    // Schedule next thread (locks dropped before context switch)
+    let current = unsafe { *(addr as *const u32) };
+    if current != val {
+        drop(flock_guard);
+        return -11; // -EAGAIN
+    }
+
+    // During ERTS init, yield and return (spin-yield) to avoid
+    // the thread-progress registration deadlock. After init, block properly.
+    if !FUTEX_BLOCKING.load(core::sync::atomic::Ordering::Acquire) {
+        drop(flock_guard);
+        yield_current();
+        return 0;
+    }
+
     let cpu = current_cpu() as usize;
     let blocked_tid: usize;
-    let switch_info: Option<(usize, usize, u64)>;
+    unsafe {
+        let cur_tid = match CPU_QUEUES[cpu].current {
+            Some(t) => t,
+            None => {
+                drop(flock_guard);
+                return 0;
+            }
+        };
+        blocked_tid = cur_tid as usize;
+        // Mark thread as blocked (under bucket lock — prevents wake race)
+        if let Some(thread) = THREADS[blocked_tid].as_mut() {
+            thread.state = State::Blocked;
+            thread.futex_addr = addr;
+            thread.futex_val = val;
+        }
+    }
+
+    // Pick the next thread to run (or go idle).
+    // We DO release the queue lock before context_switch — only the bucket
+    // lock crosses the switch boundary.
+    let switch_info: Option<(usize, u64)>;
     {
         let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
         unsafe {
-            let cur_tid = match CPU_QUEUES[cpu].current {
-                Some(t) => t,
-                None => return 0, // no current thread (idle context)
-            };
-            blocked_tid = cur_tid as usize;
             let next_tid = CPU_QUEUES[cpu].queue.pop_front();
             match next_tid {
                 Some(next) => {
                     CPU_QUEUES[cpu].current = Some(next);
                     let kstack = THREADS[next as usize].as_ref()
                         .map(|t| t.kernel_stack_top).unwrap_or(0);
-                    switch_info = Some((cur_tid as usize, next as usize, kstack));
+                    switch_info = Some((next as usize, kstack));
                 }
                 None => {
                     // No other thread — go idle, wait for IPI
@@ -502,39 +588,44 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
         }
     } // queue lock dropped
 
+    // Hand the bucket lock off to the next thread that runs on this CPU.
+    // We `forget` the guard so its Drop doesn't run; release_pending_unlock
+    // does the actual release after context_switch.
+    PENDING_UNLOCK_BUCKET[cpu].store(bucket as i32, Ordering::Release);
+    core::mem::forget(flock_guard);
+
     match switch_info {
-        Some((cur_idx, next_idx, kstack)) => {
+        Some((next_idx, kstack)) => {
             unsafe {
                 crate::syscall::set_current_kernel_stack(kstack);
-                if let (Some(cur), Some(nxt)) = (THREADS[cur_idx].as_mut(), THREADS[next_idx].as_ref()) {
+                if let (Some(cur), Some(nxt)) = (THREADS[blocked_tid].as_mut(), THREADS[next_idx].as_ref()) {
                     context_switch(
                         &raw mut cur.ctx as *mut ThreadCtx,
                         &raw const nxt.ctx as *const ThreadCtx,
                     );
                 }
             }
+            // We were resumed after a wake. Release any pending unlock from
+            // the thread that switched TO us before it switched away.
+            release_pending_unlock(current_cpu() as usize);
             0 // woken
         }
         None => {
             // No other thread on this CPU. Context-switch to the per-CPU
-            // idle loop. This properly saves the blocked thread's register
-            // state so that futex_wake can later resume it on any CPU.
+            // idle loop. The idle loop only checks the run queue, so no
+            // side-channel tracking is needed — when futex_wake runs, it
+            // pushes this thread to the queue and the idle loop picks it up.
             let cpu = current_cpu() as usize;
             unsafe {
-                IDLE_BLOCKED_TID[cpu] = blocked_tid;
-                if let Some(t) = THREADS[blocked_tid].as_mut() {
-                    t.in_idle_ctx = true;
-                }
-                // context_switch saves our regs to the blocked thread's ctx
-                // and loads the idle context. When we're woken, context_switch
-                // restores our regs and we return here.
                 if let Some(thread) = THREADS[blocked_tid].as_mut() {
                     context_switch(
                         &raw mut thread.ctx as *mut ThreadCtx,
                         &raw const IDLE_CTX[cpu] as *const ThreadCtx,
                     );
                 }
-                // We were woken and context_switched back. Return 0.
+                // We were woken and context_switched back. Release any
+                // pending unlock from the cpu_idle_loop side, then return 0.
+                release_pending_unlock(current_cpu() as usize);
             }
             0
         }
@@ -545,6 +636,14 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
 pub fn futex_wake(addr: u64, count: u32) -> i64 {
     let bucket = futex_bucket(addr);
     let _flock = FUTEX_LOCKS[bucket].lock();
+    {
+        static WAKE_CALL_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let wc = WAKE_CALL_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if wc < 50 {
+            let val = unsafe { *(addr as *const u32) };
+            crate::serial_println!("[wake_call] addr={:#x} count={} val={:#x}", addr, count, val);
+        }
+    }
 
     let mut woken = 0i64;
     let _tlock = THREAD_LOCK.lock();
@@ -563,20 +662,33 @@ pub fn futex_wake(addr: u64, count: u32) -> i64 {
                         crate::serial_println!("[wake] tid={} addr={:#x}", thread.tid, addr);
                     }
 
-                    let target_cpu = (i % NUM_CPUS.load(Ordering::Relaxed)) as u32;
-                    if thread.in_idle_ctx {
-                        // Thread is in per-CPU idle context — don't add to queue.
-                        // The idle loop detects state=Ready and resumes via context_switch.
-                        thread.in_idle_ctx = false;
-                    } else {
-                        // Thread was context_switched normally — add to queue.
+                    // Unified queue: ALWAYS push the woken thread to its
+                    // home CPU's run queue. The idle loop's only source of
+                    // truth is the queue — no side-channel tracking.
+                    let target_cpu = thread.home_cpu;
+                    thread.in_idle_ctx = false;
+                    {
                         let _qlock = CPU_QUEUE_LOCKS[target_cpu as usize].lock();
                         CPU_QUEUES[target_cpu as usize].queue.push_back(thread.tid);
                     }
-                    if CPU_QUEUES[target_cpu as usize].idle && target_cpu != current_cpu() {
+                    // Always IPI the target CPU if it's not us — ensures the CPU
+                    // wakes from hlt and picks up the queued thread promptly.
+                    if target_cpu != current_cpu() {
                         crate::apic::send_ipi(target_cpu as u8);
                     }
                 }
+            }
+        }
+        // Wake-before-wait: if no waiter was found, leave a pending wake at
+        // this address. The next futex_wait at the same address will consume
+        // it and return immediately. Required for ERTS's TSE protocol where
+        // erts_tse_set can fire before the waiter completes erts_tse_wait setup.
+        if woken == 0 {
+            pending_wake_insert(bucket, addr);
+            static PW_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let wc = PW_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if wc < 20 {
+                crate::serial_println!("[pending_wake] addr={:#x}", addr);
             }
         }
     }
@@ -596,20 +708,25 @@ static NEED_RESCHED: [AtomicBool; MAX_CPUS] = {
 pub fn watchdog_wake() {
     static WD_CHECKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     let check_num = WD_CHECKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let _tlock = THREAD_LOCK.lock();
+    // Skip the lock — the watchdog runs in timer interrupt context.
+    // It only reads thread state and sets state=Ready, which is safe
+    // because state is only checked via read_volatile in the idle loop.
+    // Using try_lock deadlocks when futex_wake holds the lock on the same CPU.
     unsafe {
         for i in 0..MAX_THREADS {
             if let Some(thread) = THREADS[i].as_mut() {
                 if thread.state == State::Blocked {
                     // Check if the futex value changed (lock was released)
                     let current = *(thread.futex_addr as *const u32);
-                    if check_num < 3 {
+                    if check_num < 1 {
                         crate::serial_println!("[wd] tid={} addr={:#x} val={:#x} cur={:#x}",
                             thread.tid, thread.futex_addr, thread.futex_val, current);
                     }
-                    // Force-wake threads stuck on ERTS init sync (val=0x2)
-                    // after 3 seconds. ERTS handles spurious wakeups via recheck.
-                    let force = check_num >= 2; // force-wake ALL stuck threads after 2 seconds
+                    // With the lock-handoff protocol in futex_wait, real wakes
+                    // are never lost — the bucket lock spans the wait→sleep
+                    // transition. The watchdog is now a backstop only for
+                    // genuine value-changed-without-wake bugs.
+                    let force = false;
                     if current != thread.futex_val || force {
                         // Value changed or force-wake timeout.
                         // Just set state=Ready — DON'T add to queue.
@@ -623,7 +740,7 @@ pub fn watchdog_wake() {
 
                         static WD_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
                         let c = WD_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        if c < 20 {
+                        if c < 5 {
                             crate::serial_println!("[watchdog] woke tid={} addr={:#x} old_val={:#x} cur={:#x}",
                                 tid, addr, thread.futex_val, current);
                         }
@@ -653,11 +770,40 @@ pub fn check_resched() {
     }
 }
 
+/// Exit the current thread. Marks it as dead and switches away (never returns).
+pub fn thread_exit() {
+    let cpu = current_cpu() as usize;
+    unsafe {
+        let cur_tid = {
+            let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
+            let tid = CPU_QUEUES[cpu].current.take(); // remove from current
+            CPU_QUEUES[cpu].idle = true;
+            tid
+        };
+        if let Some(tid) = cur_tid {
+            if let Some(thread) = THREADS[tid as usize].as_mut() {
+                thread.state = State::Dead;
+            }
+        }
+        // Switch to idle context (never returns from this thread's perspective)
+        context_switch(
+            // Use a throwaway context (the dead thread's ctx, which we'll never restore)
+            &raw mut THREADS[cur_tid.unwrap_or(0) as usize].as_mut().unwrap().ctx as *mut ThreadCtx,
+            &raw const IDLE_CTX[cpu] as *const ThreadCtx,
+        );
+    }
+    loop { x86_64::instructions::hlt(); }
+}
+
 /// Child return from clone: set TLS, switch to user stack, return 0 via
 /// the syscall exit path. This makes the child return from clone(2) with 0,
 /// which is what musl's __clone expects. musl then runs pthread_create's
 /// cleanup code (releasing __thread_list_lock) before calling the thread fn.
 extern "C" fn clone_child_return() {
+    // We were just context_switched to (the parent's futex_wait may have
+    // handed off a bucket lock). Release it before doing anything else.
+    release_pending_unlock(current_cpu() as usize);
+
     // r12 = child user stack, r13 = TLS (set by context_switch restore)
     let stack: u64;
     let tls: u64;
@@ -709,10 +855,15 @@ extern "C" fn clone_child_return() {
     }
 }
 
-/// Low-level context switch (same as old thread.rs).
+/// Low-level context switch.
+/// Also saves and restores FS_BASE (TLS pointer) via RDMSR/WRMSR — without
+/// this, threads sharing a CPU would read each other's thread-local storage
+/// after a switch, which corrupts ERTS scheduler state (e.g. the per-scheduler
+/// `last_os_monotonic_time` that drives the time-backwards check).
 #[unsafe(naked)]
 extern "C" fn context_switch(_from: *mut ThreadCtx, _to: *const ThreadCtx) {
     core::arch::naked_asm!(
+        // Save callee-saved GPRs of outgoing thread.
         "mov [rdi], rsp",
         "mov [rdi+8], rbx",
         "mov [rdi+16], rbp",
@@ -720,6 +871,17 @@ extern "C" fn context_switch(_from: *mut ThreadCtx, _to: *const ThreadCtx) {
         "mov [rdi+32], r13",
         "mov [rdi+40], r14",
         "mov [rdi+48], r15",
+        // Save outgoing FS_BASE: RDMSR(0xC000_0100) -> EDX:EAX
+        "push rsi",                  // preserve to-ptr (rdmsr clobbers eax/ecx/edx)
+        "push rdi",                  // preserve from-ptr
+        "mov ecx, 0xC0000100",
+        "rdmsr",
+        "shl rdx, 32",
+        "or rax, rdx",
+        "pop rdi",
+        "mov [rdi+56], rax",
+        "pop rsi",
+        // Restore incoming GPRs.
         "mov rsp, [rsi]",
         "mov rbx, [rsi+8]",
         "mov rbp, [rsi+16]",
@@ -727,6 +889,12 @@ extern "C" fn context_switch(_from: *mut ThreadCtx, _to: *const ThreadCtx) {
         "mov r13, [rsi+32]",
         "mov r14, [rsi+40]",
         "mov r15, [rsi+48]",
+        // Restore incoming FS_BASE: WRMSR(0xC000_0100) <- EDX:EAX
+        "mov rax, [rsi+56]",
+        "mov rdx, rax",
+        "shr rdx, 32",
+        "mov ecx, 0xC0000100",
+        "wrmsr",
         "ret",
     );
 }

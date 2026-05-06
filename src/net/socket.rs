@@ -468,6 +468,8 @@ pub fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, _flags: i32,
 
     match sock.sock_type {
         SockType::TcpStream => {
+            // Poll network first to process any pending incoming packets
+            crate::net::poll();
             crate::net::with_net(|net| {
                 let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
                 if !tcp.can_recv() {

@@ -94,7 +94,7 @@ extern "x86-interrupt" fn timer_handler(mut frame: InterruptStackFrame) {
     // EOI to APIC (PIC is disabled)
     crate::apic::eoi();
 
-    // Watchdog: every ~1 second (100 ticks)
+    // Watchdog: every 100 ticks (~1 second) for stuck threads
     static WD_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     let tick = WD_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if tick % 100 == 0 && tick > 0 {

@@ -136,7 +136,7 @@ pub fn open(path: &[u8]) -> i64 {
             static OPEN_COUNT: core::sync::atomic::AtomicU64 =
                 core::sync::atomic::AtomicU64::new(0);
             let n = OPEN_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n == 91 { // switch at the end of init (92 opens during boot)
+            if n == 99999 { // disabled — blocking futex deadlocks gen_server calls
                 crate::sched::enable_blocking_futex();
             }
             x
