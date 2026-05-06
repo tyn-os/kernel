@@ -424,9 +424,25 @@ pub fn yield_current() {
                         if let Some(next) = THREADS[next_idx].as_ref() {
                             crate::syscall::set_current_kernel_stack(next.kernel_stack_top);
 
-                            // Jump directly to the thread's saved context
-                            // This is a one-way switch — the idle loop doesn't need saving
+                            // Jump directly to the thread's saved context.
+                            // One-way switch — the idle loop doesn't need
+                            // saving — but we MUST restore FS_BASE alongside
+                            // GPRs, otherwise this thread reads its TLS
+                            // through whatever FS_BASE the last user of this
+                            // CPU left behind. (Same invariant as context_switch.)
                             drop(_qlock);
+                            // First restore FS_BASE (clobbers rax/rdx/rcx,
+                            // but those aren't part of the saved context).
+                            let fs = next.ctx.fs_base;
+                            core::arch::asm!(
+                                "mov rdx, rax",
+                                "shr rdx, 32",
+                                "mov ecx, 0xC0000100",
+                                "wrmsr",
+                                in("rax") fs,
+                                out("rdx") _,
+                                out("rcx") _,
+                            );
                             core::arch::asm!(
                                 "mov rsp, {rsp}",
                                 "mov rbx, {rbx}",

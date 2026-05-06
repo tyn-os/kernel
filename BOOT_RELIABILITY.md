@@ -45,36 +45,178 @@ The boot reaches the thread-progress barrier or the supervisor tree, schedulers 
 - **FS_BASE preservation.** Fixed in commit `a9c725d`. Without it, OTP 27 couldn't even boot — schedulers stomped on each other's `last_os_monotonic_time` via aliased TLS. With it, the time-monotonicity check passes naturally. The reliability issues here all happen *after* that fix landed.
 - **Wrong `clock_gettime` semantics or non-monotonic time.** The fetch_max ratchet on `LAST_TIME_NS` is correct; ERTS sees monotonic time on every successful and failing run.
 
-## Hypothesis (incomplete)
+## Stack layout at each stage
 
-The preemption trampoline `sched_yield_trampoline` in `src/interrupts.rs` injects a `syscall(SYS_sched_yield)` into a user thread that was interrupted mid-instruction. It currently saves only `rax`, `rcx`, `r11`:
+Tracing what's where on which stack at every transition, because a
+disagreement between save and restore is exactly where this kind of
+intermittent corruption hides.
+
+### Stage 1 — user code running
+
+- `rsp = X` (in the calling thread's user stack)
+- `rip = U` (some user instruction)
+- All GPRs hold user values
+- Per-CPU `gs:[0]` = current thread's kernel-stack top (`KSP`)
+
+### Stage 2 — timer fires (IST 1)
+
+CPU automatically pushes IRET frame onto the per-thread IST 1 stack
+(not the user stack). Frame: `SS, RSP=X, RFLAGS, CS, RIP=U`. Switches
+to handler.
+
+### Stage 3 — Rust `extern "x86-interrupt"` handler
+
+Compiler-generated prologue saves all GPRs the handler clobbers onto
+the IST stack. Handler body runs `apic::eoi()`, then mutates the IRET
+frame:
+
+```rust
+let user_rsp = frame.stack_pointer.as_u64();   // = X
+let new_rsp = user_rsp - 8;                    // = X - 8
+*(new_rsp as *mut u64) = ip;                   // park original RIP
+frame.stack_pointer = new_rsp;
+frame.instruction_pointer = trampoline;
+```
+
+Epilogue restores GPRs. CPU's `iretq` pops the (modified) frame.
+
+### Stage 4 — trampoline starts on user stack
+
+- `rsp = X - 8`, `[rsp] = U` (parked RIP)
+- All GPRs = user values (the handler restored them via the
+  x86-interrupt epilogue)
 
 ```asm
 sched_yield_trampoline:
-    push rax
-    push rcx
-    push r11
+    push rax        ; rsp = X - 16, [rsp] = user_rax
+    push rcx        ; rsp = X - 24, [rsp] = user_rcx
+    push r11        ; rsp = X - 32, [rsp] = user_r11
     mov eax, 24
-    syscall
-    pop r11
-    pop rcx
-    pop rax
-    ret
+    syscall         ; CPU: rcx ← post-syscall RIP, r11 ← rflags
+                    ;      rip ← LSTAR (= syscall_entry); rsp unchanged
 ```
 
-The `syscall` path enters our Rust syscall dispatcher, which is `extern "C"` — by the System V x86-64 ABI it's allowed to clobber every caller-saved register: `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`, `r9`, `r10`, `r11`, plus `xmm0..15`. So when the trampoline returns to user code, six GPRs (and the SSE state) may be different from what user code was holding when the timer fired. That fits both failure modes: a corrupted register in the BEAM loader's hot loop becomes either a bogus opcode index (loader error) or a bogus pointer (page fault).
+Stack on entry to `syscall_entry`:
 
-## Why the obvious fix regresses
+```
+[X - 8 ] = U (parked RIP)
+[X - 16] = saved rax
+[X - 24] = saved rcx
+[X - 32] = saved r11
+rsp      = X - 32      (still on user stack)
+rcx      = syscall_entry's return RIP (in trampoline post-syscall)
+r11      = rflags
+```
 
-The obvious fix — push all nine caller-saved GPRs — *halves* the success rate (5/16). Adding a `sub rsp, 128` before the pushes to step past the SysV red zone (and an `add rsp, 128` before the final `ret` to re-find the parked RIP) brings it back to 9/16, still worse than the 13/16 baseline.
+### Stage 5 — `syscall_entry` switches to kernel stack
 
-A few candidate explanations, none confirmed:
+```asm
+mov gs:[8], rsp        ; user_rsp = X - 32 → scratch slot
+mov rsp, gs:[0]        ; rsp = KSP
+push qword ptr gs:[8]  ; [KSP-8]   = X - 32 (saved user rsp)
+push 0                 ; [KSP-16]  = 0 (alignment)
+push rcx               ; [KSP-24]  = post-syscall return RIP
+push 0                 ; [KSP-32]  = 0 (placeholder for r11/RFLAGS) ← see below
+push rdi               ; [KSP-40]  = a0 (user's rdi)
+push rsi               ; [KSP-48]  = a1 (user's rsi)
+push rdx               ; [KSP-56]  = a2 (user's rdx)
+push r8                ; [KSP-64]  = a4 (user's r8)
+push r9                ; [KSP-72]  = a5 (user's r9)
+push r10               ; [KSP-80]  = a3 (user's r10)
+push rbx               ; [KSP-88]
+push rbp               ; [KSP-96]
+push r12               ; [KSP-104]
+push r13               ; [KSP-112]
+push r14               ; [KSP-120]
+push r15               ; [KSP-128]
+call dispatch          ; pushes return addr at [KSP-136]
+```
 
-1. **Preemption count.** A larger trampoline does more work per timer tick. If preemption fires 100×/s during boot, the extra 18 instructions per fire is noise — but if some failing runs are timing-sensitive (e.g. a scheduler races to set TSE_SLEEPING before a wake clears it), the extra cycles may shift the race window the wrong way.
-2. **Stack overflow.** The 9-push variant uses 80 bytes of user stack instead of 32. Most ERTS thread stacks have plenty of room, but if any worker hits a low-stack moment during boot, the larger save may push past the bottom.
-3. **Hidden assumption.** Some part of the kernel may rely on a *specific* set of caller-saved regs being what they were before the trampoline. The 3-push version preserves rax/rcx/r11 specifically because the `syscall` instruction clobbers them; everything else is "officially" volatile per ABI but might be load-bearing in practice.
+Critically, `rdi/rsi/rdx/r8/r9/r10` ARE saved here — the trampoline
+didn't touch them but `syscall_entry` does. Combined with the
+trampoline's `rax/rcx/r11`, every caller-saved GPR survives.
 
-The right answer probably involves auditing the syscall dispatcher in `src/syscall.rs` to confirm what it clobbers, and possibly switching to a per-CPU scratch save area (FXSAVE-style) instead of pushing onto the user stack.
+### Stage 6 — dispatcher and (maybe) context switch
+
+`syscall_dispatch` is `extern "C"`. May call `yield_current` →
+`context_switch` which saves `rsp/rbx/rbp/r12-r15/FS_BASE` for the
+current thread and restores those for the next. When the original
+thread is later resumed, its rsp comes back to mid-syscall_entry.
+
+### Stage 7 — exit path
+
+Pops 14 of the 16 saved values (alignment-pad and saved-rsp are
+handled separately):
+
+```asm
+pop r15 / r14 / r13 / r12 / rbp / rbx / r10 / r9 / r8 / rdx / rsi / rdi
+pop r11           ; pops the 0 placeholder — r11 = 0, NOT user's RFLAGS
+pop rcx           ; pops post-syscall return RIP
+add rsp, 8        ; skip alignment pad
+mov gs:[0], r11   ; (r11 is just used as scratch here for kernel_stack save)
+pop rsp           ; restore user_rsp = X - 32
+sti
+jmp rcx           ; back into trampoline post-syscall
+```
+
+After `pop rsp`, `rsp = X - 32` and we're back on the user stack.
+
+### Stage 8 — trampoline post-syscall
+
+```asm
+pop r11    ; [X - 32] = saved user_r11 (preserved by trampoline)
+pop rcx    ; [X - 24] = saved user_rcx
+pop rax    ; [X - 16] = saved user_rax
+ret        ; pops [X - 8] = U (parked RIP), rsp = X
+```
+
+User code resumes at `U` with `rsp = X` and all caller-saved GPRs
+restored to their pre-interrupt values.
+
+## What the trace surfaces
+
+The trampoline + syscall_entry pair DO preserve every caller-saved
+GPR. So the original "trampoline only saves 3 regs" hypothesis was
+wrong — the syscall_entry recipe rescues the other six.
+
+Two real disagreements come out of the trace, though:
+
+1. **The `jmp rcx` exit path doesn't restore RFLAGS.** The CPU's
+   `syscall` instruction puts the user's RFLAGS into r11 on entry,
+   but `syscall_entry` pushes a `0` placeholder (line 122) instead of
+   r11, so user RFLAGS is lost. ERTS code is rarely flag-dependent
+   across instruction boundaries, but DF (direction flag) is sticky
+   for string operations and would survive into kernel and back.
+
+2. **The idle-loop fast path in `sched.rs` did not restore FS_BASE.**
+   The cooperative `context_switch` does, but the inline asm at
+   `yield_current`'s "CPU was idle, found work" branch only loaded
+   GPRs. A thread resumed via that path would read TLS through
+   whatever FS_BASE the previous user of this CPU left behind. Fixed
+   in this commit by adding a WRMSR(0xC000_0100) before the GPR
+   restore.
+
+Reliability didn't change measurably (32 runs: 26 OK / 2 beam_load /
+1 #PF / 3 timeout = 81%, same as baseline). The dominant failure is
+elsewhere — likely in something neither trace covers (e.g., FXSAVE
+state, or a scheduler race that lets two CPUs see the same `THREADS`
+slot during spawn).
+
+## Why "push all 9 GPRs" doesn't help
+
+The trampoline only saves rax/rcx/r11 because those are exactly the
+ones the `syscall` instruction itself clobbers. The full
+trampoline + syscall_entry roundtrip already preserves all nine
+caller-saved GPRs (the other six are pushed/popped inside
+syscall_entry — see stack-layout trace above).
+
+Empirically, pushing all 9 in the trampoline anyway *halves* the
+success rate (5/16); adding a 128-byte red-zone gap brings it to
+9/16. Both worse than baseline. The most likely reason is that
+adding pushes to the trampoline's user-stack writes makes it harder
+for the timing of the trampoline to align with whatever the failing
+runs are doing — but the actual root cause is somewhere else and
+extra register-saving was treating a symptom.
 
 ## What's *not* a fix
 
