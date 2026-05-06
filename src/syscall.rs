@@ -117,9 +117,14 @@ global_asm!(
     "mov rsp, gs:[0]",           // load per-CPU kernel stack
     "push qword ptr gs:[8]",     // push saved user RSP onto kernel stack
     "push 0",        // alignment padding (16 pushes total = even → RSP%16=8 after call)
-    // Save ALL user registers that Linux syscall ABI preserves
+    // Save ALL user registers that Linux syscall ABI preserves.
+    // Critically: r11 holds USER RFLAGS (the `syscall` instruction loaded
+    // it from rflags). Save it so we can restore RFLAGS on the way out;
+    // without this, sticky flags (DF in particular) leak across syscalls
+    // and can corrupt rep-movs/rep-stos memcpy/memset in user code.
     "push rcx",      // return RIP
-    "push 0",        // placeholder for r11/RFLAGS (already clobbered)
+    "push r11",      // user RFLAGS (saved by `syscall` instruction)
+    "cld",           // clear DF for kernel C ABI (rep movs/stos must have DF=0)
     "push rdi",     // a0
     "push rsi",     // a1
     "push rdx",     // a2
@@ -168,12 +173,19 @@ global_asm!(
     "jb 3f",               // bad return address → trap
     "mov [rip + last_syscall_ret], rcx",
     "add rsp, 8",    // skip alignment padding
-    // Save kernel stack top to per-CPU data for next syscall
-    "lea r11, [rsp + 8]",
-    "mov gs:[0], r11",           // per-CPU kernel stack update
+    // Restore user RFLAGS from r11 (which we restored from the saved slot
+    // a few lines above). popfq pops 8 bytes from the kernel stack into
+    // the RFLAGS register, including DF/IF/etc.
+    "push r11",
+    "popfq",
+    // Save kernel stack top to per-CPU data for next syscall (use rax as
+    // scratch — but rax holds the syscall return value, so save/restore).
+    "push rax",
+    "lea rax, [rsp + 16]",
+    "mov gs:[0], rax",
+    "pop rax",
     "pop rsp",
-    "sti",  // Re-enable interrupts before returning to user
-    "jmp rcx",  // Return to user code
+    "jmp rcx",  // Return to user code (RFLAGS already restored by popfq)
     // Bad return address detected
     "3:",
     "mov rdi, rcx",          // pass bad RCX as arg
@@ -711,13 +723,13 @@ fn sys_mmap(addr: u64, length: u64, _prot: i32, flags: i32) -> i64 {
     } else {
         // Allocate from bump allocator (ignore non-FIXED hint addresses).
         let result = MMAP_NEXT.fetch_add(aligned, Ordering::Relaxed);
+        // POSIX requires anonymous mmap to return zeroed memory. ERTS's
+        // allocators rely on this for fresh heap blocks (NULL pointers,
+        // empty lists, zero counts). Always zero, even for the 1 GiB main
+        // carrier — without it, stale bytes from prior frame use surface
+        // as #PFs through corrupt pointers and beam_load failures.
         // SAFETY: result is identity-mapped within RAM.
-        // QEMU zeros all RAM on boot, so only re-zero allocations that
-        // might overlap previously used memory. Skip huge allocations
-        // (ERTS's 1 GiB block) — QEMU already zeroed them.
-        if aligned <= 0x400_0000 { // up to 64 MiB
-            unsafe { core::ptr::write_bytes(result as *mut u8, 0, aligned as usize) };
-        }
+        unsafe { core::ptr::write_bytes(result as *mut u8, 0, aligned as usize) };
         result as i64
     }
 }

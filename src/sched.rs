@@ -29,7 +29,9 @@ enum State {
 }
 
 /// Saved thread context for context switching.
-#[repr(C)]
+/// 16-byte aligned because FXSAVE/FXRSTOR require their target buffer
+/// to be 16-byte aligned and `fxsave_area` lives at offset 64.
+#[repr(C, align(16))]
 struct ThreadCtx {
     rsp: u64,    //  0
     rbx: u64,    //  8
@@ -39,6 +41,41 @@ struct ThreadCtx {
     r14: u64,    // 40
     r15: u64,    // 48
     fs_base: u64, // 56  — TLS pointer; restored via WRMSR(0xC000_0100)
+    fxsave_area: [u8; 512], // 64..576 — FPU/SSE state; FXSAVE/FXRSTOR target
+}
+
+/// 16-byte-aligned 512-byte buffer for FXSAVE/FXRSTOR.
+#[repr(C, align(16))]
+struct FxsaveBuf([u8; 512]);
+
+/// Default FPU/SSE state, captured at kernel boot via FXSAVE on a freshly-
+/// initialized FPU. Copied into every newly-created ThreadCtx so the first
+/// FXRSTOR loads valid FCW/MXCSR (zero-initialized memory would set FCW=0,
+/// which unmasks every FP exception and breaks ERTS).
+static mut FXSAVE_TEMPLATE: FxsaveBuf = FxsaveBuf([0u8; 512]);
+
+/// Capture the current FPU/SSE state as the template for new threads.
+/// Must be called once during boot, before any thread is spawned.
+pub fn init_fxsave_template() {
+    unsafe {
+        // Reset FPU to defaults, set MXCSR to its post-reset value.
+        core::arch::asm!(
+            "fninit",
+            "mov dword ptr [rsp - 8], 0x1F80",
+            "ldmxcsr [rsp - 8]",
+            options(nostack),
+        );
+        let ptr = &raw mut FXSAVE_TEMPLATE as *mut FxsaveBuf as *mut u8;
+        core::arch::asm!(
+            "fxsave64 [{}]",
+            in(reg) ptr,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+fn fxsave_template() -> [u8; 512] {
+    unsafe { FXSAVE_TEMPLATE.0 }
 }
 
 /// Thread control block.
@@ -88,7 +125,10 @@ static mut CPU_QUEUES: [CpuQueue; MAX_CPUS] = {
 /// thread's register state to be properly saved in its ctx, so that
 /// futex_wake can safely resume it on any CPU.
 static mut IDLE_CTX: [ThreadCtx; MAX_CPUS] = {
-    const EMPTY: ThreadCtx = ThreadCtx { rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, fs_base: 0 };
+    const EMPTY: ThreadCtx = ThreadCtx {
+        rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, fs_base: 0,
+        fxsave_area: [0u8; 512],
+    };
     [EMPTY; MAX_CPUS]
 };
 /// Per-CPU idle stacks (4 KiB each).
@@ -259,6 +299,11 @@ extern "C" fn cpu_idle_loop() -> ! {
 pub fn init(num_cpus: usize) {
     NUM_CPUS.store(num_cpus, Ordering::Release);
 
+    // Capture default FPU/SSE state for new threads BEFORE any thread is
+    // spawned — otherwise `fxsave_template()` returns zeroed memory and the
+    // first FXRSTOR loads FCW=0 (all FP exceptions unmasked).
+    init_fxsave_template();
+
     // Initialize per-CPU idle contexts
     for cpu in 0..num_cpus {
         unsafe {
@@ -277,7 +322,10 @@ pub fn init(num_cpus: usize) {
         THREADS[0] = Some(Thread {
             tid: 0,
             state: State::Running,
-            ctx: ThreadCtx { rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, fs_base: 0 },
+            ctx: ThreadCtx {
+                rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, fs_base: 0,
+                fxsave_area: fxsave_template(),
+            },
             kernel_stack_top: &syscall_stack_0_top as *const u8 as u64,
             user_stack: 0,
             fn_ptr: 0,
@@ -342,6 +390,7 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
                 r14: child_tid,
                 r15: 0,
                 fs_base: tls, // initial FS_BASE — musl/ERTS may overwrite via ARCH_SET_FS
+                fxsave_area: fxsave_template(),
             },
             kernel_stack_top: kstack_top,
             user_stack: stack,
@@ -426,14 +475,15 @@ pub fn yield_current() {
 
                             // Jump directly to the thread's saved context.
                             // One-way switch — the idle loop doesn't need
-                            // saving — but we MUST restore FS_BASE alongside
-                            // GPRs, otherwise this thread reads its TLS
-                            // through whatever FS_BASE the last user of this
-                            // CPU left behind. (Same invariant as context_switch.)
+                            // saving — but we MUST restore FS_BASE and the
+                            // FPU/SSE state alongside GPRs, otherwise this
+                            // thread reads TLS / XMM register state from
+                            // whatever the last user of this CPU left behind.
+                            // (Same invariant as context_switch.)
                             drop(_qlock);
-                            // First restore FS_BASE (clobbers rax/rdx/rcx,
-                            // but those aren't part of the saved context).
                             let fs = next.ctx.fs_base;
+                            let fxptr = &next.ctx.fxsave_area as *const _ as u64;
+                            // Restore FS_BASE (clobbers rax/rdx/rcx).
                             core::arch::asm!(
                                 "mov rdx, rax",
                                 "shr rdx, 32",
@@ -442,6 +492,12 @@ pub fn yield_current() {
                                 in("rax") fs,
                                 out("rdx") _,
                                 out("rcx") _,
+                            );
+                            // Restore FPU/SSE state.
+                            core::arch::asm!(
+                                "fxrstor64 [{}]",
+                                in(reg) fxptr,
+                                options(nostack, preserves_flags),
                             );
                             core::arch::asm!(
                                 "mov rsp, {rsp}",
@@ -872,10 +928,15 @@ extern "C" fn clone_child_return() {
 }
 
 /// Low-level context switch.
-/// Also saves and restores FS_BASE (TLS pointer) via RDMSR/WRMSR — without
-/// this, threads sharing a CPU would read each other's thread-local storage
-/// after a switch, which corrupts ERTS scheduler state (e.g. the per-scheduler
-/// `last_os_monotonic_time` that drives the time-backwards check).
+///
+/// Saves and restores: callee-saved GPRs (rsp, rbx, rbp, r12-r15), FS_BASE
+/// (TLS pointer, MSR 0xC000_0100), and the FPU/SSE state (FXSAVE/FXRSTOR
+/// area at offset 64 in ThreadCtx — 512 bytes, must be 16-byte aligned).
+///
+/// Without FXSAVE/FXRSTOR, ERTS and musl SSE-using code (memcpy/memset via
+/// movdqa, FP arithmetic) would see XMM register contents from whichever
+/// thread last ran on this CPU. That manifests as random data corruption —
+/// different beam_load failures and pointer-deref page faults each run.
 #[unsafe(naked)]
 extern "C" fn context_switch(_from: *mut ThreadCtx, _to: *const ThreadCtx) {
     core::arch::naked_asm!(
@@ -887,6 +948,8 @@ extern "C" fn context_switch(_from: *mut ThreadCtx, _to: *const ThreadCtx) {
         "mov [rdi+32], r13",
         "mov [rdi+40], r14",
         "mov [rdi+48], r15",
+        // Save outgoing FPU/SSE state.
+        "fxsave64 [rdi+64]",
         // Save outgoing FS_BASE: RDMSR(0xC000_0100) -> EDX:EAX
         "push rsi",                  // preserve to-ptr (rdmsr clobbers eax/ecx/edx)
         "push rdi",                  // preserve from-ptr
@@ -911,6 +974,8 @@ extern "C" fn context_switch(_from: *mut ThreadCtx, _to: *const ThreadCtx) {
         "shr rdx, 32",
         "mov ecx, 0xC0000100",
         "wrmsr",
+        // Restore incoming FPU/SSE state.
+        "fxrstor64 [rsi+64]",
         "ret",
     );
 }

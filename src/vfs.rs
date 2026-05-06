@@ -128,7 +128,7 @@ pub fn open(path: &[u8]) -> i64 {
     let (data_offset, data_len) = match cpio_lookup(path) {
         Some(x) => {
             if let Ok(s) = core::str::from_utf8(path) {
-                serial_println!("[vfs] open {} ({} bytes)", s, x.1);
+                serial_println!("[vfs] open {} cpio_off={:#x} ({} bytes)", s, x.0, x.1);
             }
             // After enough modules are loaded, switch from spin-yield to
             // blocking futex. The init phase loads ~80 .beam files; after
