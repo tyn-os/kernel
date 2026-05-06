@@ -337,6 +337,19 @@ extern "C" fn syscall_dispatch(
                 serial_println!("[t{}#{}] nr={} a0={:#x}", idx, tc, nr, a0);
             }
         }
+        // Always trace syscalls touching socket fds (>= 500) so we can see
+        // what gen_tcp does on accepted connections — this runs after the
+        // per-thread cap. Only includes syscalls where a0 is genuinely an fd.
+        let fd_taking = matches!(nr,
+            0 | 1 | 3 | 17 | 18 | 19 | 20 | 21 | 41 | 42 | 43 | 44 | 45 | 46 | 47
+            | 48 | 49 | 50 | 51 | 52 | 54 | 55 | 72 | 217 | 232 | 233 | 288);
+        if fd_taking && a0 >= 500 && a0 < 600 {
+            static SOCK_C: AtomicU64 = AtomicU64::new(0);
+            let sc = SOCK_C.fetch_add(1, Ordering::Relaxed);
+            if sc < 1000 {
+                serial_println!("[sock-sc] t{} nr={} fd={} a1={:#x} a2={:#x}", idx, nr, a0, a1, a2);
+            }
+        }
     }
     if idx < 24 { IN_SYSCALL[idx].store(true, Ordering::Relaxed); }
     let result = syscall_dispatch_inner(nr, a0, a1, a2, a3, _a4);
@@ -596,6 +609,15 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
 }
 
 fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
+    // Trace any read on socket-range fds (>= 500) so we can see what gen_tcp
+    // is doing on accepted connections.
+    if fd >= 500 {
+        static R: AtomicU64 = AtomicU64::new(0);
+        let n = R.fetch_add(1, Ordering::Relaxed);
+        if n < 30 {
+            serial_println!("[read-sock] fd={} count={}", fd, count);
+        }
+    }
     // stdin: read from COM1 serial port
     if fd == 0 {
         return sys_read_stdin(buf, count);

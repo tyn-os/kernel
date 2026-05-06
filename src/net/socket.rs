@@ -463,14 +463,20 @@ pub fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, _flags: i32,
                     _src_addr: *mut u8, _addrlen: *mut u32) -> i64 {
     let sock = match find_socket(fd) {
         Some(s) => s,
-        None => return -9,
+        None => {
+            static MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            if MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 5 {
+                crate::serial_println!("[recv-miss] fd={} (socket not found)", fd);
+            }
+            return -9;
+        }
     };
 
     match sock.sock_type {
         SockType::TcpStream => {
             // Poll network first to process any pending incoming packets
             crate::net::poll();
-            crate::net::with_net(|net| {
+            let result = crate::net::with_net(|net| {
                 let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
                 if !tcp.can_recv() {
                     if !tcp.is_active() {
@@ -483,7 +489,14 @@ pub fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, _flags: i32,
                     Ok(n) => n as i64,
                     Err(_) => -104, // -ECONNRESET
                 }
-            })
+            });
+            // Log first few recv calls per socket fd to trace gen_tcp:recv
+            static REC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let n = REC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 50 {
+                crate::serial_println!("[recv] fd={} len={} -> {}", fd, len, result);
+            }
+            result
         }
         _ => -9,
     }
