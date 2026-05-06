@@ -122,7 +122,8 @@ extern "C" fn main(_mbi: *const u8) -> ! {
             b"-bindir\0", b"/otp/erts-15.2.7/bin\0",
             b"-noshell\0",
             b"-noinput\0",
-            b"-eval\0", b"application:start(telemetry), {ok,_}='Elixir.Bandit':start_link([{plug,'Elixir.HelloPlug'},{port,8080},{scheme,http}]), erlang:display('Bandit on Tyn!').\0",
+            b"-kernel\0", b"inet_backend\0", b"inet\0",
+            b"-eval\0", b"erlang:display(starting), {ok,L}=gen_tcp:listen(8080,[binary,{active,false},{reuseaddr,true}]), erlang:display(listening), {ok,S}=gen_tcp:accept(L), erlang:display(accepted), {ok,D}=gen_tcp:recv(S,0,10000), erlang:display({got,D}), gen_tcp:send(S,<<\"HTTP/1.0 200 OK\\r\\nContent-Length: 5\\r\\n\\r\\nHELLO\">>), erlang:display(sent), gen_tcp:close(S), erlang:display(done).\0",
         ];
         let mut arg_ptrs = [0u64; 20];
         for (i, arg) in args.iter().enumerate() {
