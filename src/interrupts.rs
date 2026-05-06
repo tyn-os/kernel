@@ -133,6 +133,13 @@ core::arch::global_asm!(
     "sched_yield_trampoline:",
     // Original RIP is at [rsp] (pushed by timer handler).
     // Save caller-saved regs that syscall clobbers.
+    //
+    // BUG: this only preserves rax/rcx/r11; rdx/rsi/rdi/r8-r10 and xmm0..15
+    // can be live in interrupted user code and the syscall path may clobber
+    // them. Investigated in BOOT_RELIABILITY.md — the 9-GPR-push variants
+    // regress reliability for reasons not yet fully understood. Keeping the
+    // 3-push baseline (81% reliable) until the right preservation discipline
+    // is found.
     "push rax",
     "push rcx",
     "push r11",
