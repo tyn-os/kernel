@@ -796,19 +796,32 @@ pub fn watchdog_wake() {
                     }
                     // With the lock-handoff protocol in futex_wait, real wakes
                     // are never lost — the bucket lock spans the wait→sleep
-                    // transition. The watchdog is now a backstop only for
+                    // transition. The watchdog is a backstop only for
                     // genuine value-changed-without-wake bugs.
                     let force = false;
                     if current != thread.futex_val || force {
                         // Value changed or force-wake timeout.
-                        // Just set state=Ready — DON'T add to queue.
-                        // The idle loop on the thread's CPU detects the state
-                        // change and resumes via context_switch. Adding to queue
-                        // would cause dual scheduling.
+                        // Set state=Ready AND push to home_cpu's queue.
+                        // The idle loop only pulls from the queue, so
+                        // setting state alone leaves the thread orphaned
+                        // (Ready but not queued, never picked up). Dedup
+                        // by checking `contains` so a concurrent real
+                        // futex_wake racing the watchdog doesn't queue
+                        // the same tid twice.
                         thread.state = State::Ready;
                         let addr = thread.futex_addr;
                         thread.futex_addr = 0;
                         let tid = thread.tid;
+                        let target_cpu = thread.home_cpu as usize;
+                        if target_cpu < MAX_CPUS {
+                            let _qlock = CPU_QUEUE_LOCKS[target_cpu].lock();
+                            if !CPU_QUEUES[target_cpu].queue.iter().any(|&t| t == tid) {
+                                CPU_QUEUES[target_cpu].queue.push_back(tid);
+                            }
+                        }
+                        if target_cpu != current_cpu() as usize {
+                            crate::apic::send_ipi(target_cpu as u8);
+                        }
 
                         static WD_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
                         let c = WD_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
