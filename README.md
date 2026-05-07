@@ -44,25 +44,33 @@ Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP shi
 
 ## Status
 
-**OTP 27 BEAM running on bare metal with SMP, TCP networking, and Elixir.**
+**OTP 27 BEAM running on bare metal with SMP, TCP, HTTP, and Elixir. 100% boot reliability on KVM (64/64 trial).**
 
 ```
-$ echo "hello" | nc localhost 5555
-Hello from OTP 27 on Tyn!
+$ curl http://localhost:5566/
+Hi
 ```
 
 ```
-{otp27,"27"}
-{listening,8080}
-{accepted,#Port<0.4>}
-done
+starting
+listening
+accepted
+h_spawned
+{ctrl,ok}
+parent_msg_sent
+h_start
+h_got_sock
+{h_setopts,ok}
+{h_got_tcp,77}
+{h_send,ok}
+{parent_got,done}
 ```
 
 - OTP 27 ERTS boots with 8 CPUs, loads 80+ .beam files from in-memory VFS
 - Full OTP kernel application starts — supervision trees, code_server, logger
-- Erlang TCP server: `gen_tcp:listen` → `accept` → `send` → host receives data
+- HTTP server: `gen_tcp:listen` → `accept` → `controlling_process` → `inet:setopts({active,once})` → `{tcp,S,Data}` delivery → `send` → host gets the response
 - Elixir 1.18.3 runs: `IO.puts`, `System.version`, `Kernel.inspect` all work
-- Stable under load — serves TCP connections indefinitely, 41 OTP processes, zero crashes
+- Stable boot: 64/64 successful starts on a 30-second KVM trial — zero data-corruption failures (no #PF, #GP, or beam_load errors), zero scheduler-progress timeouts
 
 ### What works
 
@@ -88,8 +96,8 @@ The switch happens automatically after ERTS finishes loading boot modules. Norma
 
 ### What's next
 
+- **Bandit / Phoenix** — the kernel TCP surface is verified end-to-end (the manual ThousandIsland-style flow above exercises every primitive Bandit relies on), but Bandit's `DynamicSupervisor` → `Handler` GenServer chain stalls after `accept`. Open investigation in [MESSAGE_DELIVERY.md](MESSAGE_DELIVERY.md).
 - **BEAM JIT** — BeamAsm support (requires IST-safe preemption for clone child stacks)
-- **Phoenix/Bandit** — run a web framework on Tyn
 - **Interactive shell** — IEx/Erlang shell with full stdin support
 
 ## Building & Running
@@ -202,6 +210,13 @@ cd staging && find . -type f | sed 's|^\./||' | cpio -o -H newc > ../src/otp-roo
 - [Module structure](docs/module-structure.md) — source file dependencies and line counts
 - [Boot flow](docs/boot-flow.md) — from power-on to Erlang shell, syscall sequence
 - [Runtime architecture](docs/runtime-arch.md) — CPU layout, futex strategy, memory map
+
+## Investigation logs
+
+These document the bug-class hunts that took boot reliability from 81% to 100% and continue to chase the Bandit-application-level stall:
+
+- [BOOT_RELIABILITY.md](BOOT_RELIABILITY.md) — failure modes, stack-layout trace through preemption + syscall, what fixes worked and why
+- [MESSAGE_DELIVERY.md](MESSAGE_DELIVERY.md) — scheduler-wake / process-scheduling races; the watchdog-rescue bug and the open Bandit handler stall
 
 ## Design Principles
 
