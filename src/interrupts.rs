@@ -94,12 +94,12 @@ extern "x86-interrupt" fn timer_handler(mut frame: InterruptStackFrame) {
     // EOI to APIC (PIC is disabled)
     crate::apic::eoi();
 
-    // Watchdog: every 100 ticks (~1 second) for stuck threads
-    static WD_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    let tick = WD_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if tick % 100 == 0 && tick > 0 {
-        crate::sched::watchdog_wake();
-    }
+    // Watchdog: every tick (10 ms with the 100 Hz APIC timer). Cheap —
+    // iterates at most MAX_THREADS = 24 entries. Needs to be tick-frequent
+    // because it doubles as the deadline checker for FUTEX_WAIT timeouts
+    // (used by ethr_event_twait → schedulers' timer-aware sleep). With
+    // a 1-second cadence, `receive after N` resolution would be 1 s.
+    crate::sched::watchdog_wake();
 
     const KERNEL_BASE: u64 = 0x0F00_0000;
     let ip = frame.instruction_pointer.as_u64();

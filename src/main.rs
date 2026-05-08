@@ -129,11 +129,11 @@ extern "C" fn main(_mbi: *const u8) -> ! {
             // — listen/accept/setopts({active,once})/controlling_process/
             // active-mode {tcp,S,Data} delivery/send/close — works in this
             // raw flow. Curl returns "Hi".
-            b"-eval\0", b"erlang:display(starting), {ok,L}=gen_tcp:listen(8080,[binary,{reuseaddr,true}]), erlang:display(listening), {ok,S}=gen_tcp:accept(L), erlang:display(accepted), Self=self(), Pid=spawn(fun() -> erlang:display(h_start), receive {sock,Sk} -> erlang:display(h_got_sock), R1=inet:setopts(Sk,[{active,once}]), erlang:display({h_setopts,R1}), receive {tcp,Sk,D} -> erlang:display({h_got_tcp,byte_size(D)}), R2=gen_tcp:send(Sk,<<\"HTTP/1.0 200 OK\\r\\n\\r\\nHi\">>), erlang:display({h_send,R2}), gen_tcp:close(Sk), Self ! done after 5000 -> Self ! h_timeout end end end), erlang:display(h_spawned), Rc=gen_tcp:controlling_process(S,Pid), erlang:display({ctrl,Rc}), Pid ! {sock,S}, erlang:display(parent_msg_sent), receive M -> erlang:display({parent_got,M}) after 12000 -> erlang:display(parent_timeout) end.\0",
+            b"-eval\0", b"erlang:display(starting), {ok,L}=gen_tcp:listen(8080,[binary,{reuseaddr,true}]), erlang:display(listening), {ok,S}=gen_tcp:accept(L), erlang:display(accepted), Self=self(), Pid=spawn(fun() -> erlang:display(h_start), receive {sock,Sk} -> erlang:display(h_got_sock), R1=inet:setopts(Sk,[{active,once}]), erlang:display({h_setopts,R1}), receive {tcp,Sk,D} -> erlang:display({h_got_tcp,byte_size(D)}), R2=gen_tcp:send(Sk,<<\"HTTP/1.0 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nHi\">>), erlang:display({h_send,R2}), gen_tcp:close(Sk), Self ! done after 5000 -> Self ! h_timeout end end end), erlang:display(h_spawned), Rc=gen_tcp:controlling_process(S,Pid), erlang:display({ctrl,Rc}), Pid ! {sock,S}, erlang:display(parent_msg_sent), receive M -> erlang:display({parent_got,M}) after 12000 -> erlang:display(parent_timeout) end.\0",
         ];
         let mut arg_ptrs = [0u64; 20];
         for (i, arg) in args.iter().enumerate() {
-            sp -= 1024; // must fit longest arg (eval strings can be 600+ bytes)
+            sp -= 2048; // must fit longest arg (diagnostic eval strings can be 1500+ bytes)
             core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
             arg_ptrs[i] = sp;
         }

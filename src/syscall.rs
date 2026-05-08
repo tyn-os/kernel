@@ -428,7 +428,7 @@ fn syscall_dispatch_inner(
             51
         }
         SYS_EPOLL_CTL => sys_epoll_ctl(a1 as i32, a2 as i32, a3),
-        SYS_EPOLL_WAIT | SYS_EPOLL_PWAIT => sys_epoll_wait(a0, a1, a2),
+        SYS_EPOLL_WAIT | SYS_EPOLL_PWAIT => sys_epoll_wait(a0, a1, a2, a3 as i32),
         SYS_RT_SIGACTION => 0, // record but no-op
         SYS_RT_SIGPROCMASK => 0,
         SYS_SIGALTSTACK => 0,
@@ -476,7 +476,7 @@ fn syscall_dispatch_inner(
         SYS_SCHED_SETAFFINITY => 0,
         SYS_SOCKETPAIR => sys_pipe(a3 as *mut i32), // fake as pipe pair
         SYS_PRCTL => 0, // no-op
-        SYS_FUTEX => sys_futex(a0, a1, a2),
+        SYS_FUTEX => sys_futex(a0, a1, a2, a3),
         SYS_PPOLL => sys_ppoll(a0, a1, a2),
         SYS_SELECT => {
             // select(nfds, readfds, writefds, exceptfds, *timeval)
@@ -510,7 +510,13 @@ fn syscall_dispatch_inner(
         }
         SYS_TIMERFD_SETTIME => sys_timerfd_settime(a0 as i32, a1 as i32, a2),
         SYS_SCHED_YIELD => {
-            crate::sched::yield_current();
+            // Linux semantics: sched_yield is a hint, returns immediately.
+            // ERTS's scheduler calls it as part of its own main loop; if we
+            // context-switch here, we delay ERTS getting back to its
+            // top-of-loop checks (erts_check_time → timer wheel advance).
+            // Preemption is driven by the 100 Hz timer-based trampoline,
+            // not by voluntary sched_yield. With this no-op, schedulers
+            // run their main loop continuously and timers fire on time.
             0
         }
         SYS_NANOSLEEP => { crate::sched::yield_current(); 0 }
@@ -1085,40 +1091,73 @@ fn sys_epoll_ctl(op: i32, fd: i32, event_ptr: u64) -> i64 {
     0 // table full — silently succeed
 }
 
-fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64) -> i64 {
-    crate::net::poll();
-    crate::sched::yield_current();
-
-    let mut count = 0i64;
-    let max = maxevents as usize;
+fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64, timeout_ms: i32) -> i64 {
     const EPOLLIN: u32 = 0x001;
+    let max = maxevents as usize;
 
-    // Check each registered fd for readiness; return its registered `data`.
-    let _g = EPOLL_LOCK.lock();
-    unsafe {
-        for e in EPOLL_TABLE.iter() {
-            if count >= max as i64 { break; }
-            if e.fd < 0 { continue; }
-            let ready = if e.fd == 51 {
-                timerfd_ready()
-            } else if crate::pipe::is_pipe_fd(e.fd) {
-                crate::pipe::has_data(e.fd)
-            } else if crate::net::socket::is_socket_fd(e.fd) {
-                crate::net::socket::poll_socket(e.fd) & 0x1 != 0
-            } else {
-                false
-            };
-            if ready {
-                let off = (count as u64) * 12;
-                let ev = (events_ptr + off) as *mut u8;
-                *(ev as *mut u32) = EPOLLIN;
-                *((ev as u64 + 4) as *mut u64) = e.data;
-                count += 1;
+    // ERTS calls epoll_wait(epfd, events, max, timeout_ms) with a timeout
+    // computed from its nearest timer-wheel expiration. The scheduler
+    // expects to be unblocked when either (a) an fd becomes ready, or
+    // (b) the timeout elapses, so it can advance the timer wheel and
+    // fire `receive after N` / gen_server:call timeouts. If we ignore
+    // the timeout and return immediately every call, the scheduler
+    // either spin-loops (burning CPU) or — worse — sleeps elsewhere
+    // assuming epoll_wait blocked, and the timer wheel never advances.
+    //
+    // Convert timeout_ms = -1 (infinite) → block-until-ready; 0 →
+    // return immediately; >0 → wait up to that many ms.
+    let deadline = match timeout_ms {
+        -1 => None,
+        0 => Some(0u64), // return immediately after first scan
+        t if t > 0 => Some(monotonic_ns().saturating_add((t as u64) * 1_000_000)),
+        _ => Some(0u64),
+    };
+
+    loop {
+        crate::net::poll();
+
+        let mut count = 0i64;
+        let _g = EPOLL_LOCK.lock();
+        unsafe {
+            for e in EPOLL_TABLE.iter() {
+                if count >= max as i64 { break; }
+                if e.fd < 0 { continue; }
+                let ready = if e.fd == 51 {
+                    timerfd_ready()
+                } else if crate::pipe::is_pipe_fd(e.fd) {
+                    crate::pipe::has_data(e.fd)
+                } else if crate::net::socket::is_socket_fd(e.fd) {
+                    crate::net::socket::poll_socket(e.fd) & 0x1 != 0
+                } else {
+                    false
+                };
+                if ready {
+                    let off = (count as u64) * 12;
+                    let ev = (events_ptr + off) as *mut u8;
+                    *(ev as *mut u32) = EPOLLIN;
+                    *((ev as u64 + 4) as *mut u64) = e.data;
+                    count += 1;
+                }
             }
         }
-    }
+        drop(_g);
 
-    count
+        if count > 0 {
+            return count;
+        }
+
+        match deadline {
+            Some(0) => return 0,
+            Some(d) => {
+                if monotonic_ns() >= d {
+                    return 0;
+                }
+            }
+            None => {}
+        }
+
+        crate::sched::yield_current();
+    }
 }
 
 /// ppoll: check pollfds for ready pipe fds.
@@ -1230,11 +1269,32 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
     }
 }
 
-fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
+fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64) -> i64 {
     let cmd = (op & 0x7f) as u32; // mask FUTEX_PRIVATE_FLAG
     match cmd {
         0 | 9 => {
-            crate::sched::futex_wait(uaddr, val as u32)
+            // FUTEX_WAIT / FUTEX_WAIT_BITSET. The 4th arg is a *const
+            // struct timespec when non-null — the relative timeout for
+            // FUTEX_WAIT (an absolute time for FUTEX_WAIT_BITSET, but
+            // ERTS's ethr_event uses plain FUTEX_WAIT with a relative
+            // timespec). If we ignore it, ethr_event_twait — used by
+            // schedulers for timer-aware sleeps — becomes an infinite
+            // wait, and `receive after N` / gen_server:call timeouts
+            // never fire.
+            let deadline = if timeout_ptr != 0 {
+                // SAFETY: caller passes a user-space pointer; we treat
+                // it as identity-mapped into our address space.
+                unsafe {
+                    let tv_sec = *(timeout_ptr as *const u64);
+                    let tv_nsec = *((timeout_ptr + 8) as *const u64);
+                    let dur_ns = tv_sec.saturating_mul(1_000_000_000)
+                        .saturating_add(tv_nsec);
+                    Some(monotonic_ns().saturating_add(dur_ns))
+                }
+            } else {
+                None
+            };
+            crate::sched::futex_wait_until(uaddr, val as u32, deadline)
         }
         1 => {
             crate::sched::futex_wake(uaddr, val as u32)

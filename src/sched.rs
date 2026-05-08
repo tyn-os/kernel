@@ -94,6 +94,8 @@ struct Thread {
     clone_r9: u64,     // saved R9 for child (musl's fn pointer)
     clone_rip: u64,    // saved return RIP for child
     home_cpu: u32,     // CPU where this thread was created (futex_wake targets this)
+    wait_deadline_ns: u64, // 0 = no deadline; else monotonic_ns deadline for timed wait
+    wait_timed_out: bool,  // set true by watchdog when deadline reached before wake
 }
 
 /// Per-CPU run queue.
@@ -337,6 +339,8 @@ pub fn init(num_cpus: usize) {
             clone_r9: 0,
             clone_rip: 0,
             home_cpu: 0,
+            wait_deadline_ns: 0,
+            wait_timed_out: false,
         });
         CPU_QUEUES[0].current = Some(0);
         CPU_QUEUES[0].idle = false;
@@ -403,6 +407,8 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
             clone_r9,
             clone_rip,
             home_cpu: 0, // updated below to best_cpu
+            wait_deadline_ns: 0,
+            wait_timed_out: false,
         });
     }
 
@@ -560,14 +566,26 @@ pub fn yield_current() {
     }
 }
 
-/// Futex WAIT — atomically check *addr == val and sleep.
-/// Returns 0 (woken) or -EAGAIN (value changed).
+/// Futex WAIT (no timeout) — kept for callers that don't pass a deadline.
+pub fn futex_wait(addr: u64, val: u32) -> i64 {
+    futex_wait_until(addr, val, None)
+}
+
+/// Futex WAIT with optional absolute deadline (in monotonic_ns units).
+/// Returns 0 (woken normally), -EAGAIN (value changed), or -ETIMEDOUT (110)
+/// if the deadline expires without a wake.
 ///
 /// **Lock-handoff protocol:** the bucket lock is acquired before the value
 /// check, and held continuously until AFTER context_switch completes. The
 /// next thread to run on this CPU releases the lock via release_pending_unlock.
 /// This closes the wake-loss race window between marking-blocked and sleeping.
-pub fn futex_wait(addr: u64, val: u32) -> i64 {
+///
+/// **Timeout behaviour:** if `deadline` is set and we'd otherwise block
+/// indefinitely, we attach the deadline to the thread (`futex_deadline_ns`)
+/// and let the watchdog rescue it when the deadline passes. The watchdog's
+/// rescue path now queues the woken thread, so `ethr_event_twait` returns
+/// ETIMEDOUT to ERTS and the scheduler advances its timer wheel.
+pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
     // If only 1 thread exists, yield and return (spurious wakeup).
     // This handles pre-clone musl locks that would otherwise deadlock.
     if NEXT_TID.load(Ordering::Relaxed) <= 1 {
@@ -632,6 +650,8 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
             thread.state = State::Blocked;
             thread.futex_addr = addr;
             thread.futex_val = val;
+            thread.wait_deadline_ns = deadline.unwrap_or(0);
+            thread.wait_timed_out = false;
         }
     }
 
@@ -680,6 +700,17 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
             // We were resumed after a wake. Release any pending unlock from
             // the thread that switched TO us before it switched away.
             release_pending_unlock(current_cpu() as usize);
+            // If we were woken because of a deadline timeout (watchdog set
+            // wait_timed_out), report ETIMEDOUT so ERTS's ethr_event_twait
+            // returns to the scheduler and lets it advance the timer wheel.
+            unsafe {
+                if let Some(t) = THREADS[blocked_tid].as_mut() {
+                    let to = t.wait_timed_out;
+                    t.wait_timed_out = false;
+                    t.wait_deadline_ns = 0;
+                    if to { return -110; } // -ETIMEDOUT
+                }
+            }
             0 // woken
         }
         None => {
@@ -698,6 +729,12 @@ pub fn futex_wait(addr: u64, val: u32) -> i64 {
                 // We were woken and context_switched back. Release any
                 // pending unlock from the cpu_idle_loop side, then return 0.
                 release_pending_unlock(current_cpu() as usize);
+                if let Some(t) = THREADS[blocked_tid].as_mut() {
+                    let to = t.wait_timed_out;
+                    t.wait_timed_out = false;
+                    t.wait_deadline_ns = 0;
+                    if to { return -110; }
+                }
             }
             0
         }
@@ -784,6 +821,7 @@ pub fn watchdog_wake() {
     // It only reads thread state and sets state=Ready, which is safe
     // because state is only checked via read_volatile in the idle loop.
     // Using try_lock deadlocks when futex_wake holds the lock on the same CPU.
+    let now_ns = crate::syscall::monotonic_ns();
     unsafe {
         for i in 0..MAX_THREADS {
             if let Some(thread) = THREADS[i].as_mut() {
@@ -797,9 +835,15 @@ pub fn watchdog_wake() {
                     // With the lock-handoff protocol in futex_wait, real wakes
                     // are never lost — the bucket lock spans the wait→sleep
                     // transition. The watchdog is a backstop only for
-                    // genuine value-changed-without-wake bugs.
+                    // genuine value-changed-without-wake bugs and for the
+                    // expiration of timed waits (FUTEX_WAIT with a timespec
+                    // — used by ethr_event_twait to drive ERTS's timer
+                    // wheel). Without the timeout branch, `receive after N`
+                    // and gen_server:call timeouts never fire.
+                    let timed_out = thread.wait_deadline_ns != 0
+                        && now_ns >= thread.wait_deadline_ns;
                     let force = false;
-                    if current != thread.futex_val || force {
+                    if current != thread.futex_val || force || timed_out {
                         // Value changed or force-wake timeout.
                         // Set state=Ready AND push to home_cpu's queue.
                         // The idle loop only pulls from the queue, so
@@ -811,6 +855,10 @@ pub fn watchdog_wake() {
                         thread.state = State::Ready;
                         let addr = thread.futex_addr;
                         thread.futex_addr = 0;
+                        if timed_out {
+                            thread.wait_timed_out = true;
+                        }
+                        thread.wait_deadline_ns = 0;
                         let tid = thread.tid;
                         let target_cpu = thread.home_cpu as usize;
                         if target_cpu < MAX_CPUS {
