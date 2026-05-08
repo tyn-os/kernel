@@ -123,12 +123,28 @@ extern "C" fn main(_mbi: *const u8) -> ! {
             b"-noshell\0",
             b"-noinput\0",
             b"-kernel\0", b"inet_backend\0", b"inet\0",
-            // Manual ThousandIsland-style HTTP server. Bandit/ThousandIsland
-            // itself stalls on Tyn (the GenServer/DynamicSupervisor handler
-            // chain doesn't progress past accept) but every primitive it uses
-            // — listen/accept/setopts({active,once})/controlling_process/
-            // active-mode {tcp,S,Data} delivery/send/close — works in this
-            // raw flow. Curl returns "Hi".
+            // Bisection probe: does proc_lib:spawn work? does
+            // gen_server:start_link work? Each stage prints before AND
+            // after so we can see exactly which step stalls.
+            // §B2.15: ThousandIsland with my_handler — a stripped-down
+            // pure-Erlang gen_server that mimics TI.Handler's exact init
+            // shape (Process.flag(:trap_exit, true), then waits for
+            // {:thousand_island_ready, ...} in handle_info) but DOESN'T
+            // use the `use ThousandIsland.Handler` macro.
+            // Manual gen_tcp HTTP demo. Bandit/ThousandIsland themselves
+            // stall on Tyn — see MESSAGE_DELIVERY.md §B2.12-§B2.15.
+            // §B2.15 narrowed the bug to `ThousandIsland.Connection.start`
+            // itself crashing before dispatching the handler module: a
+            // pure-Erlang `my_handler` with just gen_server callbacks
+            // never has its init/1 reached and its .beam is never loaded
+            // by VFS, even though we proved DynamicSupervisor.start_child
+            // works in isolation. Logger isn't catching the crash report
+            // (probably because Logger's pipeline is partially broken),
+            // so the next probe is recompiling Connection.start with
+            // IO.puts markers, or wrapping it in try/rescue.
+            // Every primitive (listen / accept / setopts({active,once}) /
+            // controlling_process / active-mode {tcp,S,Data} delivery /
+            // send / close) works in this raw flow. Curl returns "Hi".
             b"-eval\0", b"erlang:display(starting), {ok,L}=gen_tcp:listen(8080,[binary,{reuseaddr,true}]), erlang:display(listening), {ok,S}=gen_tcp:accept(L), erlang:display(accepted), Self=self(), Pid=spawn(fun() -> erlang:display(h_start), receive {sock,Sk} -> erlang:display(h_got_sock), R1=inet:setopts(Sk,[{active,once}]), erlang:display({h_setopts,R1}), receive {tcp,Sk,D} -> erlang:display({h_got_tcp,byte_size(D)}), R2=gen_tcp:send(Sk,<<\"HTTP/1.0 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nHi\">>), erlang:display({h_send,R2}), gen_tcp:close(Sk), Self ! done after 5000 -> Self ! h_timeout end end end), erlang:display(h_spawned), Rc=gen_tcp:controlling_process(S,Pid), erlang:display({ctrl,Rc}), Pid ! {sock,S}, erlang:display(parent_msg_sent), receive M -> erlang:display({parent_got,M}) after 12000 -> erlang:display(parent_timeout) end.\0",
         ];
         let mut arg_ptrs = [0u64; 20];

@@ -538,6 +538,269 @@ is now documented but not yet fixed; it'll resurface if/when we
 re-attempt Bandit because the wake-pipe spin will return and need
 yielding to break.
 
+### B2.12. Bisection: minimal ThousandIsland + EchoHandler reproduces the same stall
+
+To find out whether the stall is in Bandit's HTTP/Plug layer or in
+ThousandIsland's socket handoff, I built a minimal `EchoHandler`
+that uses `ThousandIsland.Handler` directly — bypassing all of
+Bandit:
+
+```elixir
+defmodule EchoHandler do
+  use ThousandIsland.Handler
+  def handle_connection(_socket, state) do
+    IO.puts("[echo] handle_connection"); {:continue, state}
+  end
+  def handle_data(data, socket, state) do
+    IO.puts("[echo] handle_data #{byte_size(data)} bytes")
+    ThousandIsland.Socket.send(socket, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nHi\n")
+    {:close, state}
+  end
+end
+
+{:ok, _} = ThousandIsland.start_link(port: 8080, handler_module: EchoHandler)
+```
+
+Compiled the .beam against ThousandIsland 1.3.10 (in a docker
+`elixir:1.18-alpine` container, since the build server's OTP 27 was
+TYN-tainted), added it to the cpio rootfs, and booted Tyn:
+
+```
+ti_start
+{ti_started,<0.79.0>}                ← TI.start_link returned OK
+=WARNING REPORT==== Failed to lookup telemetry handlers ===  (3×)
+[accept] connection established!
+[accept] returning new_fd=502         ← kernel accepted curl's connection
+[sock-sc] fd=502 a1=0x3 a2=0x0       ← F_GETFL on fd 502
+[sock-sc] fd=502 a1=0x4 a2=0x8800    ← F_SETFL O_NONBLOCK|O_LARGEFILE
+                                      ← (then silence on fd 502 forever)
+[sock-sc] fd=501 ...                  ← back to accept loop on listener
+```
+
+**Neither `handle_connection` nor `handle_data` ever prints.** Curl
+times out with 0 bytes received. This is the **same `accept →
+fcntl → silence`** pattern we saw with Bandit, so the bug is **not
+in Bandit's HTTP layer** — it's in ThousandIsland's socket-handoff
+to the handler process.
+
+Earlier in the session we proved that raw `spawn(fun() -> ...
+end)` + `controlling_process` works (the manual `gen_tcp` demo
+returns "Hi"). So the failure narrows to:
+
+> `DynamicSupervisor.start_child` → `gen_server:init_it` →
+> `proc_lib:init_p` → handler `init/1`
+
+The spawned child gen_server **never starts running its `init/1`**.
+The supervisor returns successfully (so `start_child` doesn't
+block ThousandIsland's acceptor), but the resulting child process
+sits in some state where it hasn't yet been scheduled or hasn't
+processed its first message.
+
+This is a much narrower target than "the Bandit handler stall" —
+it's a `proc_lib`/dynamic-supervisor lifecycle bug specific to
+how Tyn schedules the newly-spawned child.
+
+### B2.13. Process-spawn / supervisor / GenServer pattern: every layer works
+
+After §B2.12 narrowed the bug to "DynamicSupervisor.start_child →
+gen_server:init_it → handler init/1," I ran a sequence of focused
+experiments to pin down which layer fails. **Every layer works**:
+
+| Test | Result |
+|------|--------|
+| t1 — raw `spawn(fun)` | child runs ✓ |
+| t2 — `proc_lib:spawn(fun)` | child runs ✓ |
+| t3 — `proc_lib:spawn_link(fun)` | child runs ✓ |
+| t4 — `proc_lib:start_link(M,F,A)` with `init_ack` | child runs, `{ok,Pid}` returned ✓ |
+| t7 — `Agent.start_link` | `{ok,<0.79.0>}` ✓ |
+| t8 — `Task.start_link(fun)` | task body runs ✓ |
+| t9 — `DynamicSupervisor.start_child` of an `Agent` | agent's init fun runs, `{ok,<0.83.0>}` ✓ |
+| t10 — `spawn_link` + `process_flag(trap_exit,true)` + recv | child runs, msg delivered ✓ |
+| t11 — `proc_lib:spawn_link` + trap_exit + recv | msg delivered ✓ |
+| t12 — DynSup child + trap_exit + recv | msg delivered ✓ |
+
+`t12` is the **exact pattern ThousandIsland.Handler uses** — DynSup
+spawns a process that does `Process.flag(:trap_exit, true)` then
+waits for `:thousand_island_ready` in `handle_info`. Our test
+sends a stand-in message and the child receives it. **It works.**
+
+So the bug is **not** in:
+- process spawning at any level
+- supervisor child management
+- GenServer's init / handle_info flow
+- `Process.flag(:trap_exit, true)`
+- message delivery to a freshly-spawned child
+
+The remaining suspect is the acceptor-side flow specific to
+ThousandIsland: between `start_child` (returning `{:ok, pid}`)
+and the `send(pid, {:thousand_island_ready, ...})` that the
+handler actually waits for, the acceptor calls
+`gen_tcp:controlling_process(socket, pid)`. The fcntl trace on
+fd 502 (`F_GETFL → F_SETFL O_NONBLOCK|O_LARGEFILE`) is from
+`controlling_process` or its internal `inet:setopts`. After that
+fcntl, we see no further activity on fd 502 — so either
+`controlling_process` is hanging (and the send never happens),
+or it returns and the message is sent but isn't delivered.
+
+Earlier we proved raw `gen_tcp:controlling_process(Sk, SpawnedPid)`
+works (the manual demo prints `{ctrl, ok}`). The difference here
+is that `Pid` is a freshly-spawned **GenServer process** registered
+under a DynamicSupervisor, not a bare `spawn` pid. There may be a
+subtle mailbox / monitor / link interaction that fails only in that
+combination.
+
+Next probe: explicitly call `gen_tcp:controlling_process` from the
+acceptor pattern with a DynSup-managed handler, with `send` of a
+distinguished message after, and watch the kernel-side fcntl/recv
+sequence. (Postponed — committing the bisection diary first.)
+
+### B2.14. The B-probe: identical OTP pattern with an Agent works perfectly
+
+Per the next narrowing step, I built the precise pattern your hypothesis
+called out — `gen_tcp:listen` → `DynamicSupervisor.start_child` of an
+Agent (a vanilla GenServer) → `gen_tcp:accept` → `controlling_process` →
+`inet:setopts({active, once})` → `send(handler, {:tcp, sock, "test"})`
+— and bracketed every step with `[B]` markers.
+
+```
+[B] before listen
+[B] listen ok
+[B] dynsup <0.79.0>
+[B] handler agent_init                ← Agent's init runs in DynSup child
+[B] handler <0.80.0>
+[B] before accept
+[B] accepted sock                     ← curl connects, accept returns
+[B] before controlling_process
+[B] controlling_process => ok         ← gen_tcp:controlling_process works
+[B] before setopts
+[B] setopts => ok                     ← inet:setopts({active,once}) works
+[B] before send fake tcp
+[B] send done
+[B] handler alive=true                ← handler still alive
+[B] DONE
+```
+
+**Every primitive completes successfully.** This is the same OTP-level
+shape as TI's acceptor flow, with a generic `Agent` standing in for
+`ThousandIsland.Handler`.
+
+For comparison, the kernel-side trace from a real
+`ThousandIsland + EchoHandler` run shows:
+
+```
+[accept] returning new_fd=502
+[sock-sc] t4 nr=72 fd=502 a1=0x3 a2=0x0    ← fcntl F_GETFL
+[sock-sc] t4 nr=72 fd=502 a1=0x4 a2=0x8800 ← fcntl F_SETFL O_NONBLOCK|O_LARGEFILE
+[sock-sc] t5 nr=43 fd=501 ...              ← back to accept on listener
+                                            (and silence on fd 502 forever)
+```
+
+The acceptor **returns to its accept loop** — meaning
+`start_child + controlling_process + send` all completed
+successfully (they don't make further kernel syscalls; they're
+Erlang-internal). But the handler `GenServer` **never processes
+`{:thousand_island_ready, ...}`** — the very next message on its
+mailbox after `init/1` returns.
+
+**Strong signal.** It's not a missing kernel primitive; it's a
+specific interaction between `ThousandIsland.Handler`'s expanded
+GenServer (generated by `use ThousandIsland.Handler`) and how
+its `handle_info({:thousand_island_ready, ...})` clause fires.
+Our manual test of the same OTP pattern works; TI's specific
+combination of `Process.flag(:trap_exit, true)` + the
+`{:thousand_island_ready, ...}` flow does not.
+
+Possible next-session probes (none cheap):
+
+1. Recompile ThousandIsland with `IO.puts` markers on every line
+   of `Connection.start` and `Handler.handle_info` — needs the
+   docker `elixir:1.18-alpine` toolchain re-pulled (was removed
+   for disk space). Would tell us *exactly* which line in
+   `Connection.start` runs and whether `Handler.handle_info` ever
+   dispatches.
+2. Compile a stripped-down `MyHandler` that uses `GenServer`
+   directly (no `use ThousandIsland.Handler` macro), copies the
+   exact `init`/`handle_info` shape, and is started by a custom
+   listener. If *that* works but `EchoHandler` doesn't, the bug
+   is in `__using__`'s expansion.
+
+### B2.15. Stripped-down `my_handler` proves the bug is in `Connection.start`, not the handler
+
+Wrote a pure-Erlang `my_handler` with just `-behaviour(gen_server)`
+plus `child_spec/1` and `start_link/1` — **no** `use ThousandIsland.Handler`,
+no macro expansion, just raw `gen_server` callbacks:
+
+```erlang
+init(_) ->
+    io:format("[myhandler] init~n"),
+    process_flag(trap_exit, true),
+    {ok, ...}.
+
+handle_info({thousand_island_ready, _, _, _, _}, ...) ->
+    io:format("[myhandler] got thousand_island_ready~n"), ...;
+handle_info(M, S) -> io:format("[myhandler] got unknown=~p~n",[M]), ...
+```
+
+Compiled with system `erlc` (OTP 25 — forward-compatible to OTP 27),
+added the `.beam` to the cpio rootfs, started ThousandIsland with
+`handler_module: my_handler`. Verified:
+
+- `code:which(my_handler) = "./my_handler.beam"` ✓
+- Manual `my_handler:start_link({foo, []})` from the eval **works** —
+  prints `[myhandler] init` ✓
+- `ThousandIsland:start_link([{port,8080},{handler_module,my_handler}])`
+  returns `{ok, <0.80.0>}` ✓
+
+Now curl. Kernel trace:
+
+```
+[accept] returning new_fd=502
+[sock-sc] fd=502 nr=72 a1=0x3 a2=0x0       ← fcntl F_GETFL
+[sock-sc] fd=502 nr=72 a1=0x4 a2=0x8800    ← fcntl F_SETFL O_NONBLOCK
+[sock-sc] fd=501 nr=43 ...                  ← back to accept
+```
+
+**`my_handler.beam` is never loaded by VFS** during the connection.
+Compare to `Elixir.ThousandIsland.HandlerConfig.beam` and
+`Elixir.DynamicSupervisor.beam` and `Elixir.Task.beam` which **are**
+loaded as part of TI startup — so the loader works fine for other
+modules. The handler module specifically is never reached.
+
+We also saw a **flood of 88 telemetry warnings** per single curl
+connection ("Failed to lookup telemetry handlers"). Starting
+`telemetry` via `:application.ensure_all_started(:telemetry)`
+removes the warnings — but **does not fix the stall**. Same fcntl
+sequence, no handler load.
+
+**Conclusion.** The handler module isn't the bug. The bug is in
+`ThousandIsland.Connection.start` itself — specifically the
+section between accepting the socket and calling
+`Supervisor.child_spec({handler_module, args}, opts)`. That
+function call (which would force-load `my_handler.beam` via
+`my_handler.child_spec/1`) is **never reached**. The acceptor's
+parent (`AcceptorSupervisor`) silently restarts it after the
+crash — Logger isn't catching the report (probably because
+Logger's own pipeline is partially broken without all of
+`error_logger`'s deps started).
+
+The real next-session probe: get a CRASH REPORT out of the
+acceptor so we can see *which line* in `Connection.start`
+raises. Options:
+
+1. Recompile `ThousandIsland.Connection` with `IO.puts` after
+   each line — the docker `elixir:1.18-alpine` toolchain
+   already worked for `EchoHandler.beam`, just need to re-pull
+   it.
+2. Patch the Acceptor to wrap `Connection.start` in
+   `try/rescue` and `IO.puts` the exception so we can see what
+   actually crashes.
+3. Add a custom Logger handler to the Tyn boot path that
+   formats reports to stdout unconditionally (bypass Elixir's
+   Logger entirely).
+
+Whichever we pick, the answer is now **one log line away** —
+the crash IS happening, we just don't see it.
+
 ### B3. Bandit's handler stall (still the original symptom)
 
 After the B1 fix, boot is 100% reliable but **Bandit still stalls
