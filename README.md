@@ -6,7 +6,7 @@ No Linux. No POSIX. Just your Erlang/Elixir/Gleam code on bare metal.
 
 ## What is Tyn?
 
-Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~5,000 lines of Rust, targeting KVM/QEMU cloud deployments.
+Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~6,300 lines of Rust, targeting KVM/QEMU cloud deployments.
 
 The BEAM already has its own process model, scheduler, memory management, and distribution protocol. A general-purpose OS kernel underneath duplicates much of what the BEAM provides natively. Tyn explores what happens when you remove that redundancy and give BEAM a purpose-built host.
 
@@ -33,7 +33,7 @@ The BEAM already has its own process model, scheduler, memory management, and di
 │  BEAM Host Interface (Rust)             │
 │  ~50 Linux syscalls emulated            │
 ├─────────────────────────────────────────┤
-│  Tyn Kernel (Rust, ~5,000 LOC)          │
+│  Tyn Kernel (Rust, ~6,300 LOC)          │
 │  SMP · Memory · Networking · VFS · I/O  │
 ├─────────────────────────────────────────┤
 │  KVM / QEMU / Cloud Hypervisor          │
@@ -44,33 +44,33 @@ Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP shi
 
 ## Status
 
-**OTP 27 BEAM running on bare metal with SMP, TCP, HTTP, and Elixir. 100% boot reliability on KVM (64/64 trial).**
+**OTP 27 BEAM running on bare metal with SMP, TCP, **Bandit + Plug**, and Elixir.**
+
+```elixir
+defmodule HelloPlug do
+  import Plug.Conn
+  def init(opts), do: opts
+  def call(conn, _opts) do
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(200, "Hello from Bandit on Tyn!\n")
+  end
+end
+
+{:ok, _} = Bandit.start_link(plug: HelloPlug, port: 8080)
+```
 
 ```
 $ curl http://localhost:5566/
-Hi
+Hello from Bandit on Tyn!
 ```
 
-```
-starting
-listening
-accepted
-h_spawned
-{ctrl,ok}
-parent_msg_sent
-h_start
-h_got_sock
-{h_setopts,ok}
-{h_got_tcp,77}
-{h_send,ok}
-{parent_got,done}
-```
-
-- OTP 27 ERTS boots with 8 CPUs, loads 80+ .beam files from in-memory VFS
+- OTP 27 ERTS boots with up to 8 CPUs, loads 150+ .beam files from in-memory VFS
 - Full OTP kernel application starts — supervision trees, code_server, logger
-- HTTP server: `gen_tcp:listen` → `accept` → `controlling_process` → `inet:setopts({active,once})` → `{tcp,S,Data}` delivery → `send` → host gets the response
+- **Bandit** runs unmodified on top of **ThousandIsland** with the default `num_acceptors: 100` configuration — the full `DynamicSupervisor` → `Connection.start` → handler-spawn chain works
+- **Plug pipeline**: `Plug.Conn` → `put_resp_content_type` → `send_resp` → host gets the response
 - Elixir 1.18.3 runs: `IO.puts`, `System.version`, `Kernel.inspect` all work
-- Stable boot: 64/64 successful starts on a 30-second KVM trial — zero data-corruption failures (no #PF, #GP, or beam_load errors), zero scheduler-progress timeouts
+- Reliability: from a clean clone, 3/3 boot+curl trials succeed end-to-end (boot reaches `bandit_listening` within 7–15s on KVM, then Bandit serves curl). Sequential request handling within a single boot is rock-solid (5/5).
 
 ### What works
 
@@ -96,7 +96,8 @@ The switch happens automatically after ERTS finishes loading boot modules. Norma
 
 ### What's next
 
-- **Bandit / Phoenix** — the kernel TCP surface is verified end-to-end (the manual ThousandIsland-style flow above exercises every primitive Bandit relies on), but Bandit's `DynamicSupervisor` → `Handler` GenServer chain stalls after `accept`. Open investigation in [MESSAGE_DELIVERY.md](MESSAGE_DELIVERY.md).
+- **Phoenix** — Bandit + Plug works; Phoenix on top should "just work" subject to compiling its dependency tree against the same OTP/Elixir as the cpio
+- **Concurrent-burst load** — sequential request handling is rock-solid; under a 5-simultaneous-curl burst, 2/5 succeed and 3 get `Connection reset by peer`. This is a smoltcp backpressure / connection-sup limit, not a kernel bug — see [MESSAGE_DELIVERY.md §B2.22](MESSAGE_DELIVERY.md)
 - **BEAM JIT** — BeamAsm support (requires IST-safe preemption for clone child stacks)
 - **Interactive shell** — IEx/Erlang shell with full stdin support
 
@@ -106,7 +107,7 @@ The switch happens automatically after ERTS finishes loading boot modules. Norma
 
 - Rust nightly toolchain with `rust-src` component
 - QEMU with KVM support (`qemu-system-x86_64`)
-- Pre-built BEAM binary and OTP rootfs (see "Building ERTS + VFS" below)
+- A statically-linked `beam.smp` and the OTP/Elixir rootfs cpio. **Both are committed at `src/beam.smp.elf` and `src/otp-rootfs.cpio` so the kernel builds out of the box.** To rebuild them yourself, see "Building ERTS + VFS" below.
 
 ### Build
 
@@ -127,12 +128,13 @@ qemu-system-x86_64 \
   -netdev user,id=net0,hostfwd=tcp::5555-:8080
 ```
 
-### Test TCP from host
+### Test the Bandit demo from host
 
 ```bash
-# In another terminal while QEMU is running:
-echo "hello" | nc localhost 5555
-# → conn 1 procs 41
+# In another terminal while QEMU is running, after Tyn prints
+# "bandit_listening" on the serial console (~12s after boot):
+curl http://localhost:5555/
+# → Hello from Bandit on Tyn!
 ```
 
 ## Building ERTS + VFS
@@ -213,10 +215,10 @@ cd staging && find . -type f | sed 's|^\./||' | cpio -o -H newc > ../src/otp-roo
 
 ## Investigation logs
 
-These document the bug-class hunts that took boot reliability from 81% to 100% and continue to chase the Bandit-application-level stall:
+These document the bug-class hunts that got Tyn from "ERTS boots" to "Bandit + Plug serves real traffic":
 
 - [BOOT_RELIABILITY.md](BOOT_RELIABILITY.md) — failure modes, stack-layout trace through preemption + syscall, what fixes worked and why
-- [MESSAGE_DELIVERY.md](MESSAGE_DELIVERY.md) — scheduler-wake / process-scheduling races; the watchdog-rescue bug and the open Bandit handler stall
+- [MESSAGE_DELIVERY.md](MESSAGE_DELIVERY.md) — scheduler-wake / process-scheduling races, the watchdog-rescue fix, and the `sys_accept` race that was blocking ThousandIsland's concurrent-acceptor pattern (now fixed)
 
 ## Design Principles
 

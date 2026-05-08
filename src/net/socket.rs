@@ -52,6 +52,17 @@ pub fn is_socket_fd(fd: i32) -> bool {
     unsafe { SOCKETS.iter().any(|s| s.fd == fd) }
 }
 
+/// Set the non-blocking flag on a socket fd. Called from `fcntl(F_SETFL)`.
+/// Without this, ERTS's `inet_drv` keeps issuing `accept` calls that would
+/// block under contention, instead of getting EAGAIN and retrying via epoll.
+pub fn set_nonblock(fd: i32, nonblock: bool) {
+    unsafe {
+        if let Some(s) = SOCKETS.iter_mut().find(|s| s.fd == fd) {
+            s.nonblock = nonblock;
+        }
+    }
+}
+
 fn find_socket(fd: i32) -> Option<&'static mut Socket> {
     // SAFETY: caller must hold SOCKET_LOCK or be in single-threaded context
     unsafe { SOCKETS.iter_mut().find(|s| s.fd == fd) }
@@ -199,6 +210,14 @@ pub fn sys_listen(fd: i32, _backlog: i32) -> i64 {
 }
 
 /// accept4(fd, addr, addrlen, flags) → new_fd or error
+///
+/// **Concurrent-acceptor correctness.** ERTS's `inet_drv` runs many
+/// concurrent `gen_tcp:accept` waiters on the same listener (TI starts
+/// 100). When a connection arrives, only ONE waiter must capture it.
+/// We make the state-check + handle-steal + new-listener-install
+/// atomic by doing all of it inside a single `with_net`. The losing
+/// races see the freshly-installed listener (`Listen` state) and either
+/// yield (blocking) or return EAGAIN (non-blocking).
 pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32) -> i64 {
     let sock = match find_socket(fd) {
         Some(s) => s,
@@ -209,66 +228,57 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
         return -95; // -EOPNOTSUPP
     }
 
-    // Poll the network and wait for an incoming connection.
-    // For blocking sockets, loop with poll + yield until established.
-    loop {
-        crate::net::poll();
-
-        let state = crate::net::with_net(|net| {
-            let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-            tcp.state()
-        });
-
-        if state == tcp::State::Established || state == tcp::State::CloseWait {
-            break;
-        }
-
-        if sock.nonblock || (flags & 0x800) != 0 {
-            return -11; // -EAGAIN
-        }
-
-        // Blocking: yield and retry
-        crate::sched::yield_current();
-    }
-
-    crate::serial_println!("[accept] connection established!");
-
-    // Connection established on the listening socket.
-    // In smoltcp, a listening socket transitions to "established" when
-    // a connection arrives. We need to extract it and create a new
-    // listening socket for the next connection.
-    let remote = crate::net::with_net(|net| {
-        let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-        tcp.remote_endpoint()
-    });
-
-    // Create a new socket for the accepted connection
-    // (swap: the current handle becomes the accepted connection,
-    //  create a fresh listener on the same port)
-    let accepted_handle = sock.handle;
+    let nonblock_call = sock.nonblock || (flags & 0x800) != 0;
     let listen_port = sock.local_port;
     let listen_addr = sock.local_addr;
 
-    let new_listener_handle = crate::net::with_net(|net| {
-        let rx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
-        let tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
-        let new_tcp = tcp::Socket::new(rx_buf, tx_buf);
-        let h = net.sockets.add(new_tcp);
-        let tcp = net.sockets.get_mut::<tcp::Socket>(h);
-        let endpoint = if listen_addr == Ipv4Address::UNSPECIFIED {
-            IpListenEndpoint { addr: None, port: listen_port }
-        } else {
-            IpListenEndpoint {
-                addr: Some(IpAddress::Ipv4(listen_addr)),
-                port: listen_port,
-            }
-        };
-        tcp.listen(endpoint).ok();
-        h
-    });
+    // Atomic check-and-extract loop. Each iteration runs under `with_net`,
+    // so only one CPU at a time can succeed in stealing the established
+    // connection. Returns Some((accepted_handle, remote)) on success,
+    // None if no connection is pending yet.
+    let (accepted_handle, remote) = loop {
+        crate::net::poll();
 
-    // Update the listener socket to use the new handle
-    sock.handle = new_listener_handle;
+        let result = crate::net::with_net(|net| {
+            let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+            let state = tcp.state();
+            if state != tcp::State::Established && state != tcp::State::CloseWait {
+                return None;
+            }
+            // Connection is here. Capture remote, then install a fresh
+            // listener on the same endpoint and swap `sock.handle`.
+            let remote = tcp.remote_endpoint();
+            let accepted = sock.handle;
+
+            let rx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
+            let tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
+            let new_tcp = tcp::Socket::new(rx_buf, tx_buf);
+            let new_h = net.sockets.add(new_tcp);
+            let new_listener = net.sockets.get_mut::<tcp::Socket>(new_h);
+            let endpoint = if listen_addr == Ipv4Address::UNSPECIFIED {
+                IpListenEndpoint { addr: None, port: listen_port }
+            } else {
+                IpListenEndpoint {
+                    addr: Some(IpAddress::Ipv4(listen_addr)),
+                    port: listen_port,
+                }
+            };
+            new_listener.listen(endpoint).ok();
+            sock.handle = new_h;
+            Some((accepted, remote))
+        });
+
+        if let Some(captured) = result {
+            break captured;
+        }
+
+        if nonblock_call {
+            return -11; // -EAGAIN
+        }
+        crate::sched::yield_current();
+    };
+
+    crate::serial_println!("[accept] connection established!");
 
     // Create a new fd for the accepted connection
     let new_fd = alloc_fd();

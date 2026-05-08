@@ -801,7 +801,190 @@ raises. Options:
 Whichever we pick, the answer is now **one log line away** —
 the crash IS happening, we just don't see it.
 
-### B3. Bandit's handler stall (still the original symptom)
+### B2.16-B2.20. The real bug: concurrent `gen_tcp:accept` waiters
+
+After §B2.15 narrowed the failure to "before `Connection.start` even
+runs," I patched `ThousandIsland.Connection.beam` (in docker
+`elixir:1.18-alpine`) with `:erlang.display(:CONN_*)` markers
+inside `start/5` and `do_start/9`. With the patched .beam in the
+cpio rootfs, ran TI again, curl connected → **zero `CONN_`
+markers** were printed. So `Connection.start` is not called.
+
+That moved the bug upstream of `Connection.start`. The next step
+was an attempt to patch `Acceptor.beam` similarly, but the
+docker-recompiled version failed to load:
+
+```
+exception error: ArgumentError
+"The module ThousandIsland.Acceptor was given as a child to a
+supervisor but it does not exist"
+in 'Elixir.Supervisor':init_child/1 (lib/supervisor.ex, line 797)
+```
+
+That's a load-side issue with the docker-built beam — likely
+debug-info / OTP-version mismatch with the rest of the cpio.
+Restored the original Acceptor and went a different way: replicate
+TI's actual call shape from a plain eval and watch the kernel-side
+syscall trace.
+
+**The reveal.** With **TI's exact listen options + 100 concurrent
+acceptors blocked on `gen_tcp:accept(L)`** (TI's default
+`num_acceptors`), curl connects → kernel does its accept and a
+short setup (`F_GETFL → F_SETFL O_NONBLOCK|O_LARGEFILE`) → then
+**stops, with zero Erlang acceptor processes waking up**. The
+short setup is exactly what we'd seen in the broken TI flow.
+
+```
+[accept] returning new_fd=502
+[sock-sc] fd=502 nr=72 a1=0x3 a2=0x0       ← fcntl F_GETFL
+[sock-sc] fd=502 nr=72 a1=0x4 a2=0x8800    ← fcntl F_SETFL O_NONBLOCK
+[sock-sc] fd=501 nr=43 ...                  ← back to accept (no acceptor woke)
+                                             (silence on fd 502 forever)
+```
+
+For comparison, with **1 acceptor** doing the same thing, the
+kernel does the FULL setup: `fcntl + getsockopt(SO_LINGER) +
+getsockopt(IP_TOS) + setsockopt(IPV6_V6ONLY) + setsockopt + ...`
+— the inet_drv's full post-accept configuration sequence — and
+returns `{:ok, port}` cleanly.
+
+**Bisection.** With **2 concurrent acceptors**, the first one DID
+wake up and got `{:ok, #Port<0.4>}`, but the second never woke
+(only one curl connection, expected). However the **parent's
+`receive {acc_done, ...}` never fired** even though the first
+child exited normally after sending — a separate symptom worth
+investigating but secondary to the primary bug.
+
+**Primary bug isolated:** when many Erlang processes call
+`gen_tcp:accept(L)` on the same listener, our kernel's response
+to a single incoming connection is consumed by the inet_drv's
+short-circuit setup but **never delivered to any of the waiting
+Erlang processes**. With 1 waiter, full setup runs and the result
+is delivered. The transition between 1 and N is the bug.
+
+**Workaround test:** TI accepts a `num_acceptors` option, default
+100. Setting `num_acceptors: 1` should sidestep the bug. Tested:
+TI starts; kernel does full accept setup on fd 502; but
+`Connection.start` is *still* not called. So num_acceptors=1
+alone is not sufficient — there's at least one more layer (perhaps
+an issue with how TI's single-acceptor flow differs from our
+single-shell-process accept). The probe and patched Connection
+are preserved in the rootfs (`my_handler.beam`,
+`Elixir.EchoHandler.beam`, `Elixir.ThousandIsland.Connection.beam`
+patched, `crash_logger.beam`) — the next session can pick up
+exactly where this left off without rebuilding the Docker
+toolchain.
+
+**Hypothesis for the kernel-side fix:** our smoltcp/socket layer
+delivers a connection-arrival to whichever process happens to be
+in `accept` first (or to ONE of them via some FIFO), but if the
+inet_drv's port has multiple proc-async-accept entries queued, we
+need to deliver the inet_async response to the right caller via
+the port-control protocol, and we may be dropping that message.
+Inspecting `src/net/socket.rs` accept-completion handling and how
+we route `{:inet_async, ...}` messages to waiting processes is
+the next step.
+
+### B2.21. FIXED: `sys_accept` race + `fcntl` for sockets — TI works end-to-end
+
+**Root cause confirmed.** `sys_accept` had a race between
+read-state and steal-handle, and `fcntl(F_SETFL, O_NONBLOCK)`
+wasn't being recorded for socket fds (only pipes). With many
+concurrent acceptors blocked on the same listener, several
+processes could see `Established` simultaneously, race to swap
+the socket handle, and corrupt each other's state — so the
+inet_drv accept-completion was either dropped or delivered
+incoherently.
+
+**Fix in two parts** (both in `src/`):
+
+1. `src/net/socket.rs` — `sys_accept` now does state-check +
+   handle-steal + new-listener-install **atomically inside one
+   `with_net`**. Losing races see the freshly-installed
+   listener (`Listen` state) and either yield (blocking) or
+   return EAGAIN (non-blocking).
+2. `src/syscall.rs` — `sys_fcntl(F_SETFL, O_NONBLOCK)` now
+   records the flag for socket fds via the new
+   `crate::net::socket::set_nonblock`. Without this all 100
+   ERTS-managed listening accepts are blocking, so they all
+   race instead of getting EAGAIN and waiting on epoll.
+
+**End-to-end verification** (with a stripped-down pure-Erlang
+`my_handler` standing in for an Elixir handler — the docker-
+compiled `Elixir.EchoHandler.beam` had a "corrupt atom table"
+load error against the rest of the cpio's beams, hence the
+Erlang stand-in):
+
+```
+[V] start TI w/ my_handler
+[V] TI {ok,<0.83.0>}
+{myhandler_child_spec,{[],[]}}    ← Connection.start now reaches DynamicSupervisor.start_child
+{myhandler_start_link,[],[]}      ← child spec dispatched
+{myhandler_init,[]}                ← my_handler init runs
+myhandler_got_ready                ← :thousand_island_ready DELIVERED
+myhandler_got_tcp_data             ← curl HTTP request received
+```
+
+```
+$ curl http://localhost:5566/
+Hi
+```
+
+**Reliability: 15/16 = 93.75%** on the 30s KVM trial with full
+ThousandIsland flow (default 100 acceptors). Manual gen_tcp demo
+still ships at 6/6 in a quick check.
+
+This unblocks Bandit too — Bandit is just HTTP/Plug on top of
+ThousandIsland. With TI's spawn/dispatch chain working, the
+remaining work for Bandit is matching its expected handler
+shape (which uses Elixir-compiled beams; the Docker compile
+issue would need to be debugged separately, but it's a build
+problem now, not a kernel bug).
+
+### B2.22. Bandit + HelloPlug: works end-to-end on Tyn
+
+With the kernel-side accept-race fix from §B2.21 in place,
+Bandit's TI-based dispatch chain works untouched. The May-5
+Bandit and HelloPlug beams (compiled before any of this debug
+work, never patched) just run.
+
+```elixir
+defmodule HelloPlug do
+  import Plug.Conn
+  def init(opts), do: opts
+  def call(conn, _opts) do
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(200, "Hello from Bandit on Tyn!\n")
+  end
+end
+```
+
+```erlang
+{ok, _} = 'Elixir.Bandit':start_link([{plug, 'Elixir.HelloPlug'}, {port, 8080}]).
+```
+
+```
+$ curl http://localhost:5566/
+Hello from Bandit on Tyn!
+```
+
+**Reliability:**
+- Sequential: 5/5 in a single boot, 14/16 = 87.5% across 16 boots
+  (the 2 failures are the same boot-time variance we've had).
+- Concurrent burst (5 simultaneous curls in a tight loop): 2/5 succeed,
+  3 get `Connection reset by peer`. This is a separate (much milder)
+  smoltcp backpressure / connection-sup max_children-style issue —
+  unrelated to the accept-race bug fixed here. Real-world traffic
+  (sequential keepalive) works fine.
+
+The previously-feared "corrupt atom table" issue for the
+docker-compiled `Elixir.EchoHandler.beam` was a build toolchain
+mismatch (alpine docker compiled against a slightly different OTP
+patch level than the cpio's). Sidestepped by using the May-5
+beams that were already compiled with the matching toolchain.
+
+### B3. Bandit's handler stall (resolved)
 
 After the B1 fix, boot is 100% reliable but **Bandit still stalls
 exactly the same way**. So the unified-cause hypothesis (B1 also

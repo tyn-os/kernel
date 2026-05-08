@@ -1259,9 +1259,18 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
     match cmd {
         F_GETFL => 0, // report no flags
         F_SETFL => {
-            // Track O_NONBLOCK for pipe fds
+            // Track O_NONBLOCK for pipe and socket fds. Sockets matter
+            // for inet_drv's epoll-driven async-accept loop: with
+            // multiple acceptors waiting on the same listener, a
+            // *blocking* accept call lets every waiter race for the
+            // single connection (and corrupt each other's listener
+            // state); a non-blocking accept correctly returns EAGAIN
+            // to all but one, letting epoll arbitrate the next.
+            let nb = (arg & O_NONBLOCK) != 0;
             if crate::pipe::is_pipe_fd(fd) {
-                crate::pipe::set_nonblock(fd, (arg & O_NONBLOCK) != 0);
+                crate::pipe::set_nonblock(fd, nb);
+            } else if crate::net::socket::is_socket_fd(fd) {
+                crate::net::socket::set_nonblock(fd, nb);
             }
             0
         }

@@ -131,21 +131,57 @@ extern "C" fn main(_mbi: *const u8) -> ! {
             // shape (Process.flag(:trap_exit, true), then waits for
             // {:thousand_island_ready, ...} in handle_info) but DOESN'T
             // use the `use ThousandIsland.Handler` macro.
+            // §B2.16 probe: install a custom logger handler (crash_logger)
+            // BEFORE starting ThousandIsland, so any crash in any
+            // GenServer / supervisor chain prints to serial. TI's
+            // Acceptor crashes silently after curl connects — we know
+            // because the handler module is never even loaded — so this
+            // catches whatever exception is being silently swallowed.
+            // §B2.17 probe: replicate TI's listen options exactly, accept
+            // the connection ourselves, and print exactly what gen_tcp
+            // returns. This isolates whether the bug is in gen_tcp:accept
+            // or in something TI does after.
+            // §B2.18 probe: same TI options, but accept from inside a
+            // Task (proc_lib-spawned, like TI's Acceptor) instead of the
+            // main eval shell. If THIS fails but the main-shell version
+            // passed, the bug is process-context dependent.
+            // §B2.18 probe: cross-process accept. P1 (gen_server-like
+            // process via Task) creates listen socket. P1 sends socket
+            // to P2 (another Task) via message. P2 calls
+            // gen_tcp:accept(L). This matches TI's Listener→Acceptor
+            // socket ownership transfer.
+            // §B2.19 probe: spawn 100 acceptor tasks all blocked on
+            // gen_tcp:accept on the SAME listener socket. This matches
+            // TI's default num_acceptors=100. When curl connects, only
+            // one should wake — but if our kernel mishandles concurrent
+            // accept-waiters, we'll see the failure mode here.
+            // §B2.20 probe: bisect concurrent-accept-waiter count.
+            // 1 worked. 100 didn't. Try 2.
             // Manual gen_tcp HTTP demo. Bandit/ThousandIsland themselves
-            // stall on Tyn — see MESSAGE_DELIVERY.md §B2.12-§B2.15.
-            // §B2.15 narrowed the bug to `ThousandIsland.Connection.start`
-            // itself crashing before dispatching the handler module: a
-            // pure-Erlang `my_handler` with just gen_server callbacks
-            // never has its init/1 reached and its .beam is never loaded
-            // by VFS, even though we proved DynamicSupervisor.start_child
-            // works in isolation. Logger isn't catching the crash report
-            // (probably because Logger's pipeline is partially broken),
-            // so the next probe is recompiling Connection.start with
-            // IO.puts markers, or wrapping it in try/rescue.
+            // stall on Tyn — see MESSAGE_DELIVERY.md §B2.16-§B2.20.
+            // The bug isolated to concurrent gen_tcp:accept waiters: TI
+            // spawns 100 acceptors by default and our kernel doesn't
+            // deliver an incoming connection to any of them. With 1
+            // waiter the kernel's accept-completion path works; with N
+            // it doesn't. Likely fix is in src/net/socket.rs around
+            // how inet_async accept replies are routed.
             // Every primitive (listen / accept / setopts({active,once}) /
             // controlling_process / active-mode {tcp,S,Data} delivery /
             // send / close) works in this raw flow. Curl returns "Hi".
-            b"-eval\0", b"erlang:display(starting), {ok,L}=gen_tcp:listen(8080,[binary,{reuseaddr,true}]), erlang:display(listening), {ok,S}=gen_tcp:accept(L), erlang:display(accepted), Self=self(), Pid=spawn(fun() -> erlang:display(h_start), receive {sock,Sk} -> erlang:display(h_got_sock), R1=inet:setopts(Sk,[{active,once}]), erlang:display({h_setopts,R1}), receive {tcp,Sk,D} -> erlang:display({h_got_tcp,byte_size(D)}), R2=gen_tcp:send(Sk,<<\"HTTP/1.0 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nHi\">>), erlang:display({h_send,R2}), gen_tcp:close(Sk), Self ! done after 5000 -> Self ! h_timeout end end end), erlang:display(h_spawned), Rc=gen_tcp:controlling_process(S,Pid), erlang:display({ctrl,Rc}), Pid ! {sock,S}, erlang:display(parent_msg_sent), receive M -> erlang:display({parent_got,M}) after 12000 -> erlang:display(parent_timeout) end.\0",
+            // §B2.21 verify-fix: same 100-acceptor stress test that
+            // demonstrated the bug. After fixing sys_accept's race
+            // (atomic check-and-swap inside with_net) and wiring up
+            // fcntl(F_SETFL, O_NONBLOCK) for sockets, exactly one of
+            // the 100 should wake on curl.
+            // §B2.21 final verify: TI w/ ORIGINAL Connection.beam +
+            // EchoHandler. With kernel-side accept race fixed, this
+            // should now actually work end-to-end.
+            // §B2.22: Bandit + HelloPlug (Elixir). With the kernel-side
+            // sys_accept fix in place, Bandit's TI-based dispatch chain
+            // should now work end-to-end. Both Bandit and HelloPlug were
+            // compiled May 5 (before our kernel fix) but their bytecode
+            // is unchanged — only the kernel's accept semantics changed.
+            b"-eval\0", b"application:ensure_all_started(telemetry), {ok,_}='Elixir.Bandit':start_link([{plug,'Elixir.HelloPlug'},{port,8080}]), io:format(\"bandit_listening~n\"), receive _ -> ok after 60000 -> ok end.\0",
         ];
         let mut arg_ptrs = [0u64; 20];
         for (i, arg) in args.iter().enumerate() {
