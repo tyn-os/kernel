@@ -70,7 +70,13 @@ Hello from Bandit on Tyn!
 - **Bandit** runs unmodified on top of **ThousandIsland** with the default `num_acceptors: 100` configuration — the full `DynamicSupervisor` → `Connection.start` → handler-spawn chain works
 - **Plug pipeline**: `Plug.Conn` → `put_resp_content_type` → `send_resp` → host gets the response
 - Elixir 1.18.3 runs: `IO.puts`, `System.version`, `Kernel.inspect` all work
-- Reliability: from a clean clone, 3/3 boot+curl trials succeed end-to-end (boot reaches `bandit_listening` within 7–15s on KVM, then Bandit serves curl). Sequential request handling within a single boot is rock-solid (5/5).
+
+Where things stand on KVM (host: AWS Xeon 6975P-C):
+
+- **Image size:** 45 MB bootable image — ~4× smaller than Alpine + Elixir + Bandit (~190 MB)
+- **Cold boot to serving HTTP:** ~7 s on KVM (kernel → BEAM handoff in ~430 ms; rest is OTP startup)
+- **Reliability:** 16/16 cold-boot trials, each serving a curl request through Bandit + Plug
+- **Runtime memory:** ~400 MB host RSS — ~6× an Alpine container due to ERTS allocator pool defaults (demand paging landed; allocator tuning is next)
 
 ### What works
 

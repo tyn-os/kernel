@@ -305,10 +305,40 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Next available mmap address (bump allocator for anonymous mappings).
 /// Must stay within the 4 GiB identity-mapped region and 2560M RAM.
 /// Start above: ELF copy (288 MiB), CPIO copy (314 MiB + ~30 MiB = 344 MiB).
-static MMAP_NEXT: AtomicU64 = AtomicU64::new(0x1600_0000); // Start at 352 MiB
+const MMAP_BASE: u64 = 0x1600_0000; // 352 MiB
+static MMAP_NEXT: AtomicU64 = AtomicU64::new(MMAP_BASE);
 
-/// brk heap top.
+/// brk heap top (current break — set by `brk(addr)`).
 static BRK_TOP: AtomicU64 = AtomicU64::new(0);
+/// First non-zero brk value ERTS set — used as the base for "brk used"
+/// computation. Linux ABI: `brk(0)` returns the initial break, which is
+/// typically end-of-data + heap; we store whatever ERTS first asks for.
+static BRK_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Print a one-line memory snapshot to the serial log. Useful for
+/// post-mortem benchmarking — call from anywhere in the kernel after
+/// userspace is up to read out actual ERTS allocator usage.
+pub fn mem_stats_snapshot() {
+    let mmap_top = MMAP_NEXT.load(Ordering::Relaxed);
+    let mmap_used = mmap_top.saturating_sub(MMAP_BASE);
+    let brk = BRK_TOP.load(Ordering::Relaxed);
+    let brk_base = BRK_BASE.load(Ordering::Relaxed);
+    let brk_used = if brk == 0 || brk_base == 0 { 0 }
+                   else { brk.saturating_sub(brk_base) };
+    // Static carve-outs (rough): ELF copy ~8 MB, CPIO copy ~30 MB,
+    // user stack region 2 MB, kernel heap 2 MB, page tables ~few MB.
+    const STATIC_MB: u64 = 8 + 30 + 2 + 2 + 4;
+    let total_mb = STATIC_MB + mmap_used / (1024 * 1024) + brk_used / (1024 * 1024);
+    serial_println!(
+        "[memstat] mmap={} MB brk={} MB static~{} MB total~{} MB (mmap_top={:#x} brk_top={:#x})",
+        mmap_used / (1024 * 1024),
+        brk_used / (1024 * 1024),
+        STATIC_MB,
+        total_mb,
+        mmap_top,
+        brk
+    );
+}
 
 // ---------- Dispatcher ----------
 
@@ -708,6 +738,8 @@ fn sys_brk(addr: u64) -> i64 {
     if addr == 0 {
         BRK_TOP.load(Ordering::Relaxed) as i64
     } else {
+        // Record the first non-zero brk as the base for memory accounting.
+        let _ = BRK_BASE.compare_exchange(0, addr, Ordering::Relaxed, Ordering::Relaxed);
         BRK_TOP.store(addr, Ordering::Relaxed);
         addr as i64
     }
@@ -729,13 +761,16 @@ fn sys_mmap(addr: u64, length: u64, _prot: i32, flags: i32) -> i64 {
     } else {
         // Allocate from bump allocator (ignore non-FIXED hint addresses).
         let result = MMAP_NEXT.fetch_add(aligned, Ordering::Relaxed);
-        // POSIX requires anonymous mmap to return zeroed memory. ERTS's
-        // allocators rely on this for fresh heap blocks (NULL pointers,
-        // empty lists, zero counts). Always zero, even for the 1 GiB main
-        // carrier — without it, stale bytes from prior frame use surface
-        // as #PFs through corrupt pointers and beam_load failures.
-        // SAFETY: result is identity-mapped within RAM.
-        unsafe { core::ptr::write_bytes(result as *mut u8, 0, aligned as usize) };
+        // POSIX requires anonymous mmap to return zeroed memory. We rely
+        // on the *host* providing this: QEMU's guest RAM is backed by a
+        // host MAP_ANONYMOUS|MAP_PRIVATE region, which gives zero pages
+        // on first touch (host-side demand paging). Eagerly zeroing here
+        // would force every page to fault in immediately and would push
+        // QEMU's RSS up to the full ERTS allocator commit (~1.4 GB).
+        //
+        // The MMAP_NEXT region (>= 352 MiB) is above all kernel boot
+        // data, so no stale bytes from prior writes can surface — the
+        // host mmap zero-on-first-touch is the entire backing.
         result as i64
     }
 }
