@@ -304,8 +304,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Next available mmap address (bump allocator for anonymous mappings).
 /// Must stay within the 4 GiB identity-mapped region and 2560M RAM.
-/// Start above: ELF copy (288 MiB), CPIO copy (314 MiB + ~30 MiB = 344 MiB).
-const MMAP_BASE: u64 = 0x1600_0000; // 352 MiB
+/// Start above: ELF copy (320 MiB), CPIO copy (330 MiB + up to ~80 MiB = 410 MiB).
+const MMAP_BASE: u64 = 0x1A00_0000; // 416 MiB
 static MMAP_NEXT: AtomicU64 = AtomicU64::new(MMAP_BASE);
 
 /// brk heap top (current break — set by `brk(addr)`).

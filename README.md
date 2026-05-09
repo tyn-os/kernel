@@ -44,38 +44,48 @@ Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP shi
 
 ## Status
 
-**OTP 27 BEAM running on bare metal with SMP, TCP, **Bandit + Plug**, and Elixir.**
+**OTP 27 BEAM running on bare metal with SMP, TCP, **Phoenix + Bandit + Plug**, and Elixir.**
 
 ```elixir
-defmodule HelloPlug do
-  import Plug.Conn
-  def init(opts), do: opts
-  def call(conn, _opts) do
+defmodule TynHelloWeb.HelloController do
+  use TynHelloWeb, :controller
+
+  def index(conn, _params) do
     conn
     |> put_resp_content_type("text/plain")
-    |> send_resp(200, "Hello from Bandit on Tyn!\n")
+    |> send_resp(200, "Hello from Phoenix on Tyn!\n")
   end
 end
 
-{:ok, _} = Bandit.start_link(plug: HelloPlug, port: 8080)
+defmodule TynHelloWeb.Router do
+  use TynHelloWeb, :router
+  pipeline :api, do: plug :accepts, ["json", "html"]
+  scope "/", TynHelloWeb do
+    pipe_through :api
+    get "/", HelloController, :index
+  end
+end
+
+{:ok, _} = Bandit.start_link(plug: TynHelloWeb.Router, port: 8080)
 ```
 
 ```
 $ curl http://localhost:5566/
-Hello from Bandit on Tyn!
+Hello from Phoenix on Tyn!
 ```
 
-- OTP 27 ERTS boots with up to 8 CPUs, loads 150+ .beam files from in-memory VFS
+- OTP 27 ERTS boots with up to 8 CPUs, loads 200+ .beam files from in-memory VFS
 - Full OTP kernel application starts — supervision trees, code_server, logger
+- **Phoenix 1.8** routes through `use TynHelloWeb, :router` (Bandit fronts the Phoenix Router directly; the full `Phoenix.Endpoint` middleware stack would also work given `secret_key_base` etc., but the Router is the minimum demo)
 - **Bandit** runs unmodified on top of **ThousandIsland** with the default `num_acceptors: 100` configuration — the full `DynamicSupervisor` → `Connection.start` → handler-spawn chain works
 - **Plug pipeline**: `Plug.Conn` → `put_resp_content_type` → `send_resp` → host gets the response
 - Elixir 1.18.3 runs: `IO.puts`, `System.version`, `Kernel.inspect` all work
 
 Where things stand on KVM (host: AWS Xeon 6975P-C):
 
-- **Image size:** 45 MB bootable image — ~4× smaller than Alpine + Elixir + Bandit (~190 MB)
+- **Image size:** 49 MB bootable image — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
 - **Cold boot to serving HTTP:** ~7 s on KVM (kernel → BEAM handoff in ~430 ms; rest is OTP startup)
-- **Reliability:** 16/16 cold-boot trials, each serving a curl request through Bandit + Plug
+- **Reliability:** 14/16 cold-boot trials, each routing a curl request through Phoenix.Router + Bandit + Plug
 - **Runtime memory:** ~400 MB host RSS — ~6× an Alpine container due to ERTS allocator pool defaults (demand paging landed; allocator tuning is next)
 
 ### What works

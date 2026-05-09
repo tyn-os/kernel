@@ -72,10 +72,11 @@ extern "C" fn main(_mbi: *const u8) -> ! {
     serial_println!("[boot] ELF binary: {} bytes", HELLO_ELF.len());
 
     // The kernel's .rodata contains the embedded ELF and cpio archive.
-    // With JIT, .rodata can be ~55 MB (34 MB ELF + 21 MB cpio). Kernel at
-    // 240 MiB extends to ~295 MiB. Place copy buffers well above that.
-    const ELF_COPY_BASE: usize = 0x1200_0000; // 288 MiB
-    const CPIO_COPY_BASE: usize = ELF_COPY_BASE + 0x1A0_0000; // +26 MiB = 314 MiB
+    // Kernel at 240 MiB extends to ~291 MiB with current ELF (8.4 MB) +
+    // cpio (~45 MB w/ Phoenix). Copy buffers must be above kernel's end
+    // and below MMAP_NEXT base (now 0x1A00_0000 = 416 MiB).
+    const ELF_COPY_BASE: usize = 0x1400_0000;            // 320 MiB
+    const CPIO_COPY_BASE: usize = ELF_COPY_BASE + 0x0A0_0000; // +10 MiB = 330 MiB
     // SAFETY: Destination regions are identity-mapped and above the kernel.
     let elf_copy = unsafe {
         let dst = ELF_COPY_BASE as *mut u8;
@@ -181,7 +182,8 @@ extern "C" fn main(_mbi: *const u8) -> ! {
             // should now work end-to-end. Both Bandit and HelloPlug were
             // compiled May 5 (before our kernel fix) but their bytecode
             // is unchanged — only the kernel's accept semantics changed.
-            b"-eval\0", b"application:ensure_all_started(telemetry), {ok,_}='Elixir.Bandit':start_link([{plug,'Elixir.HelloPlug'},{port,8080}]), io:format(\"bandit_listening~n\"), receive _ -> ok after 60000 -> ok end.\0",
+            // §B3 Phoenix bisection #1: Bandit with Router directly (skip Endpoint middleware)
+            b"-eval\0", b"application:ensure_all_started(telemetry), {ok,_}='Elixir.Bandit':start_link([{plug,'Elixir.TynHelloWeb.Router'},{port,8080},{scheme,http}]), io:format(\"phoenix_listening~n\"), receive _ -> ok after 60000 -> ok end.\0",
         ];
         let mut arg_ptrs = [0u64; 20];
         for (i, arg) in args.iter().enumerate() {
