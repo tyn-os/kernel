@@ -85,7 +85,7 @@ Where things stand on KVM (host: AWS Xeon 6975P-C):
 
 - **Image size:** 49 MB bootable image — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
 - **Cold boot to serving HTTP:** ~7 s on KVM (kernel → BEAM handoff in ~430 ms; rest is OTP startup)
-- **Reliability:** 14/16 cold-boot trials, each routing a curl request through Phoenix.Router + Bandit + Plug
+- **Reliability:** 30/32 cold-boot trials, each routing a curl request through Phoenix.Router + Bandit + Plug. The two failures are a long-known ERTS thread-progress registration race (`managed=4/5`) where one of the 5 startup threads doesn't register and schedulers wait forever — kernel-side futex/scheduler bug, not Phoenix-specific. Phoenix is no less reliable than Bandit-only; the original 14/16 number was a measurement artifact (the readiness marker `phoenix_listening\n` gets interleaved with kernel debug output and a strict `grep -q` missed it on otherwise-successful boots)
 - **Runtime memory:** ~400 MB host RSS — ~6× an Alpine container due to ERTS allocator pool defaults (demand paging landed; allocator tuning is next)
 
 ### What works
