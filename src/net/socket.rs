@@ -8,6 +8,7 @@
 //! Socket fds start at 500 to avoid collisions.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicI32, Ordering};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
@@ -41,39 +42,34 @@ struct Socket {
     local_addr: Ipv4Address,
 }
 
-/// Global socket table
-static mut SOCKETS: Vec<Socket> = Vec::new();
-static SOCKET_LOCK: spin::Mutex<()> = spin::Mutex::new(());
-static mut NEXT_SOCK_FD: i32 = SOCK_FD_BASE;
+/// Global socket table. Guarded by its own spinlock; lock order is
+/// SOCKETS → NET_LOCK whenever a syscall touches both.
+static SOCKETS: spin::Mutex<Vec<Socket>> = spin::Mutex::new(Vec::new());
+static NEXT_SOCK_FD: AtomicI32 = AtomicI32::new(SOCK_FD_BASE);
 
-/// Check if an fd is a socket fd
+/// Check if an fd is a socket fd.
 pub fn is_socket_fd(fd: i32) -> bool {
-    // SAFETY: read-only check, fd field is word-sized (x86 TSO safe)
-    unsafe { SOCKETS.iter().any(|s| s.fd == fd) }
+    SOCKETS.lock().iter().any(|s| s.fd == fd)
 }
 
 /// Set the non-blocking flag on a socket fd. Called from `fcntl(F_SETFL)`.
 /// Without this, ERTS's `inet_drv` keeps issuing `accept` calls that would
 /// block under contention, instead of getting EAGAIN and retrying via epoll.
 pub fn set_nonblock(fd: i32, nonblock: bool) {
-    unsafe {
-        if let Some(s) = SOCKETS.iter_mut().find(|s| s.fd == fd) {
-            s.nonblock = nonblock;
-        }
+    if let Some(s) = SOCKETS.lock().iter_mut().find(|s| s.fd == fd) {
+        s.nonblock = nonblock;
     }
 }
 
-fn find_socket(fd: i32) -> Option<&'static mut Socket> {
-    // SAFETY: caller must hold SOCKET_LOCK or be in single-threaded context
-    unsafe { SOCKETS.iter_mut().find(|s| s.fd == fd) }
+/// Run `f` on the `Socket` matching `fd` while holding the SOCKETS lock.
+/// Returns `None` if no such fd exists. Closures may safely call into
+/// `crate::net::with_net` (lock order is SOCKETS → NET_LOCK).
+fn with_socket<R>(fd: i32, f: impl FnOnce(&mut Socket) -> R) -> Option<R> {
+    SOCKETS.lock().iter_mut().find(|s| s.fd == fd).map(f)
 }
 
 fn alloc_fd() -> i32 {
-    unsafe {
-        let fd = NEXT_SOCK_FD;
-        NEXT_SOCK_FD += 1;
-        fd
-    }
+    NEXT_SOCK_FD.fetch_add(1, Ordering::Relaxed)
 }
 
 // ---- syscall implementations ----
@@ -125,28 +121,21 @@ pub fn sys_socket(domain: i32, sock_type: i32, _protocol: i32) -> i64 {
 
     let fd = alloc_fd();
 
-    unsafe {
-        SOCKETS.push(Socket {
-            fd,
-            sock_type: st,
-            handle,
-            nonblock,
-            backlog: Vec::new(),
-            local_port: 0,
-            local_addr: Ipv4Address::UNSPECIFIED,
-        });
-    }
+    SOCKETS.lock().push(Socket {
+        fd,
+        sock_type: st,
+        handle,
+        nonblock,
+        backlog: Vec::new(),
+        local_port: 0,
+        local_addr: Ipv4Address::UNSPECIFIED,
+    });
 
     fd as i64
 }
 
 /// bind(fd, addr, addrlen) → 0 or error
 pub fn sys_bind(fd: i32, addr_ptr: *const u8, _addrlen: u32) -> i64 {
-    let sock = match find_socket(fd) {
-        Some(s) => s,
-        None => return -9, // -EBADF
-    };
-
     // Parse struct sockaddr_in { sa_family(2), sin_port(2), sin_addr(4), zero(8) }
     let (port, addr) = unsafe {
         let family = *(addr_ptr as *const u16);
@@ -157,56 +146,53 @@ pub fn sys_bind(fd: i32, addr_ptr: *const u8, _addrlen: u32) -> i64 {
         (port, addr)
     };
 
-    sock.local_port = port;
-    sock.local_addr = addr;
+    with_socket(fd, |sock| {
+        sock.local_port = port;
+        sock.local_addr = addr;
 
-    match sock.sock_type {
-        SockType::UdpDgram => {
-            crate::net::with_net(|net| {
-                let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
-                let endpoint = if addr == Ipv4Address::UNSPECIFIED {
-                    IpListenEndpoint { addr: None, port }
-                } else {
-                    IpListenEndpoint { addr: Some(IpAddress::Ipv4(addr)), port }
-                };
-                match udp.bind(endpoint) {
-                    Ok(()) => {},
-                    Err(_) => return -98i64, // -EADDRINUSE
-                }
+        match sock.sock_type {
+            SockType::UdpDgram => {
+                crate::net::with_net(|net| {
+                    let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
+                    let endpoint = if addr == Ipv4Address::UNSPECIFIED {
+                        IpListenEndpoint { addr: None, port }
+                    } else {
+                        IpListenEndpoint { addr: Some(IpAddress::Ipv4(addr)), port }
+                    };
+                    match udp.bind(endpoint) {
+                        Ok(()) => 0,
+                        Err(_) => -98i64, // -EADDRINUSE
+                    }
+                })
+            }
+            SockType::TcpStream | SockType::TcpListener => {
+                // TCP bind is deferred to listen/connect
                 0
-            })
+            }
         }
-        SockType::TcpStream | SockType::TcpListener => {
-            // TCP bind is deferred to listen/connect
-            0
-        }
-    }
+    }).unwrap_or(-9)
 }
 
 /// listen(fd, backlog) → 0 or error
 pub fn sys_listen(fd: i32, _backlog: i32) -> i64 {
-    let sock = match find_socket(fd) {
-        Some(s) => s,
-        None => return -9,
-    };
-
-    sock.sock_type = SockType::TcpListener;
-
-    crate::net::with_net(|net| {
-        let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-        let endpoint = if sock.local_addr == Ipv4Address::UNSPECIFIED {
-            IpListenEndpoint { addr: None, port: sock.local_port }
-        } else {
-            IpListenEndpoint {
-                addr: Some(IpAddress::Ipv4(sock.local_addr)),
-                port: sock.local_port,
+    with_socket(fd, |sock| {
+        sock.sock_type = SockType::TcpListener;
+        crate::net::with_net(|net| {
+            let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+            let endpoint = if sock.local_addr == Ipv4Address::UNSPECIFIED {
+                IpListenEndpoint { addr: None, port: sock.local_port }
+            } else {
+                IpListenEndpoint {
+                    addr: Some(IpAddress::Ipv4(sock.local_addr)),
+                    port: sock.local_port,
+                }
+            };
+            match tcp.listen(endpoint) {
+                Ok(()) => 0,
+                Err(_) => -98, // -EADDRINUSE
             }
-        };
-        match tcp.listen(endpoint) {
-            Ok(()) => 0,
-            Err(_) => -98, // -EADDRINUSE
-        }
-    })
+        })
+    }).unwrap_or(-9)
 }
 
 /// accept4(fd, addr, addrlen, flags) → new_fd or error
@@ -219,59 +205,66 @@ pub fn sys_listen(fd: i32, _backlog: i32) -> i64 {
 /// races see the freshly-installed listener (`Listen` state) and either
 /// yield (blocking) or return EAGAIN (non-blocking).
 pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32) -> i64 {
-    let sock = match find_socket(fd) {
-        Some(s) => s,
-        None => return -9,
+    // Snapshot listener metadata under the SOCKETS lock; the values needed
+    // for the listen-endpoint reinstall don't change for the lifetime of
+    // the listener fd.
+    let snapshot = with_socket(fd, |sock| {
+        if sock.sock_type != SockType::TcpListener {
+            return Err(-95i64); // -EOPNOTSUPP
+        }
+        Ok((
+            sock.nonblock || (flags & 0x800) != 0,
+            sock.local_port,
+            sock.local_addr,
+        ))
+    });
+    let (nonblock_call, listen_port, listen_addr) = match snapshot {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => return e,
+        None => return -9, // -EBADF
     };
 
-    if sock.sock_type != SockType::TcpListener {
-        return -95; // -EOPNOTSUPP
-    }
-
-    let nonblock_call = sock.nonblock || (flags & 0x800) != 0;
-    let listen_port = sock.local_port;
-    let listen_addr = sock.local_addr;
-
-    // Atomic check-and-extract loop. Each iteration runs under `with_net`,
-    // so only one CPU at a time can succeed in stealing the established
-    // connection. Returns Some((accepted_handle, remote)) on success,
-    // None if no connection is pending yet.
+    // Atomic check-and-extract loop. Each iteration re-acquires SOCKETS
+    // (so it sees the freshly-installed handle from any prior winning
+    // accept) and runs the smoltcp side under `with_net`. Only the CPU
+    // that observes Established/CloseWait wins the connection; losers
+    // drop both locks and either yield or return EAGAIN, so the spin
+    // loop never sleeps while holding a lock.
     let (accepted_handle, remote) = loop {
         crate::net::poll();
 
-        let result = crate::net::with_net(|net| {
-            let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-            let state = tcp.state();
-            if state != tcp::State::Established && state != tcp::State::CloseWait {
-                return None;
-            }
-            // Connection is here. Capture remote, then install a fresh
-            // listener on the same endpoint and swap `sock.handle`.
-            let remote = tcp.remote_endpoint();
-            let accepted = sock.handle;
-
-            let rx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
-            let tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
-            let new_tcp = tcp::Socket::new(rx_buf, tx_buf);
-            let new_h = net.sockets.add(new_tcp);
-            let new_listener = net.sockets.get_mut::<tcp::Socket>(new_h);
-            let endpoint = if listen_addr == Ipv4Address::UNSPECIFIED {
-                IpListenEndpoint { addr: None, port: listen_port }
-            } else {
-                IpListenEndpoint {
-                    addr: Some(IpAddress::Ipv4(listen_addr)),
-                    port: listen_port,
+        let result = with_socket(fd, |sock| {
+            crate::net::with_net(|net| {
+                let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                let state = tcp.state();
+                if state != tcp::State::Established && state != tcp::State::CloseWait {
+                    return None;
                 }
-            };
-            new_listener.listen(endpoint).ok();
-            sock.handle = new_h;
-            Some((accepted, remote))
-        });
+                let remote = tcp.remote_endpoint();
+                let accepted = sock.handle;
+
+                let rx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
+                let tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
+                let new_tcp = tcp::Socket::new(rx_buf, tx_buf);
+                let new_h = net.sockets.add(new_tcp);
+                let new_listener = net.sockets.get_mut::<tcp::Socket>(new_h);
+                let endpoint = if listen_addr == Ipv4Address::UNSPECIFIED {
+                    IpListenEndpoint { addr: None, port: listen_port }
+                } else {
+                    IpListenEndpoint {
+                        addr: Some(IpAddress::Ipv4(listen_addr)),
+                        port: listen_port,
+                    }
+                };
+                new_listener.listen(endpoint).ok();
+                sock.handle = new_h;
+                Some((accepted, remote))
+            })
+        }).flatten();
 
         if let Some(captured) = result {
             break captured;
         }
-
         if nonblock_call {
             return -11; // -EAGAIN
         }
@@ -280,21 +273,18 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
 
     crate::serial_println!("[accept] connection established!");
 
-    // Create a new fd for the accepted connection
     let new_fd = alloc_fd();
     let nonblock = (flags & 0x800) != 0;
 
-    unsafe {
-        SOCKETS.push(Socket {
-            fd: new_fd,
-            sock_type: SockType::TcpStream,
-            handle: accepted_handle,
-            nonblock,
-            backlog: Vec::new(),
-            local_port: listen_port,
-            local_addr: listen_addr,
-        });
-    }
+    SOCKETS.lock().push(Socket {
+        fd: new_fd,
+        sock_type: SockType::TcpStream,
+        handle: accepted_handle,
+        nonblock,
+        backlog: Vec::new(),
+        local_port: listen_port,
+        local_addr: listen_addr,
+    });
 
     // Fill in peer address if requested
     if !addr_ptr.is_null() {
@@ -323,8 +313,8 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
 
 /// getsockname(fd, addr, addrlen) → 0 or error
 pub fn sys_getsockname(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32) -> i64 {
-    let sock = match find_socket(fd) {
-        Some(s) => s,
+    let local = match with_socket(fd, |sock| (sock.local_port, sock.local_addr)) {
+        Some(v) => v,
         None => return -9,
     };
 
@@ -332,9 +322,9 @@ pub fn sys_getsockname(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32) -> i64
         unsafe {
             core::ptr::write_bytes(addr_ptr, 0, 16);
             *(addr_ptr as *mut u16) = 2; // AF_INET
-            *(addr_ptr.add(2) as *mut u16) = sock.local_port.to_be();
+            *(addr_ptr.add(2) as *mut u16) = local.0.to_be();
             core::ptr::copy_nonoverlapping(
-                sock.local_addr.octets().as_ptr(),
+                local.1.octets().as_ptr(),
                 addr_ptr.add(4),
                 4,
             );
@@ -348,15 +338,15 @@ pub fn sys_getsockname(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32) -> i64
 
 /// getpeername(fd, addr, addrlen) → 0 or error
 pub fn sys_getpeername(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32) -> i64 {
-    let sock = match find_socket(fd) {
-        Some(s) => s,
+    let remote = match with_socket(fd, |sock| {
+        crate::net::with_net(|net| {
+            let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+            tcp.remote_endpoint()
+        })
+    }) {
+        Some(v) => v,
         None => return -9,
     };
-
-    let remote = crate::net::with_net(|net| {
-        let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-        tcp.remote_endpoint()
-    });
 
     match remote {
         Some(ep) => {
@@ -439,77 +429,75 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
 /// send/sendto/write on a socket fd
 pub fn sys_sendto(fd: i32, buf: *const u8, len: usize, _flags: i32,
                   _dest_addr: *const u8, _addrlen: u32) -> i64 {
-    let sock = match find_socket(fd) {
-        Some(s) => s,
-        None => return -9,
-    };
-
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
 
-    match sock.sock_type {
-        SockType::TcpStream => {
-            crate::net::with_net(|net| {
-                let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-                if !tcp.can_send() {
-                    return -11i64; // -EAGAIN
-                }
-                match tcp.send_slice(data) {
-                    Ok(sent) => sent as i64,
-                    Err(_) => -104, // -ECONNRESET
-                }
-            })
+    with_socket(fd, |sock| {
+        match sock.sock_type {
+            SockType::TcpStream => {
+                crate::net::with_net(|net| {
+                    let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                    if !tcp.can_send() {
+                        return -11i64; // -EAGAIN
+                    }
+                    match tcp.send_slice(data) {
+                        Ok(sent) => sent as i64,
+                        Err(_) => -104, // -ECONNRESET
+                    }
+                })
+            }
+            SockType::UdpDgram => -95, // -EOPNOTSUPP
+            _ => -9,
         }
-        SockType::UdpDgram => {
-            // For sendto with destination address
-            // TODO: parse dest_addr
-            -95 // -EOPNOTSUPP for now
-        }
-        _ => -9,
-    }
+    }).unwrap_or(-9)
 }
 
 /// recv/recvfrom/read on a socket fd
 pub fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, _flags: i32,
                     _src_addr: *mut u8, _addrlen: *mut u32) -> i64 {
-    let sock = match find_socket(fd) {
-        Some(s) => s,
+    // Poll network first to process any pending incoming packets. Done
+    // outside the SOCKETS lock so concurrent senders/recvers on other
+    // fds aren't blocked.
+    crate::net::poll();
+
+    let result = with_socket(fd, |sock| {
+        match sock.sock_type {
+            SockType::TcpStream => {
+                crate::net::with_net(|net| {
+                    let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                    if !tcp.can_recv() {
+                        if !tcp.is_active() {
+                            return 0i64; // EOF — connection closed
+                        }
+                        return -11; // -EAGAIN
+                    }
+                    let dest = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+                    match tcp.recv_slice(dest) {
+                        Ok(n) => n as i64,
+                        Err(_) => -104, // -ECONNRESET
+                    }
+                })
+            }
+            _ => -9,
+        }
+    });
+
+    let result = match result {
+        Some(r) => r,
         None => {
             static MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-            if MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 5 {
+            if MISS.fetch_add(1, Ordering::Relaxed) < 5 {
                 crate::serial_println!("[recv-miss] fd={} (socket not found)", fd);
             }
             return -9;
         }
     };
 
-    match sock.sock_type {
-        SockType::TcpStream => {
-            // Poll network first to process any pending incoming packets
-            crate::net::poll();
-            let result = crate::net::with_net(|net| {
-                let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-                if !tcp.can_recv() {
-                    if !tcp.is_active() {
-                        return 0i64; // EOF — connection closed
-                    }
-                    return -11; // -EAGAIN
-                }
-                let dest = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-                match tcp.recv_slice(dest) {
-                    Ok(n) => n as i64,
-                    Err(_) => -104, // -ECONNRESET
-                }
-            });
-            // Log first few recv calls per socket fd to trace gen_tcp:recv
-            static REC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-            let n = REC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 50 {
-                crate::serial_println!("[recv] fd={} len={} -> {}", fd, len, result);
-            }
-            result
-        }
-        _ => -9,
+    static REC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let n = REC.fetch_add(1, Ordering::Relaxed);
+    if n < 50 {
+        crate::serial_println!("[recv] fd={} len={} -> {}", fd, len, result);
     }
+    result
 }
 
 /// Check socket readiness for ppoll/select.
@@ -518,77 +506,71 @@ pub fn poll_socket(fd: i32) -> u16 {
     const POLLIN: u16 = 0x0001;
     const POLLOUT: u16 = 0x0004;
     const POLLHUP: u16 = 0x0010;
-    const POLLERR: u16 = 0x0008;
+    const _POLLERR: u16 = 0x0008;
 
-    let sock = match find_socket(fd) {
-        Some(s) => s,
-        None => return 0,
-    };
-
-    crate::net::with_net(|net| {
-        match sock.sock_type {
-            SockType::TcpStream => {
-                let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-                let mut events = 0u16;
-                if tcp.can_recv() { events |= POLLIN; }
-                if tcp.can_send() { events |= POLLOUT; }
-                if !tcp.is_active() && !tcp.is_listening() {
-                    events |= POLLHUP;
+    with_socket(fd, |sock| {
+        crate::net::with_net(|net| {
+            match sock.sock_type {
+                SockType::TcpStream => {
+                    let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                    let mut events = 0u16;
+                    if tcp.can_recv() { events |= POLLIN; }
+                    if tcp.can_send() { events |= POLLOUT; }
+                    if !tcp.is_active() && !tcp.is_listening() {
+                        events |= POLLHUP;
+                    }
+                    events
                 }
-                events
+                SockType::TcpListener => {
+                    let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                    let mut events = 0u16;
+                    // Listener is "readable" when a connection is established
+                    if tcp.is_active() { events |= POLLIN; }
+                    events
+                }
+                SockType::UdpDgram => {
+                    let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
+                    let mut events = 0u16;
+                    if udp.can_recv() { events |= POLLIN; }
+                    if udp.can_send() { events |= POLLOUT; }
+                    events
+                }
             }
-            SockType::TcpListener => {
-                let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-                let mut events = 0u16;
-                // Listener is "readable" when a connection is established
-                if tcp.is_active() { events |= POLLIN; }
-                events
-            }
-            SockType::UdpDgram => {
-                let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
-                let mut events = 0u16;
-                if udp.can_recv() { events |= POLLIN; }
-                if udp.can_send() { events |= POLLOUT; }
-                events
-            }
-        }
-    })
+        })
+    }).unwrap_or(0)
 }
 
 /// Check if any socket has a pending event (connection ready, data available).
+///
+/// Snapshots the fd list under SOCKETS, then drops the lock before
+/// poll_socket re-acquires it per fd — avoids spin::Mutex recursion.
 pub fn any_socket_ready() -> bool {
-    // SAFETY: read-only iteration, word-sized fields (x86 TSO safe)
-    unsafe {
-        for sock in SOCKETS.iter() {
-            if sock.fd < 0 { continue; }
-            if poll_socket(sock.fd) & 0x0001 != 0 { // POLLIN
-                return true;
-            }
-        }
-    }
-    false
+    const POLLIN: u16 = 0x0001;
+    let fds: Vec<i32> = SOCKETS.lock().iter().filter(|s| s.fd >= 0).map(|s| s.fd).collect();
+    fds.into_iter().any(|fd| poll_socket(fd) & POLLIN != 0)
 }
 
-/// Close a socket fd
+/// Close a socket fd.
+///
+/// Removes the socket from the table under the SOCKETS lock, then
+/// hands it to smoltcp under NET_LOCK. Holding both locks while
+/// calling tcp.close() avoids leaving a half-removed entry visible
+/// to other CPUs.
 pub fn close(fd: i32) {
-    unsafe {
-        if let Some(idx) = SOCKETS.iter().position(|s| s.fd == fd) {
-            let sock = &SOCKETS[idx];
-            crate::net::with_net(|net| {
-                match sock.sock_type {
-                    SockType::TcpStream | SockType::TcpListener => {
-                        let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-                        tcp.close();
-                    }
-                    SockType::UdpDgram => {
-                        let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
-                        udp.close();
-                    }
-                }
-                // Remove from smoltcp after close
-                net.sockets.remove(sock.handle);
-            });
-            SOCKETS.remove(idx);
+    let mut sockets = SOCKETS.lock();
+    let Some(idx) = sockets.iter().position(|s| s.fd == fd) else { return };
+    let sock = sockets.remove(idx);
+    crate::net::with_net(|net| {
+        match sock.sock_type {
+            SockType::TcpStream | SockType::TcpListener => {
+                let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                tcp.close();
+            }
+            SockType::UdpDgram => {
+                let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
+                udp.close();
+            }
         }
-    }
+        net.sockets.remove(sock.handle);
+    });
 }
