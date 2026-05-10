@@ -76,7 +76,15 @@ extern "C" fn main(_mbi: *const u8) -> ! {
     // cpio (~45 MB w/ Phoenix). Copy buffers must be above kernel's end
     // and below MMAP_NEXT base (now 0x1A00_0000 = 416 MiB).
     const ELF_COPY_BASE: usize = 0x1400_0000;            // 320 MiB
-    const CPIO_COPY_BASE: usize = ELF_COPY_BASE + 0x0A0_0000; // +10 MiB = 330 MiB
+    // CPIO must sit above the ELF source buffer. Previously +10 MiB, but
+    // the JIT-enabled beam.smp is ~10.1 MiB unstripped — it spilled into
+    // the cpio region and clobbered the tail of the RW segment (including
+    // the initialized `_dl_ns` pointer used by musl's __libc_setup_tls,
+    // crashing JIT boots with #GP at 0x99cae4 / r14 = garbage). 16 MiB
+    // gives headroom for any plausible BEAM build.
+    const CPIO_COPY_BASE: usize = ELF_COPY_BASE + 0x100_0000; // +16 MiB = 336 MiB
+    assert!(HELLO_ELF.len() <= CPIO_COPY_BASE - ELF_COPY_BASE,
+        "embedded ELF would overlap CPIO buffer — bump CPIO_COPY_BASE");
     // SAFETY: Destination regions are identity-mapped and above the kernel.
     let elf_copy = unsafe {
         let dst = ELF_COPY_BASE as *mut u8;
@@ -255,6 +263,22 @@ extern "C" fn main(_mbi: *const u8) -> ! {
         sp -= 16;
         *(sp as *mut u64) = 6;
         *((sp + 8) as *mut u64) = 4096;
+
+        // AT_BASE (7) — load bias of the interpreter (0 for static).
+        sp -= 16;
+        *(sp as *mut u64) = 7;
+        *((sp + 8) as *mut u64) = 0;
+
+        // AT_HWCAP (16) — hardware capability bitmask. musl on x86_64
+        // detects features via CPUID directly so 0 is acceptable.
+        sp -= 16;
+        *(sp as *mut u64) = 16;
+        *((sp + 8) as *mut u64) = 0;
+
+        // AT_CLKTCK (17) — clock ticks per second.
+        sp -= 16;
+        *(sp as *mut u64) = 17;
+        *((sp + 8) as *mut u64) = 100;
 
         // envp NULL terminator
         sp -= 8;
