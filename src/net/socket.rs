@@ -21,6 +21,24 @@ use crate::serial_println;
 const SOCK_FD_BASE: i32 = 500;
 const MAX_SOCKETS: usize = 32;
 
+/// Size of the smoltcp listener pool pre-bound to a port at `sys_listen`
+/// time. smoltcp's `tcp::Socket` only holds one connection at a time; with
+/// a single listener, a second SYN that arrives before the first transitions
+/// to Established receives a RST. We pre-bind a pool of listening sockets to
+/// the same `IpListenEndpoint` — smoltcp routes each incoming SYN to one
+/// available listener — and `sys_accept` adds a fresh replacement listener
+/// every time it consumes an established connection, so the pool stays full.
+///
+/// 8 is enough to absorb realistic bursts; ThousandIsland's 100-acceptor
+/// default oversubscribes the pool but only N concurrent in-flight SYNs can
+/// land before any acceptor consumes one.
+///
+/// The `backlog` argument to `listen(2)` is intentionally ignored: it sets
+/// the queue depth in real kernels, not the number of pre-bound sockets,
+/// and BEAM passes values like 1024 that would exhaust the kernel heap if
+/// taken literally as a socket count.
+const LISTENER_POOL_SIZE: usize = 8;
+
 /// Socket type
 #[derive(Clone, Copy, PartialEq)]
 enum SockType {
@@ -29,13 +47,20 @@ enum SockType {
     UdpDgram,
 }
 
-/// Per-socket state
+/// Per-socket state.
+///
+/// For `TcpListener`, the listener owns a pool of `tcp::Socket`s all
+/// bound to the same endpoint: `handle` is the primary slot, `backlog`
+/// holds the spares. `sys_accept` scans `[handle] + backlog` for an
+/// Established/CloseWait socket and replaces that slot with a fresh
+/// listener once it captures one.
 struct Socket {
     fd: i32,
     sock_type: SockType,
     handle: SocketHandle,
     nonblock: bool,
-    /// For listeners: accepted connections waiting to be returned
+    /// For listeners: spare listening handles (size = LISTENER_POOL_SIZE − 1
+    /// after sys_listen, always refilled by sys_accept). Empty for streams.
     backlog: Vec<SocketHandle>,
     /// Local address after bind
     local_port: u16,
@@ -70,6 +95,27 @@ fn with_socket<R>(fd: i32, f: impl FnOnce(&mut Socket) -> R) -> Option<R> {
 
 fn alloc_fd() -> i32 {
     NEXT_SOCK_FD.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Size of rx/tx buffers for spare listeners installed by sys_listen and
+/// sys_accept. Smaller than the 8 KiB used in sys_socket because (a) the
+/// listener mostly only holds a SYN/SYN-ACK before sys_accept moves it
+/// to a stream, and (b) we pre-allocate LISTENER_POOL_SIZE of them.
+const LISTENER_BUF_SIZE: usize = 2048;
+
+/// Create a new `tcp::Socket` bound to `endpoint` in Listen state, add it
+/// to the SocketSet, and return its handle. Called inside `with_net`;
+/// caller must already hold NET_LOCK.
+fn install_fresh_listener(
+    net: &mut crate::net::NetState,
+    endpoint: IpListenEndpoint,
+) -> SocketHandle {
+    let rx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; LISTENER_BUF_SIZE]);
+    let tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; LISTENER_BUF_SIZE]);
+    let listener = tcp::Socket::new(rx_buf, tx_buf);
+    let h = net.sockets.add(listener);
+    net.sockets.get_mut::<tcp::Socket>(h).listen(endpoint).ok();
+    h
 }
 
 // ---- syscall implementations ----
@@ -174,11 +220,16 @@ pub fn sys_bind(fd: i32, addr_ptr: *const u8, _addrlen: u32) -> i64 {
 }
 
 /// listen(fd, backlog) → 0 or error
+///
+/// Pre-binds `LISTENER_POOL_SIZE` `tcp::Socket`s to the same endpoint so
+/// concurrent SYNs each find a listener in Listen state. smoltcp routes
+/// each SYN to one of them; `sys_accept` consumes the established one and
+/// refills the slot. The user-passed `backlog` is ignored — see the
+/// LISTENER_POOL_SIZE docs.
 pub fn sys_listen(fd: i32, _backlog: i32) -> i64 {
     with_socket(fd, |sock| {
         sock.sock_type = SockType::TcpListener;
         crate::net::with_net(|net| {
-            let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
             let endpoint = if sock.local_addr == Ipv4Address::UNSPECIFIED {
                 IpListenEndpoint { addr: None, port: sock.local_port }
             } else {
@@ -187,10 +238,33 @@ pub fn sys_listen(fd: i32, _backlog: i32) -> i64 {
                     port: sock.local_port,
                 }
             };
-            match tcp.listen(endpoint) {
-                Ok(()) => 0,
-                Err(_) => -98, // -EADDRINUSE
+
+            // Primary slot: convert the existing socket (allocated by
+            // sys_socket) into a listener on this endpoint.
+            {
+                let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                if tcp.listen(endpoint).is_err() {
+                    return -98i64; // -EADDRINUSE
+                }
             }
+
+            // Spare listeners: create pool_size − 1 more, each bound to the
+            // same endpoint. smoltcp matches an incoming SYN against the
+            // first listener that's in Listen state for the destination
+            // port, so any of them can serve.
+            //
+            // Buffers are 2 KiB instead of 8 KiB (as in sys_socket) — these
+            // listeners only need to absorb a SYN/SYN-ACK plus the initial
+            // HTTP request (≤ a few hundred bytes) before sys_accept hands
+            // the socket off to user space; sys_accept also installs the
+            // replacement listener at 2 KiB. 8 listeners × 4 KiB = 32 KiB,
+            // small enough not to fragment a busy 4 MiB heap.
+            sock.backlog.clear();
+            for _ in 1..LISTENER_POOL_SIZE {
+                let h = install_fresh_listener(net, endpoint);
+                sock.backlog.push(h);
+            }
+            0
         })
     }).unwrap_or(-9)
 }
@@ -224,30 +298,16 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
         None => return -9, // -EBADF
     };
 
-    // Atomic check-and-extract loop. Each iteration re-acquires SOCKETS
-    // (so it sees the freshly-installed handle from any prior winning
-    // accept) and runs the smoltcp side under `with_net`. Only the CPU
-    // that observes Established/CloseWait wins the connection; losers
-    // drop both locks and either yield or return EAGAIN, so the spin
-    // loop never sleeps while holding a lock.
+    // Scan the listener pool ({sock.handle} ∪ sock.backlog) for any socket
+    // in Established/CloseWait. Whichever slot wins is replaced by a fresh
+    // listener so the pool stays full. Each iteration runs under SOCKETS
+    // and NET_LOCK; losers drop both locks and yield, never sleeping with
+    // a spinlock held.
     let (accepted_handle, remote) = loop {
         crate::net::poll();
 
         let result = with_socket(fd, |sock| {
             crate::net::with_net(|net| {
-                let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
-                let state = tcp.state();
-                if state != tcp::State::Established && state != tcp::State::CloseWait {
-                    return None;
-                }
-                let remote = tcp.remote_endpoint();
-                let accepted = sock.handle;
-
-                let rx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
-                let tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 8192]);
-                let new_tcp = tcp::Socket::new(rx_buf, tx_buf);
-                let new_h = net.sockets.add(new_tcp);
-                let new_listener = net.sockets.get_mut::<tcp::Socket>(new_h);
                 let endpoint = if listen_addr == Ipv4Address::UNSPECIFIED {
                     IpListenEndpoint { addr: None, port: listen_port }
                 } else {
@@ -256,9 +316,38 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
                         port: listen_port,
                     }
                 };
-                new_listener.listen(endpoint).ok();
-                sock.handle = new_h;
-                Some((accepted, remote))
+
+                // Try primary slot.
+                let primary_state = {
+                    let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                    tcp.state()
+                };
+                if primary_state == tcp::State::Established
+                    || primary_state == tcp::State::CloseWait
+                {
+                    let accepted = sock.handle;
+                    let remote = net.sockets
+                        .get_mut::<tcp::Socket>(accepted)
+                        .remote_endpoint();
+                    sock.handle = install_fresh_listener(net, endpoint);
+                    return Some((accepted, remote));
+                }
+
+                // Try each spare in backlog.
+                for i in 0..sock.backlog.len() {
+                    let h = sock.backlog[i];
+                    let state = net.sockets.get_mut::<tcp::Socket>(h).state();
+                    if state == tcp::State::Established
+                        || state == tcp::State::CloseWait
+                    {
+                        let remote = net.sockets
+                            .get_mut::<tcp::Socket>(h)
+                            .remote_endpoint();
+                        sock.backlog[i] = install_fresh_listener(net, endpoint);
+                        return Some((h, remote));
+                    }
+                }
+                None
             })
         }).flatten();
 
@@ -522,10 +611,19 @@ pub fn poll_socket(fd: i32) -> u16 {
                     events
                 }
                 SockType::TcpListener => {
-                    let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                    // Pool is readable when ANY slot has an Established
+                    // connection ready to be accepted.
                     let mut events = 0u16;
-                    // Listener is "readable" when a connection is established
-                    if tcp.is_active() { events |= POLLIN; }
+                    if net.sockets.get_mut::<tcp::Socket>(sock.handle).is_active() {
+                        events |= POLLIN;
+                    } else {
+                        for &h in sock.backlog.iter() {
+                            if net.sockets.get_mut::<tcp::Socket>(h).is_active() {
+                                events |= POLLIN;
+                                break;
+                            }
+                        }
+                    }
                     events
                 }
                 SockType::UdpDgram => {
@@ -562,15 +660,27 @@ pub fn close(fd: i32) {
     let sock = sockets.remove(idx);
     crate::net::with_net(|net| {
         match sock.sock_type {
-            SockType::TcpStream | SockType::TcpListener => {
+            SockType::TcpStream => {
                 let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
                 tcp.close();
+                net.sockets.remove(sock.handle);
+            }
+            SockType::TcpListener => {
+                // Listener pool: take down every slot.
+                let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                tcp.close();
+                net.sockets.remove(sock.handle);
+                for h in sock.backlog.iter() {
+                    net.sockets.get_mut::<tcp::Socket>(*h).close();
+                    net.sockets.remove(*h);
+                }
             }
             SockType::UdpDgram => {
                 let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
                 udp.close();
+                net.sockets.remove(sock.handle);
             }
         }
-        net.sockets.remove(sock.handle);
     });
 }
+
