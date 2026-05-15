@@ -599,7 +599,7 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
         static WAIT_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let wc = WAIT_LOG.fetch_add(1, Ordering::Relaxed);
         if wc < 50 {
-            let cur = unsafe { *(addr as *const u32) };
+            let cur = unsafe { (*(addr as *const AtomicU32)).load(Ordering::SeqCst) };
             let cpu = current_cpu() as usize;
             let tid = unsafe { CPU_QUEUES[cpu].current.unwrap_or(0) };
             crate::serial_println!("[wait] tid={} addr={:#x} expect={:#x} cur={:#x}",
@@ -620,7 +620,13 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
         return 0;
     }
 
-    let current = unsafe { *(addr as *const u32) };
+    // SeqCst load (rather than a plain `*addr` deref) so the compiler is
+    // forbidden from caching or reordering this read across the bucket-lock
+    // acquire above. On x86 TSO this compiles to a regular `mov` either
+    // way, but the explicit atomic operation makes the cross-CPU read
+    // intent unambiguous and matches how ERTS writes the address
+    // (`atomic_xchg`/store with seq_cst on the waker side).
+    let current = unsafe { (*(addr as *const AtomicU32)).load(Ordering::SeqCst) };
     if current != val {
         drop(flock_guard);
         return -11; // -EAGAIN
@@ -749,7 +755,7 @@ pub fn futex_wake(addr: u64, count: u32) -> i64 {
         static WAKE_CALL_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let wc = WAKE_CALL_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if wc < 50 {
-            let val = unsafe { *(addr as *const u32) };
+            let val = unsafe { (*(addr as *const AtomicU32)).load(Ordering::SeqCst) };
             crate::serial_println!("[wake_call] addr={:#x} count={} val={:#x}", addr, count, val);
         }
     }
@@ -827,7 +833,7 @@ pub fn watchdog_wake() {
             if let Some(thread) = THREADS[i].as_mut() {
                 if thread.state == State::Blocked {
                     // Check if the futex value changed (lock was released)
-                    let current = *(thread.futex_addr as *const u32);
+                    let current = (*(thread.futex_addr as *const AtomicU32)).load(Ordering::SeqCst);
                     if check_num < 1 {
                         crate::serial_println!("[wd] tid={} addr={:#x} val={:#x} cur={:#x}",
                             thread.tid, thread.futex_addr, thread.futex_val, current);
