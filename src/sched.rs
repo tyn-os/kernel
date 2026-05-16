@@ -860,17 +860,21 @@ pub fn watchdog_wake() {
                         && now_ns >= thread.wait_deadline_ns;
                     // Stall safety net: rescue any thread that has been on
                     // an infinite wait (no deadline) for longer than
-                    // BLOCKED_RESCUE_NS. ~17% of Phoenix boots stall here
-                    // because ERTS's ethr_event_reset can race with
-                    // ethr_event_set: a reset that runs between two set
-                    // calls clears the ON flag in user space, so the second
-                    // set's `xchg(state, ON)` sees OFF (= 1) instead of
-                    // OFF_WAITER (= -1) and skips the futex_wake syscall
+                    // BLOCKED_RESCUE_NS. A baseline ≈ 17% of Phoenix boots
+                    // stall here because ERTS's ethr_event_reset can race
+                    // with ethr_event_set: a reset that runs between two
+                    // set calls clears the ON flag in user space, so the
+                    // second set's `xchg(state, ON)` sees OFF (= 1) instead
+                    // of OFF_WAITER (= -1) and skips the futex_wake syscall
                     // entirely — the wake is lost in user space before the
                     // kernel can see it. ERTS's TSE event loop tolerates
                     // spurious wakeups (it re-checks the event value and
                     // re-waits if needed), so a forced rescue here is
-                    // indistinguishable from a spurious wake. See
+                    // indistinguishable from a spurious wake. The measured
+                    // improvement is modest — pooled across 192 trials,
+                    // 166/192 ≈ 86.5% (vs 82.8% baseline, 95% CI ~[82,90]%
+                    // overlaps baseline) — but the mechanism is correct
+                    // and the rescue caps stall duration at ≈ 5 s. See
                     // directions/BOOT_STALL_TSE.md for the full trace.
                     const BLOCKED_RESCUE_NS: u64 = 5_000_000_000; // 5 s
                     let stale = thread.wait_deadline_ns == 0
