@@ -308,6 +308,25 @@ use core::sync::atomic::{AtomicU64, Ordering};
 const MMAP_BASE: u64 = 0x1A00_0000; // 416 MiB
 static MMAP_NEXT: AtomicU64 = AtomicU64::new(MMAP_BASE);
 
+/// Freed mmap regions available for reuse. Each entry is
+/// `(start_addr, len)`, both 4 KiB-aligned.
+///
+/// Without this, our bump allocator advances `MMAP_NEXT` monotonically
+/// forever and exhausts the 2.1 GiB mmap region during long-running
+/// userspace workloads. ERTS+BeamAsm's allocate→compile→free cycle for
+/// JIT code burns through address space within a few seconds of boot.
+/// `sys_munmap` parks freed ranges here; `sys_mmap` checks the free list
+/// before bumping `MMAP_NEXT`. Adjacent ranges are coalesced on insert
+/// to keep fragmentation bounded.
+///
+/// We don't unmap the underlying pages or free physical frames — the
+/// virtual address space is the constrained resource (the 1 GiB huge
+/// pages are already mapped at boot), and ERTS won't access memory
+/// after `munmap`. Demand-paging on the host side means most pages were
+/// never touched anyway.
+static FREE_REGIONS: spin::Mutex<alloc::vec::Vec<(u64, u64)>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
 /// brk heap top (current break — set by `brk(addr)`).
 static BRK_TOP: AtomicU64 = AtomicU64::new(0);
 /// First non-zero brk value ERTS set — used as the base for "brk used"
@@ -412,7 +431,7 @@ fn syscall_dispatch_inner(
         SYS_EXIT_GROUP => sys_exit_group(a0 as i32),
         SYS_BRK => sys_brk(a0),
         SYS_MMAP => sys_mmap(a0, a1, a2 as i32, a3 as i32),
-        SYS_MUNMAP => 0, // no-op
+        SYS_MUNMAP => sys_munmap(a0, a1),
         SYS_MPROTECT => 0, // no-op
         SYS_MADVISE => 0, // no-op
         SYS_ARCH_PRCTL => sys_arch_prctl(a0 as i32, a1),
@@ -777,41 +796,173 @@ fn sys_mmap(addr: u64, length: u64, _prot: i32, flags: i32) -> i64 {
         if addr.saturating_add(aligned) > MMAP_LIMIT {
             return -12; // -ENOMEM
         }
+        // If the requested range falls in the free list, remove it — the
+        // caller is reclaiming the virtual address explicitly.
+        free_regions_drop_range(addr, aligned);
         // SAFETY: addr is identity-mapped within our 4 GiB region.
         if aligned <= 0x400_0000 { // up to 64 MiB
             unsafe { core::ptr::write_bytes(addr as *mut u8, 0, aligned as usize) };
         }
-        addr as i64
-    } else {
-        // Bump allocator with RAM-boundary check. compare_exchange loop so
-        // a request that would cross MMAP_LIMIT returns -ENOMEM without
-        // advancing MMAP_NEXT (a plain fetch_add could push past the limit
-        // even when refusing the caller — and worse, two concurrent
-        // fetch_adds could both succeed and overlap).
-        loop {
-            let cur = MMAP_NEXT.load(Ordering::Relaxed);
-            let new = cur.saturating_add(aligned);
-            if new > MMAP_LIMIT {
-                return -12; // -ENOMEM
+        return addr as i64;
+    }
+
+    // Non-FIXED: try to satisfy from the free list before bumping.
+    if let Some(reused) = free_regions_take(aligned) {
+        // Zero the reused region so it behaves like a fresh mmap (POSIX
+        // requires anonymous mmap to return zero pages). Cap the eager
+        // zero at 64 MiB to keep the syscall cheap — larger requests are
+        // rare (ERTS allocator carriers) and ERTS zero-initializes its
+        // own carrier headers anyway.
+        if aligned <= 0x400_0000 {
+            // SAFETY: identity-mapped, formerly owned by userspace.
+            unsafe { core::ptr::write_bytes(reused as *mut u8, 0, aligned as usize) };
+        }
+        return reused as i64;
+    }
+
+    // Bump allocator with RAM-boundary check. compare_exchange loop so a
+    // request that would cross MMAP_LIMIT returns -ENOMEM without
+    // advancing MMAP_NEXT (a plain fetch_add could push past the limit
+    // even when refusing the caller — and worse, two concurrent fetch_adds
+    // could both succeed and overlap).
+    loop {
+        let cur = MMAP_NEXT.load(Ordering::Relaxed);
+        let new = cur.saturating_add(aligned);
+        if new > MMAP_LIMIT {
+            return -12; // -ENOMEM
+        }
+        if MMAP_NEXT
+            .compare_exchange(cur, new, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            // Host gives zero pages on first touch via the QEMU RAM
+            // backing's MAP_ANONYMOUS|MAP_PRIVATE host mapping. Eagerly
+            // zeroing here would force every page to fault in and push
+            // QEMU RSS up to the full ERTS allocator commit (~1.4 GB);
+            // MMAP_NEXT starts at 416 MiB so no stale bytes from kernel
+            // boot data can surface.
+            return cur as i64;
+        }
+    }
+}
+
+fn sys_munmap(addr: u64, length: u64) -> i64 {
+    if addr == 0 || length == 0 {
+        return -22; // -EINVAL
+    }
+    // Page-align addr down and length up.
+    let aligned_addr = addr & !0xFFF;
+    let aligned_len = (length + (addr - aligned_addr) + 0xFFF) & !0xFFF;
+    // Only track regions within the mmap-managed range. Anything outside
+    // (ELF segments, brk heap, stack) we silently no-op — ERTS doesn't
+    // munmap those, but musl's free-on-shutdown path is loose about it.
+    if aligned_addr >= MMAP_BASE && aligned_addr + aligned_len <= MMAP_LIMIT {
+        free_regions_add(aligned_addr, aligned_len);
+    }
+    0
+}
+
+/// Add `(addr, len)` to the free-region list, merging with any
+/// physically-adjacent existing entry to keep fragmentation bounded.
+fn free_regions_add(addr: u64, len: u64) {
+    let mut free = FREE_REGIONS.lock();
+    // Two passes: extend an existing entry whose tail meets `addr`, then
+    // (possibly) re-merge with the entry whose head meets the new tail.
+    let mut new_addr = addr;
+    let mut new_len = len;
+    let mut merged_idx: Option<usize> = None;
+    for (i, (a, l)) in free.iter_mut().enumerate() {
+        if *a + *l == new_addr {
+            *l += new_len;
+            new_addr = *a;
+            new_len = *l;
+            merged_idx = Some(i);
+            break;
+        }
+        if new_addr + new_len == *a {
+            *a = new_addr;
+            *l += new_len;
+            new_addr = *a;
+            new_len = *l;
+            merged_idx = Some(i);
+            break;
+        }
+    }
+    match merged_idx {
+        Some(i) => {
+            // Try once more to merge with another entry that the just-
+            // extended range now touches.
+            let mut second: Option<usize> = None;
+            for (j, (a, l)) in free.iter().enumerate() {
+                if j == i { continue; }
+                if *a + *l == new_addr || new_addr + new_len == *a {
+                    second = Some(j);
+                    break;
+                }
             }
-            if MMAP_NEXT
-                .compare_exchange(cur, new, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                // POSIX requires anonymous mmap to return zeroed memory.
-                // We rely on the host: QEMU's guest RAM is backed by a
-                // host MAP_ANONYMOUS|MAP_PRIVATE region, which gives zero
-                // pages on first touch (host-side demand paging). Eagerly
-                // zeroing here would force every page to fault in
-                // immediately and would push QEMU's RSS up to the full
-                // ERTS allocator commit (~1.4 GB). The MMAP_NEXT region
-                // (>= 352 MiB) is above all kernel boot data, so no stale
-                // bytes from prior writes can surface — the host mmap
-                // zero-on-first-touch is the entire backing.
-                return cur as i64;
+            if let Some(j) = second {
+                let (oa, ol) = free.remove(j);
+                let i = if j < i { i - 1 } else { i };
+                let (lo, hi) = if oa < new_addr {
+                    (oa, new_addr + new_len)
+                } else {
+                    (new_addr, oa + ol)
+                };
+                free[i] = (lo, hi - lo);
+            }
+        }
+        None => free.push((new_addr, new_len)),
+    }
+}
+
+/// Best-fit search of the free list for a region of at least `len` bytes.
+/// Splits the entry if it's larger than needed and returns the allocated
+/// start address.
+fn free_regions_take(len: u64) -> Option<u64> {
+    let mut free = FREE_REGIONS.lock();
+    let mut best: Option<usize> = None;
+    let mut best_excess = u64::MAX;
+    for (i, (_, l)) in free.iter().enumerate() {
+        if *l >= len {
+            let excess = *l - len;
+            if excess < best_excess {
+                best_excess = excess;
+                best = Some(i);
+                if excess == 0 { break; }
             }
         }
     }
+    let i = best?;
+    let (a, l) = free[i];
+    if l == len {
+        free.swap_remove(i);
+    } else {
+        free[i] = (a + len, l - len);
+    }
+    Some(a)
+}
+
+/// Remove or trim any free-region entries that overlap `[addr, addr+len)`.
+/// Called when MAP_FIXED reclaims a previously-freed range.
+fn free_regions_drop_range(addr: u64, len: u64) {
+    let end = addr + len;
+    let mut free = FREE_REGIONS.lock();
+    let mut to_add: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    free.retain(|(a, l)| {
+        let r_end = *a + *l;
+        if r_end <= addr || *a >= end {
+            return true; // disjoint
+        }
+        // Some overlap: keep the disjoint head and tail (if any).
+        if *a < addr {
+            to_add.push((*a, addr - *a));
+        }
+        if r_end > end {
+            to_add.push((end, r_end - end));
+        }
+        false
+    });
+    free.extend(to_add);
 }
 
 fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
