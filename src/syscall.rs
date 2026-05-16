@@ -745,6 +745,26 @@ fn sys_brk(addr: u64) -> i64 {
     }
 }
 
+/// Upper bound on guest-physical addresses backed by actual RAM.
+///
+/// Memory above this falls in the PCI MMIO hole or is simply unmapped
+/// on the host: writes vanish, reads return BIOS-default values. If
+/// `sys_mmap` hands out an address range that straddles this boundary,
+/// the userspace allocator stores its free-list / carrier metadata in
+/// unbacked space; its first traversal reads zeros (or worse), follows
+/// a NULL/garbage pointer, and faults. That's the JIT BEAM
+/// `_int_malloc` #GP we chased for several sessions (rdx pointed at
+/// 0xa4000320 — past the 2560 MiB RAM boundary).
+///
+/// Hardcoded to 2560 MiB to match the project's standard QEMU
+/// `-m 2560M` invocation (q35 with 2.5 GiB RAM keeps the 32-bit PCI
+/// MMIO hole below 4 GiB so our identity-mapped pagetable covers
+/// every BAR). Larger `-m` values shift the ECAM/BARs above 4 GiB
+/// and the kernel #PFs on PCI enumeration before we get this far.
+/// TODO: read the actual memory map from multiboot info and derive
+/// this dynamically instead of hardcoding.
+const MMAP_LIMIT: u64 = 0xA000_0000;
+
 fn sys_mmap(addr: u64, length: u64, _prot: i32, flags: i32) -> i64 {
     const MAP_FIXED: i32 = 0x10;
     let aligned = (length + 0xFFF) & !0xFFF; // page-align
@@ -753,25 +773,44 @@ fn sys_mmap(addr: u64, length: u64, _prot: i32, flags: i32) -> i64 {
     // using it blindly can zero out memory that's already in use (e.g., the
     // loaded ELF's .rodata containing preloaded BEAM modules).
     if addr != 0 && (flags & MAP_FIXED) != 0 {
+        // Reject MAP_FIXED requests that would extend past available RAM.
+        if addr.saturating_add(aligned) > MMAP_LIMIT {
+            return -12; // -ENOMEM
+        }
         // SAFETY: addr is identity-mapped within our 4 GiB region.
         if aligned <= 0x400_0000 { // up to 64 MiB
             unsafe { core::ptr::write_bytes(addr as *mut u8, 0, aligned as usize) };
         }
         addr as i64
     } else {
-        // Allocate from bump allocator (ignore non-FIXED hint addresses).
-        let result = MMAP_NEXT.fetch_add(aligned, Ordering::Relaxed);
-        // POSIX requires anonymous mmap to return zeroed memory. We rely
-        // on the *host* providing this: QEMU's guest RAM is backed by a
-        // host MAP_ANONYMOUS|MAP_PRIVATE region, which gives zero pages
-        // on first touch (host-side demand paging). Eagerly zeroing here
-        // would force every page to fault in immediately and would push
-        // QEMU's RSS up to the full ERTS allocator commit (~1.4 GB).
-        //
-        // The MMAP_NEXT region (>= 352 MiB) is above all kernel boot
-        // data, so no stale bytes from prior writes can surface — the
-        // host mmap zero-on-first-touch is the entire backing.
-        result as i64
+        // Bump allocator with RAM-boundary check. compare_exchange loop so
+        // a request that would cross MMAP_LIMIT returns -ENOMEM without
+        // advancing MMAP_NEXT (a plain fetch_add could push past the limit
+        // even when refusing the caller — and worse, two concurrent
+        // fetch_adds could both succeed and overlap).
+        loop {
+            let cur = MMAP_NEXT.load(Ordering::Relaxed);
+            let new = cur.saturating_add(aligned);
+            if new > MMAP_LIMIT {
+                return -12; // -ENOMEM
+            }
+            if MMAP_NEXT
+                .compare_exchange(cur, new, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // POSIX requires anonymous mmap to return zeroed memory.
+                // We rely on the host: QEMU's guest RAM is backed by a
+                // host MAP_ANONYMOUS|MAP_PRIVATE region, which gives zero
+                // pages on first touch (host-side demand paging). Eagerly
+                // zeroing here would force every page to fault in
+                // immediately and would push QEMU's RSS up to the full
+                // ERTS allocator commit (~1.4 GB). The MMAP_NEXT region
+                // (>= 352 MiB) is above all kernel boot data, so no stale
+                // bytes from prior writes can surface — the host mmap
+                // zero-on-first-touch is the entire backing.
+                return cur as i64;
+            }
+        }
     }
 }
 

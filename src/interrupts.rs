@@ -170,11 +170,37 @@ extern "x86-interrupt" fn double_fault_handler(
     crate::halt_loop();
 }
 
-extern "x86-interrupt" fn gpf_handler(frame: InterruptStackFrame, _error_code: u64) {
+extern "x86-interrupt" fn gpf_handler(frame: InterruptStackFrame, error_code: u64) {
+    // Capture caller-saved GPRs at the very top — Rust hasn't generated
+    // any code to clobber them yet, so these reads see the actual
+    // register state at the time of the fault. Did this once before
+    // to diagnose the BOOT_STALL_TSE corruption (then it was _dl_ns
+    // showing a non-canonical pointer); doing it again to see what
+    // value is in rcx at the JIT _int_malloc fault.
+    let rax: u64;
+    let rcx: u64;
+    let rdx: u64;
+    let r14: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rax", out(reg) rax, options(nostack, preserves_flags));
+        core::arch::asm!("mov {}, rcx", out(reg) rcx, options(nostack, preserves_flags));
+        core::arch::asm!("mov {}, rdx", out(reg) rdx, options(nostack, preserves_flags));
+        core::arch::asm!("mov {}, r14", out(reg) r14, options(nostack, preserves_flags));
+    }
     crate::serial::raw_str_nolock(b"\n#GP ip=");
     crate::serial::raw_hex_nolock(frame.instruction_pointer.as_u64());
     crate::serial::raw_str_nolock(b" rsp=");
     crate::serial::raw_hex_nolock(frame.stack_pointer.as_u64());
+    crate::serial::raw_str_nolock(b" err=");
+    crate::serial::raw_hex_nolock(error_code);
+    crate::serial::raw_str_nolock(b" rax=");
+    crate::serial::raw_hex_nolock(rax);
+    crate::serial::raw_str_nolock(b" rcx=");
+    crate::serial::raw_hex_nolock(rcx);
+    crate::serial::raw_str_nolock(b" rdx=");
+    crate::serial::raw_hex_nolock(rdx);
+    crate::serial::raw_str_nolock(b" r14=");
+    crate::serial::raw_hex_nolock(r14);
     crate::serial::raw_str_nolock(b"\n");
     crate::halt_loop();
 }
