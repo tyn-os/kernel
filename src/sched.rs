@@ -96,6 +96,12 @@ struct Thread {
     home_cpu: u32,     // CPU where this thread was created (futex_wake targets this)
     wait_deadline_ns: u64, // 0 = no deadline; else monotonic_ns deadline for timed wait
     wait_timed_out: bool,  // set true by watchdog when deadline reached before wake
+    /// monotonic_ns when this thread most recently transitioned to Blocked.
+    /// 0 when not Blocked. The watchdog uses this as a stall safety net:
+    /// any thread still Blocked on an infinite wait (`wait_deadline_ns == 0`)
+    /// for longer than `BLOCKED_RESCUE_NS` is force-rescued as a spurious
+    /// wakeup. See `watchdog_wake` and directions/BOOT_STALL_TSE.md.
+    blocked_since_ns: u64,
 }
 
 /// Per-CPU run queue.
@@ -341,6 +347,7 @@ pub fn init(num_cpus: usize) {
             home_cpu: 0,
             wait_deadline_ns: 0,
             wait_timed_out: false,
+            blocked_since_ns: 0,
         });
         CPU_QUEUES[0].current = Some(0);
         CPU_QUEUES[0].idle = false;
@@ -409,6 +416,7 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
             home_cpu: 0, // updated below to best_cpu
             wait_deadline_ns: 0,
             wait_timed_out: false,
+            blocked_since_ns: 0,
         });
     }
 
@@ -658,6 +666,7 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
             thread.futex_val = val;
             thread.wait_deadline_ns = deadline.unwrap_or(0);
             thread.wait_timed_out = false;
+            thread.blocked_since_ns = crate::syscall::monotonic_ns();
         }
     }
 
@@ -770,6 +779,7 @@ pub fn futex_wake(addr: u64, count: u32) -> i64 {
                 if thread.state == State::Blocked && thread.futex_addr == addr {
                     thread.state = State::Ready;
                     thread.futex_addr = 0;
+                    thread.blocked_since_ns = 0;
                     woken += 1;
                     static WAKE_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
                     let wc = WAKE_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -848,8 +858,26 @@ pub fn watchdog_wake() {
                     // and gen_server:call timeouts never fire.
                     let timed_out = thread.wait_deadline_ns != 0
                         && now_ns >= thread.wait_deadline_ns;
+                    // Stall safety net: rescue any thread that has been on
+                    // an infinite wait (no deadline) for longer than
+                    // BLOCKED_RESCUE_NS. ~17% of Phoenix boots stall here
+                    // because ERTS's ethr_event_reset can race with
+                    // ethr_event_set: a reset that runs between two set
+                    // calls clears the ON flag in user space, so the second
+                    // set's `xchg(state, ON)` sees OFF (= 1) instead of
+                    // OFF_WAITER (= -1) and skips the futex_wake syscall
+                    // entirely — the wake is lost in user space before the
+                    // kernel can see it. ERTS's TSE event loop tolerates
+                    // spurious wakeups (it re-checks the event value and
+                    // re-waits if needed), so a forced rescue here is
+                    // indistinguishable from a spurious wake. See
+                    // directions/BOOT_STALL_TSE.md for the full trace.
+                    const BLOCKED_RESCUE_NS: u64 = 5_000_000_000; // 5 s
+                    let stale = thread.wait_deadline_ns == 0
+                        && thread.blocked_since_ns != 0
+                        && now_ns >= thread.blocked_since_ns + BLOCKED_RESCUE_NS;
                     let force = false;
-                    if current != thread.futex_val || force || timed_out {
+                    if current != thread.futex_val || force || timed_out || stale {
                         // Value changed or force-wake timeout.
                         // Set state=Ready AND push to home_cpu's queue.
                         // The idle loop only pulls from the queue, so
@@ -865,6 +893,7 @@ pub fn watchdog_wake() {
                             thread.wait_timed_out = true;
                         }
                         thread.wait_deadline_ns = 0;
+                        thread.blocked_since_ns = 0;
                         let tid = thread.tid;
                         let target_cpu = thread.home_cpu as usize;
                         if target_cpu < MAX_CPUS {
