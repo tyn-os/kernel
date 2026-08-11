@@ -105,13 +105,20 @@ teeth-tested `ampweb` amplifier under ~4 min sustained load:
   the `-smp 2` TCG crash is TCG's own multi-core emulation being unfaithful, **not** a
   Tyn SMP bug and **nothing to do with Path A or the corruption**. Filed as its own
   note; do not use `-smp 2 -accel tcg` for SMP validation.
-- **Consequence: there is NO free local reproducer of the SMP corruption.** UP `-smp 1`
-  TCG is clean (can't see it); `-smp 2` TCG is an artifact (crashes before it can
-  measure); the build host (m7i.large, a Nitro VM) can't nest KVM for faithful local
-  SMP. **The Path A SMP corruption residual is Nitro-only-observable** → the hunt is a
-  (paid) Nitro hunt. Make it cheaper by sharpening the amplifier so the corruption
-  appears in seconds not ~2 min (it first showed at ~26 k iters), and/or a corruption
-  detector that trips faster.
+- **Local reproducer status: OPEN (2026-08-11).** UP `-smp 1` TCG is clean (can't see
+  it); `-smp 2` TCG is an artifact (crashes before it can measure); the build host
+  (m7i.large, a Nitro VM) can't nest KVM. A **c5.metal running `qemu -accel kvm
+  -smp 2`** is the candidate faithful reproducer (bare metal → real KVM SMP). It
+  **boots and runs Tyn stably** (90 k iters, no crash — which *independently confirms*
+  the `-smp 2` TCG crash was an MTTCG artifact, from the faithful side). BUT whether it
+  **reproduces the corruption is UNCONFIRMED** — three metal runs were wasted on
+  *test-harness* errors (missing HTTP hammer → under-dosed; `-m 3072M` → boot `#PF`;
+  a `HP=$(hammer…)` background-in-command-substitution hang), not real nulls. **Do not
+  read those as "KVM-metal doesn't reproduce."** Next: one carefully-driven metal run
+  (proven `-m 2560M`, hammer as `(…) & HP=$!`, validate the *exact* script on build-host
+  TCG first, or drive interactively). If it reproduces → seconds-per-iter local hunt;
+  if it truly stays 0 at heavy dose → Nitro-only, sharpen the amplifier (corruption
+  first showed at ~26 k iters) to make Nitro probes cheap.
 - **Suspects (measure, don't assume):** the omitted trampoline FXSAVE/`gs:[48]` SIMD
   scaffolding (task #74, dropped as UP-dead) needed under SMP; per-CPU vs per-thread
   preempt-region assumptions; `context_switch` under 2 schedulers; AP APIC-timer
