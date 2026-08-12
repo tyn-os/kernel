@@ -42,11 +42,17 @@ overlap. Not ranked; each notes what it is, why it bites, and the fix if known.
   in any tracked config. *Bite:* a fresh operator can't reproduce the DB path.
   *Fix:* record provenance + where it's set; decide tracked-secret vs
   documented-external.
-- **IAM: build-host role can't revoke SG rules.** The build-host role lacks
-  `ec2:RevokeSecurityGroupIngress`, so ≥2 in-VPC security-group rules opened during
-  testing (**9100** dist, **6432** TLS/pgbouncer) are **un-revokable** by the tooling
-  and linger. *Fix:* one IAM policy addition clears the whole class (grant the
-  revoke action), then revoke the stale rules.
+- **IAM: `tyn-build-role` is missing perms (a recurring gap-class).** Two instances
+  hit so far: (1) no **`ec2:RevokeSecurityGroupIngress`**, so ≥2 in-VPC SG rules opened
+  during testing (**9100** dist, **6432** TLS/pgbouncer) are **un-revokable** by the
+  tooling and linger; (2) no **`iam:PassRole`** for `tyn-build-role`, so the build host
+  **can't launch a fresh build instance *with* the `tyn-build-profile`** — a fresh host
+  comes up with no aws access, which blocks it from self-serving the metal cut and
+  forces keeping the old (role-bearing) host alive just for aws (paying double). *Fix:*
+  one IAM policy addition on `tyn-build-role` grants the class — add `iam:PassRole` (on
+  `tyn-build-role`) + `ec2:RevokeSecurityGroupIngress`; then a fresh build host is
+  self-sufficient (attach the profile at launch) and stale SG rules can be revoked.
+  Audit the role for the whole ec2/iam action set the build/deploy flow needs, once.
 
 ## Kernel hardening
 
