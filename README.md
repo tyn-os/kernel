@@ -10,7 +10,7 @@ Tyn is a unikernel — a single-purpose operating system kernel that hosts one t
 
 The BEAM already has its own process model, scheduler, memory management, and distribution protocol. A general-purpose OS kernel underneath duplicates much of what BEAM provides natively. Tyn explores what happens when you remove that redundancy and give BEAM a purpose-built host.
 
-Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP ships a new version, it should just work. That's the critical lesson from [LING](https://github.com/cloudozer/ling) (Erlang on Xen), which reimplemented the VM and couldn't keep pace with upstream.
+Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP ships a new version, it should just work. This is partly why Tyn leans on upstream ERTS rather than reimplementing it, as the pioneering [LING](https://github.com/cloudozer/ling) (Erlang on Xen) did — keeping in step with fast-moving upstream OTP is a lot to take on alongside a reimplemented VM.
 
 ## Why?
 
