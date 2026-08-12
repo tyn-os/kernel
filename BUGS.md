@@ -105,20 +105,24 @@ teeth-tested `ampweb` amplifier under ~4 min sustained load:
   the `-smp 2` TCG crash is TCG's own multi-core emulation being unfaithful, **not** a
   Tyn SMP bug and **nothing to do with Path A or the corruption**. Filed as its own
   note; do not use `-smp 2 -accel tcg` for SMP validation.
-- **Local reproducer status: OPEN (2026-08-11).** UP `-smp 1` TCG is clean (can't see
-  it); `-smp 2` TCG is an artifact (crashes before it can measure); the build host
-  (m7i.large, a Nitro VM) can't nest KVM. A **c5.metal running `qemu -accel kvm
-  -smp 2`** is the candidate faithful reproducer (bare metal → real KVM SMP). It
-  **boots and runs Tyn stably** (90 k iters, no crash — which *independently confirms*
-  the `-smp 2` TCG crash was an MTTCG artifact, from the faithful side). BUT whether it
-  **reproduces the corruption is UNCONFIRMED** — three metal runs were wasted on
-  *test-harness* errors (missing HTTP hammer → under-dosed; `-m 3072M` → boot `#PF`;
-  a `HP=$(hammer…)` background-in-command-substitution hang), not real nulls. **Do not
-  read those as "KVM-metal doesn't reproduce."** Next: one carefully-driven metal run
-  (proven `-m 2560M`, hammer as `(…) & HP=$!`, validate the *exact* script on build-host
-  TCG first, or drive interactively). If it reproduces → seconds-per-iter local hunt;
-  if it truly stays 0 at heavy dose → Nitro-only, sharpen the amplifier (corruption
-  first showed at ~26 k iters) to make Nitro probes cheap.
+- **FAITHFUL LOCAL REPRODUCER FOUND (2026-08-12).** UP `-smp 1` TCG is clean (can't see
+  it); `-smp 2` TCG is an MTTCG artifact (crashes before it can measure); the build host
+  (m7i.large, a Nitro VM) can't nest KVM. **A c5.metal running `qemu -accel kvm -smp 2`
+  reproduces the corruption** — measured, controlled A/B on one box, only `-smp` differs:
+  - **`-smp 1` control: `large_md5 = 0`** (38 k iters, no crash);
+  - **`-smp 2`: `large_md5 = 5`** (monotonic 0→1→2→4→5, first nonzero ~19 k iters,
+    71 k iters, no crash) — **matches Nitro's signature** (Nitro: first nonzero ~26 k,
+    reached 4 by 52 k). Nitro-matched dose (16 workers + 30-way HTTP hammer, 240 s); **no
+    escalation needed.**
+  - **Recipe (for the hunt):** c5.metal → `qemu-system-x86_64 -accel kvm -cpu host -m
+    2560M -smp 2` booting `fixed.raw` (Path A + ampweb, `-m 2560M`) + a 30-way `/health`
+    hammer; read `large_md5` on `/chk`. Boot ~6 s, so **seconds-per-iteration** vs
+    ~10 min/Nitro-AMI. `-smp 1` on the same box is the built-in clean control. Harness:
+    `tests/simd/` + `~/work/run_one.sh` (`ACCEL CPU SMP PORT DISK HAMMERP SECS`).
+  - Three earlier metal runs failed on *my harness bugs* (no hammer / `-m 3072M` boot
+    `#PF` / `$(hammer…)` pipe hang), NOT real nulls — see
+    `feedback_expensive_cloud_harness`. The clean run followed Rule 0 (validate the exact
+    script on TCG first, `(…) & HP=$!`, deadman-switch, confirm teardown).
 - **Suspects (measure, don't assume):** the omitted trampoline FXSAVE/`gs:[48]` SIMD
   scaffolding (task #74, dropped as UP-dead) needed under SMP; per-CPU vs per-thread
   preempt-region assumptions; `context_switch` under 2 schedulers; AP APIC-timer
@@ -206,6 +210,23 @@ clone of origin/main (CLEAR_DECK Step 1), so `git bisect` → build → test is 
 but likely unnecessary given the beam suspect above. `deploy-ami.sh` now gates on a clean
 tree + logs the built HEAD SHA, so any bisect deploy is traceable to its commit. Do this on **c5.large** (cheap) with the leak-proof terminate-on-exit
 trap + `Instance:`-anchored id extraction (a prior regex bug leaked a c5.metal once).
+
+## BUG-6 — boot `#PF` under qemu-kvm at `-m 3072M` (`-m 2560M` boots fine)
+
+**Severity:** medium (a memory-size-dependent boot crash; latent — could bite on any
+host/config that hands Tyn a larger RAM map). **Status:** open, reproduced, not
+diagnosed. Found while building the SMP reproducer: booting `fixed.raw` (Path A + ampweb)
+under `qemu -accel kvm -smp {1,2} -m 3072M` **faults at boot** —
+`#PF ip=0xf030ae4 cr2=0x380000000014 rsp=0x11ae35e8` on **both** `-smp 1` and `-smp 2`
+(so it is **not** SMP-related). The **same disk boots cleanly at `-m 2560M`** (used
+throughout for both the reproducer and the Nitro deploys), so it is purely a function of
+the guest RAM size / e820 map. `cr2=0x380000000014` (~3.5 TiB) is a wild pointer — likely
+Tyn's memory-map/e820 handling computing an out-of-range address when the top of RAM sits
+at 3 GiB rather than 2.5 GiB (cf. the 4 GiB identity-map ceiling, BUG-4 class). **Repro:**
+`qemu-system-x86_64 -accel kvm -cpu host -m 3072M -machine q35 -smp 1 -drive
+file=fixed.raw,…` on a KVM host → boot `#PF` on serial. **Do not "improve" the reproducer
+harness's `-m` — 2560M is the known-good value.** *Fix direction:* audit Tyn's e820/RAM
+sizing (`src/main.rs` boot path) for an assumption that breaks above ~2.5 GiB.
 
 ## BUG-2 — `tyn_boot` crashes `exit_group(127)` on a config env value of `"0"`
 
