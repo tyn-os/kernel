@@ -146,6 +146,49 @@ static ERL_NIF_TERM xmm_probe_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     return enif_make_long(env, bad);
 }
 
+/* Detection teeth-test for xmm_probe: IDENTICAL to xmm_probe_nif but deliberately
+ * zeroes xmm0 (pxor) AFTER the spin, BEFORE the readback — so ob[0] != kn[0] and
+ * every span is counted bad. A positive control that proves the readback+compare
+ * +count path actually FIRES on a wrong XMM value (the sound-by-construction spin
+ * proves the value is held LIVE; this proves the check DETECTS corruption). Must
+ * return bad == outer. If this returns 0 the detector is inert — the "measures
+ * nothing, reads clean" trap this arc has hit (md5-is-scalar, under-dosed fsbase). */
+static ERL_NIF_TERM xmm_poison_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    long outer, spin;
+    if (argc != 2 || !enif_get_long(env, argv[0], &outer) || !enif_get_long(env, argv[1], &spin))
+        return enif_make_badarg(env);
+    long bad = 0;
+    for (long i = 0; i < outer; i++) {
+        uint64_t kn[16], ob[16]; long cnt = spin;
+        for (int j = 0; j < 16; j++) { kn[j] = 0xA5A5000000000000ULL + (uint64_t)(j+1); ob[j] = 0; }
+        __asm__ __volatile__(
+            "movq   0(%[k]), %%xmm0\n\t"  "movq   8(%[k]), %%xmm1\n\t"
+            "movq  16(%[k]), %%xmm2\n\t"  "movq  24(%[k]), %%xmm3\n\t"
+            "movq  32(%[k]), %%xmm4\n\t"  "movq  40(%[k]), %%xmm5\n\t"
+            "movq  48(%[k]), %%xmm6\n\t"  "movq  56(%[k]), %%xmm7\n\t"
+            "movq  64(%[k]), %%xmm8\n\t"  "movq  72(%[k]), %%xmm9\n\t"
+            "movq  80(%[k]), %%xmm10\n\t" "movq  88(%[k]), %%xmm11\n\t"
+            "movq  96(%[k]), %%xmm12\n\t" "movq 104(%[k]), %%xmm13\n\t"
+            "movq 112(%[k]), %%xmm14\n\t" "movq 120(%[k]), %%xmm15\n\t"
+            "1:\n\t" "dec %[cnt]\n\t" "jnz 1b\n\t"
+            "pxor %%xmm0, %%xmm0\n\t"     /* POISON: corrupt xmm0 -> ob[0] must mismatch */
+            "movq %%xmm0,   0(%[o])\n\t"  "movq %%xmm1,   8(%[o])\n\t"
+            "movq %%xmm2,  16(%[o])\n\t"  "movq %%xmm3,  24(%[o])\n\t"
+            "movq %%xmm4,  32(%[o])\n\t"  "movq %%xmm5,  40(%[o])\n\t"
+            "movq %%xmm6,  48(%[o])\n\t"  "movq %%xmm7,  56(%[o])\n\t"
+            "movq %%xmm8,  64(%[o])\n\t"  "movq %%xmm9,  72(%[o])\n\t"
+            "movq %%xmm10, 80(%[o])\n\t"  "movq %%xmm11, 88(%[o])\n\t"
+            "movq %%xmm12, 96(%[o])\n\t"  "movq %%xmm13,104(%[o])\n\t"
+            "movq %%xmm14,112(%[o])\n\t"  "movq %%xmm15,120(%[o])\n\t"
+            : [cnt]"+r"(cnt)
+            : [k]"r"(kn), [o]"r"(ob)
+            : "xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7",
+              "xmm8","xmm9","xmm10","xmm11","xmm12","xmm13","xmm14","xmm15","memory","cc");
+        for (int j = 0; j < 16; j++) if (ob[j] != kn[j]) { bad++; break; }
+    }
+    return enif_make_long(env, bad);
+}
+
 /* Red-zone survival: write a sentinel into the 128-byte SysV red zone
  * [rsp-8 .. rsp-128] below this (non-leaf, so red-zone-unused) frame's rsp, spin
  * call-free (rsp stable), read it back. A timer preempt of the spin makes
@@ -211,6 +254,7 @@ static ErlNifFunc nif_funcs[] = {
     {"gp_probe", 2, gp_probe_nif},
     {"rflags_probe", 2, rflags_probe_nif},
     {"xmm_probe", 2, xmm_probe_nif},
+    {"xmm_poison", 2, xmm_poison_nif},
     {"redzone_probe", 2, redzone_probe_nif},
 };
 
