@@ -46,7 +46,7 @@ defmodule Ampweb.Amp do
   # probe as a clean xmm_bad=0.
   def nif_ok do
     case probe_mode() do
-      m when m in ["xmm", "xmm_poison"] ->
+      m when m in ["xmm", "xmm_poison", "mixed"] ->
         (try do
            if :fsbase_probe.available(), do: 1, else: 0
          rescue _ -> 0 catch _, _ -> 0 end)
@@ -89,6 +89,11 @@ defmodule Ampweb.Amp do
   end
 
   def workers, do: env_int("TYN_AMP_WORKERS", @default_workers, 1)
+  # mixed mode: how many of `workers()` run the XMM probe; the rest run bounded
+  # md5. Default half/half — the md5 half is the LIVE positive control (large_md5>0
+  # proves corruption is happening in THIS -smp2 process) beside the xmm half
+  # (xmm_bad=0 => XMM clean under that same live corruption). Closes Cut 1 airtight.
+  def xmm_workers, do: env_int("TYN_XMM_WORKERS", div(workers(), 2), 0)
   def churn_kb, do: env_int("TYN_AMP_CHURN_KB", @default_churn_kb, 0)
   def churn_type, do: System.get_env("TYN_CHURN_TYPE") || "binary"
 
@@ -101,6 +106,11 @@ defmodule Ampweb.Amp do
     case probe_mode() do
       "xmm" -> spawn_link(fn -> xmm_worker(:xmm_probe, deadline) end)
       "xmm_poison" -> spawn_link(fn -> xmm_worker(:xmm_poison, deadline) end)
+      "mixed" ->
+        if i <= xmm_workers(),
+          do: spawn_link(fn -> xmm_worker(:xmm_probe, deadline) end),
+          else: spawn_link(fn -> worker_bounded(i, deadline) end)
+
       _ -> spawn_link(fn -> worker(i) end)
     end
   end
@@ -126,6 +136,40 @@ defmodule Ampweb.Amp do
       if is_integer(bad) and bad > 0, do: bump(:xmm_bad, bad)
       bump(:xmm_spans, 1)
       xmm_worker(fun, deadline)
+    end
+  end
+
+  # Bounded md5 worker for mixed mode: identical workload to worker/1 but stops at
+  # `deadline` (so the batch goes idle and the manager can print the combined line).
+  defp worker_bounded(i, deadline) do
+    ctype = churn_type()
+    ckb = churn_kb()
+    su = <<i, 0xC3, 0x3C, rem(i * 11, 256)>>
+    small = :binary.copy(su, div(@small_bytes, 4))
+    lu = <<i, 0x5A, 0xA5, rem(i * 7, 256)>>
+    lreps = div(@large_kb * 1024, 4)
+    large = :binary.copy(lu, lreps)
+    creps = div(max(ckb, 1) * 1024, 4)
+    r_small = :erlang.md5(small)
+    r_large = :erlang.md5(large)
+    loop_bounded(i, su, small, r_small, lu, lreps, large, r_large, creps, ctype, deadline)
+  end
+
+  defp loop_bounded(i, su, small, r_small, lu, lreps, large, r_large, creps, ctype, deadline) do
+    if mono_ms() >= deadline do
+      :done
+    else
+      if :erlang.md5(small) != r_small do
+        if genuine(i, :SMALL, div(@small_bytes, 4), su, small, r_small) == 1, do: bump(:small_md5, 1)
+      end
+
+      if :erlang.md5(large) != r_large do
+        if genuine(i, :LARGE, lreps, lu, large, r_large) == 1, do: bump(:large_md5, 1)
+      end
+
+      churn(ctype, lu, creps)
+      bump(:iters, 1)
+      loop_bounded(i, su, small, r_small, lu, lreps, large, r_large, creps, ctype, deadline)
     end
   end
 
