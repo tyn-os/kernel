@@ -26,8 +26,19 @@ pub fn init_idt() {
         // Timer at vector 32 with IST1 (safe dedicated stack for the timer ISR).
         IDT[32].set_handler_fn(timer_handler)
             .set_stack_index(0);
-        // IPI handler for SMP wakeup (vector 34)
-        IDT[34].set_handler_fn(ipi_handler);
+        // IPI handler for SMP wakeup (vector 34). BUG-1 Cut-2: MUST use the same IST
+        // as the timer. Tyn runs ring 0, so a vector WITHOUT an IST pushes its CPU
+        // interrupt frame onto the *current* stack. If this IPI preempts BeamAsm user
+        // code running on the user stack — an idle CPU can transition idle→running-user
+        // between sched.rs send_ipi's is_idle check and IPI delivery — the CPU writes
+        // the 40-byte frame into the user SysV red zone [rsp-128..rsp] and clobbers
+        // leaf spills → transient wrong md5. SMP-ONLY (IPIs need >1 CPU) ⇒ exactly
+        // BUG-1's -smp2 residual, and consistent with Cut 1 (XMM clean — this clobbers
+        // GPR spills, not XMM). Path A only IST'd the timer, missing this vector.
+        // Sharing IST1 with the timer is safe: interrupt gates run IF=0 so timer/IPI
+        // can't nest on one CPU, and each CPU has its own IST via percpu::init_cpu.
+        IDT[34].set_handler_fn(ipi_handler)
+            .set_stack_index(0);
         // Spurious interrupt handler for APIC (vector 0xFF)
         IDT[0xFF].set_handler_fn(spurious_handler);
         IDT.load_unsafe();

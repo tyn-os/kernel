@@ -50,7 +50,28 @@ pub fn init_cpu_msrs(cpu_id: usize) {
 
         // Set GS_BASE to this CPU's per-CPU syscall data.
         // The syscall entry stub uses gs:0 for kernel stack and gs:8 for scratch.
-        let gs_base = &raw const PERCPU_SYSCALL[cpu_id] as u64;
+        //
+        // BUG-1 Cut-2: index PERCPU_SYSCALL by APIC id — the SAME key the scheduler
+        // uses to WRITE gs:[0] (set_current_kernel_stack()/get_clone_regs() index by
+        // current_cpu() = APIC id). Indexing GS_BASE here by the *logical* cpu_id (the
+        // ACPI enumeration order) would, on any topology where apic_id != cpu_id, point
+        // this CPU's gs:[0] at a slot the scheduler never updates → stale kstack_top →
+        // the timer trampoline builds its iretq frame at a wrong address and the syscall
+        // loads a wrong kernel rsp (BUG-1-class silent corruption / hard fault). At Tyn's
+        // current scale apic_id == cpu_id (MEASURED: qemu -smp2 and 2-vCPU Nitro both
+        // enumerate 0,1), so this is a latent-defect fix, not a behaviour change. If they
+        // ever diverge (bigger/multi-core topologies with SMT-reserved APIC-ID bits),
+        // shout rather than corrupt silently. NOTE: PERCPU_SYSCALL is a fixed [_; 16] and
+        // apic_id is used unbounded here and in set_current_kernel_stack — see BUGS.md
+        // (sparse/large APIC ids need a bound-check or an apic→slot map).
+        let apic_id = (*((0xFEE0_0020u64) as *const u32) >> 24) as usize;
+        if apic_id != cpu_id {
+            serial_println!(
+                "[syscall] WARN apic_id {} != cpu_id {} — GS_BASE uses apic_id (BUG-1 Cut-2)",
+                apic_id, cpu_id
+            );
+        }
+        let gs_base = &raw const PERCPU_SYSCALL[apic_id] as u64;
         Msr::new(0xC000_0101).write(gs_base); // IA32_GS_BASE
     }
 }

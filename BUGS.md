@@ -33,6 +33,24 @@ exercised** — and the original "md5 large-binary flakiness" was itself an SMP 
 dist) symptom. Net: red-zone clobber fixed for UP; an **SMP-specific corruption
 residual remains**. Do NOT treat BUG-1 as closed.
 
+**SMP-RESIDUAL ROOT CAUSE FOUND + FIXED (2026-08-13, Cut 2) — pending Nitro re-validation.**
+The SMP residual is a SECOND red-zone clobber Path A missed: the **SMP wakeup IPI (vector 34,
+`src/interrupts.rs`) had no IST**, while the timer (vec 32) has `.set_stack_index(0)`. Tyn runs
+ring 0, so a vector without an IST pushes its 40-byte CPU interrupt frame onto the *current*
+stack; when the IPI preempts BeamAsm user code on the user stack (an idle CPU goes
+idle→running-user between `sched.rs` `send_ipi`'s `is_idle` check and delivery), the frame lands
+in the user red zone `[rsp-128..rsp]` and clobbers leaf spills → transient wrong md5. **SMP-only**
+(IPIs need >1 CPU); **clobbers GPR spills, not XMM** — which is exactly why the Cut-1 XMM probe
+refuted XMM (0/33 706 spans on a kernel proven to corrupt, `large_md5=2`). **Fix (1 line):**
+`IDT[34].set_handler_fn(ipi_handler).set_stack_index(0)` — same IST as the timer (safe: interrupt
+gates run IF=0 so timer/IPI can't nest per-CPU; each CPU has its own IST via `percpu::init_cpu`).
+**Reproducer dual acceptance (c5.metal `-smp 2`):** unfixed `large_md5=1` (400 s) as live positive
+control; **fixed `large_md5=0` over a cumulative 1600 s / ~500 k iters, no crash** (fluke P ≪1% at
+the ~1–2/350 s base rate); `-smp 1` → 0 by construction (no IPIs on UP); TCG boot clean.
+*Remaining:* Nitro re-validation (real target) via deploy-ami, then commit. Cut 1 (XMM refuted) +
+the earlier GS_BASE index defect (BUG-7, latent — apic==cpu measured on reproducer + 2-vCPU Nitro)
+were the exclusions that narrowed the hunt to this. Fixes UNCOMMITTED pending Nitro + ask.
+
 **Root cause:** `sched_yield_trampoline` (`src/interrupts.rs`) redirects a preempted
 thread to `syscall(sched_yield)` by writing the saved RIP + rax/rcx/r11 to
 `[user_rsp-8..-32]` — **inside the interrupted thread's 128-byte SysV red zone**
@@ -251,3 +269,27 @@ NIF builds fine. Worked around by putting all probes in one module (`fsbase_prob
 today because `sched::context_switch` (sched.rs:1184) reads the *live* fs_base via
 `rdmsr`, not the saved copy — would bite if any path ever trusted `ctx.fs_base`. **Not
 BUG-1.**
+
+## BUG-7 — `PERCPU_SYSCALL` (gs:[0]) indexed by two different keys — LATENT SMP defect
+
+**Severity:** medium (latent; would be catastrophic where it fires). **Status:** FIXED at
+source (BUG-1 Cut-2, uncommitted), boot-verify + reproducer regression owed. **What:**
+`gs:[0]` (the per-CPU kernel-stack pointer the timer trampoline and `syscall` entry read)
+lives in `PERCPU_SYSCALL[]`. `init_cpu_msrs()` set `GS_BASE = &PERCPU_SYSCALL[cpu_id]`
+(the **logical** ACPI enumeration index) while `set_current_kernel_stack()` /
+`get_clone_regs()` write/read `PERCPU_SYSCALL[apic_id]` (the **APIC id**, via
+`current_cpu()`). **Two index spaces for the same slot.** Where `apic_id != cpu_id`, a
+CPU's `gs:[0]` points at a slot the scheduler never updates → stale `kstack_top` → the
+Path-A trampoline builds its iretq frame at a wrong address (BUG-1-class silent
+corruption) and the syscall loads a wrong kernel rsp. **Why it hid:** MEASURED
+`apic_id == cpu_id` on both the qemu `-smp 2` reproducer (ACPI 0,1) and a 2-vCPU Nitro
+guest (`/proc/cpuinfo` apicid 0,1 — SMT threads of core 0), so it is **latent at Tyn's
+current scale, not the active SMP residual**. It would fire on topologies where APIC IDs
+go non-contiguous (bigger/multi-core with SMT-reserved ID bits). **Fix:** index
+`init_cpu_msrs` by `apic_id` too (read from the local APIC), matching every other
+`PERCPU_SYSCALL` access; warn loudly if `apic_id != cpu_id`. All 4 index sites now use
+`apic_id` (or literal 0 = BSP = apic 0); `cargo check` clean. **Follow-up (owed):**
+`PERCPU_SYSCALL` is a fixed `[_; 16]` indexed by `apic_id` unbounded (here and in
+`set_current_kernel_stack`) — sparse/large APIC ids need a bound-check or an
+apic→slot map. **Not the reproducer bug** — Cut-2 concurrency probe (run-queue /
+deferred-unlock races) is still owed after this.
