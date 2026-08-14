@@ -33,7 +33,7 @@ exercised** — and the original "md5 large-binary flakiness" was itself an SMP 
 dist) symptom. Net: red-zone clobber fixed for UP; an **SMP-specific corruption
 residual remains**. Do NOT treat BUG-1 as closed.
 
-**SMP-RESIDUAL ROOT CAUSE FOUND + FIXED (2026-08-13, Cut 2) — pending Nitro re-validation.**
+**SMP-RESIDUAL RESOLVED (2026-08-13, Cut 2) — Nitro-validated. BUG-1 is now CLOSED.**
 The SMP residual is a SECOND red-zone clobber Path A missed: the **SMP wakeup IPI (vector 34,
 `src/interrupts.rs`) had no IST**, while the timer (vec 32) has `.set_stack_index(0)`. Tyn runs
 ring 0, so a vector without an IST pushes its 40-byte CPU interrupt frame onto the *current*
@@ -47,9 +47,14 @@ gates run IF=0 so timer/IPI can't nest per-CPU; each CPU has its own IST via `pe
 **Reproducer dual acceptance (c5.metal `-smp 2`):** unfixed `large_md5=1` (400 s) as live positive
 control; **fixed `large_md5=0` over a cumulative 1600 s / ~500 k iters, no crash** (fluke P ≪1% at
 the ~1–2/350 s base rate); `-smp 1` → 0 by construction (no IPIs on UP); TCG boot clean.
-*Remaining:* Nitro re-validation (real target) via deploy-ami, then commit. Cut 1 (XMM refuted) +
-the earlier GS_BASE index defect (BUG-7, latent — apic==cpu measured on reproducer + 2-vCPU Nitro)
-were the exclusions that narrowed the hunt to this. Fixes UNCOMMITTED pending Nitro + ask.
+**Nitro re-validation (real target, deploy-ami c5.large, the same `nitro_ampweb.sh` harness that
+measured the original 0→4): PASS — `large_md5=0` across 240 s / 76 511 iters under load, health 200,
+no crash.** Committed `7270266` (this fix + BUG-7). Cut 1 (XMM refuted) + the GS_BASE index defect
+(BUG-7, latent — apic==cpu measured on the reproducer + a 2-vCPU Nitro guest) were the exclusions
+that narrowed the hunt to this. Provenance closed: `7270266` pushed to origin (`origin/main` =
+`76759aa`), build host reset clean to it — the fix builds from the commit and future deploys pass
+the provenance gate with no override. (The validation deploy itself used `PROVENANCE_ALLOW_DIRTY=1`
+with the scp'd fix, code verified present.)
 
 **Root cause:** `sched_yield_trampoline` (`src/interrupts.rs`) redirects a preempted
 thread to `syscall(sched_yield)` by writing the saved RIP + rax/rcx/r11 to
