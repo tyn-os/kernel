@@ -88,3 +88,19 @@ open wall so the regression does not silently imply the large-upload user-story 
 - tmpfs is pure in-kernel memory (no hardware/timing coupling), so a QEMU/TCG
   boot is a faithful confirmation; behavior is identical on bare-metal Nitro.
 - Cap is 4 MiB (`CAP` in `src/tmpfs.rs`), shared out of the 16 MiB kernel heap.
+
+## Layer-2 addition: cap under concurrent writers (`probe_cap.ex`)
+
+`probe_cap.ex` (`CapProbe.run/0`) is the Phase-2 **Layer-2** adversarial test of
+the 4 MiB byte-cap under *concurrent* writers racing the boundary — the in-situ
+counterpart to the Layer-1 `src/tmpfs_tree.rs::grant_write` unit test (which tests
+the arithmetic on a slice; this tests the live node store under real load). It
+races 16 writers × 512 KiB (8 MiB demand) at the 4 MiB cap and prints `CC_` lines
+asserted three-part (teeth / clean-handling / no-corruption / recovery).
+
+- `build_cap_app.sh` — assembles a minimal no-dep app that runs `CapProbe` at boot.
+- `drive_cap_concurrency.sh` — packs+boots it on TCG and asserts the `CC_` verdict.
+
+Validated on TCG **and** on real 4-core Nitro SMP (8 ok / 8 enospc, total exactly
+4 MiB, no interleave, recovery — the coarse-Mutex invariant holds under genuine
+parallelism).
