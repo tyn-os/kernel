@@ -11,7 +11,7 @@ The public AMI carries a stock `mix phx.new` app — landing page, a **LiveView 
 static assets served through the kernel's `sendfile(2)` — so it demonstrates the capability
 claims directly.
 
-**AMI:** `ami-09619e2d139f2a57d` (us-east-1)
+**AMI:** `ami-0c13cb4a868a6e441` (us-east-1)
 
 ```bash
 # One-time: a security group with port 8080 open
@@ -22,7 +22,7 @@ aws ec2 authorize-security-group-ingress --group-id $SG_ID \
     --protocol tcp --port 8080 --cidr 0.0.0.0/0 --region us-east-1
 
 # Launch
-INSTANCE_ID=$(aws ec2 run-instances --image-id ami-09619e2d139f2a57d \
+INSTANCE_ID=$(aws ec2 run-instances --image-id ami-0c13cb4a868a6e441 \
     --instance-type c5.large --security-group-ids $SG_ID --region us-east-1 \
     --query 'Instances[0].InstanceId' --output text)
 aws ec2 wait instance-running --region us-east-1 --instance-ids $INSTANCE_ID
@@ -31,11 +31,11 @@ IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region us-east-1 \
 echo "Tyn is at http://$IP:8080"
 ```
 
-Wait ~10 s for boot, then:
+Wait ~5 s for boot (Tyn boots in ~5 s once the instance is running; the rest is EC2 provisioning), then:
 
 ```bash
 curl http://$IP:8080/                         # Phoenix landing page (HTML)
-curl -s http://$IP:8080/assets/big.bin | wc -c  # 1500000 — a static asset via kernel sendfile(2)
+curl -s http://$IP:8080/assets/app.js | wc -c  # nonzero — a static asset via kernel sendfile(2)
 # then open http://$IP:8080/counter in a browser: the LiveView counter increments live
 ```
 
@@ -253,5 +253,7 @@ CPIO=my_app.cpio ./build-disk.sh          # -> a bootable raw disk image
     # check_origin: false   # ONLY for a throwaway IP demo — it disables CSWSH protection
   ```
 
-See the README **Limitations** for the full list (epoch wall clock, no writable FS, no
-distributed Erlang, ~3% cold-boot stall → retry at the orchestration layer).
+See the README **Limitations** for the full list — RTC-seeded second-resolution wall clock
+(real UTC, drifts, not epoch), in-memory-only writable tmpfs (`/tmp` + `/dev/shm`, 4 MiB cap,
+volatile), IPv4-only, no in-guest TLS (the two sidecar notes above), and KVM/Nitro-only (not
+QEMU-TCG).
