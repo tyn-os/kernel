@@ -104,7 +104,7 @@ impl EnaDevice {
     /// Write an RX descriptor at the current SQ tail pointing at buffer
     /// `req_id`, and advance the tail (does not ring the doorbell).
     fn post_rx_desc(&mut self, req_id: u16) {
-        let slot = (self.rx_sq_tail & Q_MASK) as u64;
+        let slot = super::ring::slot(self.rx_sq_tail, Q_MASK) as u64;
         let buf = self.rx_bufs + req_id as u64 * BUF_SIZE as u64;
         let desc = self.rx_sq + slot * RX_DESC_SIZE as u64;
         // SAFETY: slot < IO_DEPTH within rx_sq; buf within rx_bufs.
@@ -119,10 +119,9 @@ impl EnaDevice {
             write_volatile((desc + 12) as *mut u16, (buf >> 32) as u16); // buff_addr_hi
             write_volatile((desc + 14) as *mut u16, 0); // reserved16_w3
         }
-        self.rx_sq_tail = self.rx_sq_tail.wrapping_add(1);
-        if self.rx_sq_tail & Q_MASK == 0 {
-            self.rx_sq_phase ^= 1;
-        }
+        let (t, p) = super::ring::sq_advance(self.rx_sq_tail, self.rx_sq_phase, Q_MASK);
+        self.rx_sq_tail = t;
+        self.rx_sq_phase = p;
     }
 
     fn ring_rx_doorbell(&self) {
@@ -141,20 +140,18 @@ impl EnaDevice {
             let cdesc = self.tx_cq + self.tx_cq_head as u64 * TX_CDESC_SIZE as u64;
             // tx_cdesc.flags is byte 3; phase is bit 0.
             let flags = unsafe { read_volatile((cdesc + 3) as *const u8) };
-            if flags & 1 != self.tx_cq_phase {
+            if !super::ring::entry_ready(flags, self.tx_cq_phase) {
                 break;
             }
             self.tx_next_to_comp = self.tx_next_to_comp.wrapping_add(1);
-            self.tx_cq_head += 1;
-            if self.tx_cq_head == IO_DEPTH {
-                self.tx_cq_head = 0;
-                self.tx_cq_phase ^= 1;
-            }
+            let (h, p) = super::ring::cq_advance(self.tx_cq_head, self.tx_cq_phase, IO_DEPTH);
+            self.tx_cq_head = h;
+            self.tx_cq_phase = p;
         }
     }
 
     fn tx_free_slots(&self) -> u16 {
-        IO_DEPTH - 1 - self.tx_sq_tail.wrapping_sub(self.tx_next_to_comp)
+        super::ring::free_slots(self.tx_sq_tail, self.tx_next_to_comp, IO_DEPTH)
     }
 }
 
@@ -173,7 +170,7 @@ impl Device for EnaDevice {
     fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let cdesc = self.rx_cq + self.rx_cq_head as u64 * RX_CDESC_SIZE as u64;
         let status = unsafe { read_volatile(cdesc as *const u32) };
-        if ((status >> RX_CDESC_PHASE_SHIFT) & 1) as u8 != self.rx_cq_phase {
+        if !super::ring::entry_ready(((status >> RX_CDESC_PHASE_SHIFT) & 1) as u8, self.rx_cq_phase) {
             return None;
         }
         let len = unsafe { read_volatile((cdesc + 4) as *const u16) } as usize;
@@ -189,11 +186,9 @@ impl Device for EnaDevice {
         }
 
         // Advance the CQ.
-        self.rx_cq_head += 1;
-        if self.rx_cq_head == IO_DEPTH {
-            self.rx_cq_head = 0;
-            self.rx_cq_phase ^= 1;
-        }
+        let (h, p) = super::ring::cq_advance(self.rx_cq_head, self.rx_cq_phase, IO_DEPTH);
+        self.rx_cq_head = h;
+        self.rx_cq_phase = p;
 
         // Re-post the same buffer for future receives.
         if req_id < N_RX_BUFS {
@@ -235,9 +230,9 @@ impl TxToken for EnaTxToken<'_> {
         let dev = self.dev;
         dev.drain_tx();
 
-        let slot = (dev.tx_sq_tail & Q_MASK) as u64;
+        let slot = super::ring::slot(dev.tx_sq_tail, Q_MASK) as u64;
         let buf = dev.tx_bufs + slot * BUF_SIZE as u64;
-        let req_id = (dev.tx_sq_tail & Q_MASK) as u32;
+        let req_id = super::ring::slot(dev.tx_sq_tail, Q_MASK) as u32;
 
         // Let smoltcp build the frame directly in the (coherent) DMA buffer.
         // SAFETY: buf is TX buffer `slot`, len <= MTU < BUF_SIZE.
@@ -262,10 +257,9 @@ impl TxToken for EnaTxToken<'_> {
             write_volatile((desc + 8) as *mut u32, buf as u32); // buff_addr_lo
             write_volatile((desc + 12) as *mut u32, (buf >> 32) as u32 & 0xffff); // addr_hi, hdr_sz=0
         }
-        dev.tx_sq_tail = dev.tx_sq_tail.wrapping_add(1);
-        if dev.tx_sq_tail & Q_MASK == 0 {
-            dev.tx_sq_phase ^= 1;
-        }
+        let (t, p) = super::ring::sq_advance(dev.tx_sq_tail, dev.tx_sq_phase, Q_MASK);
+        dev.tx_sq_tail = t;
+        dev.tx_sq_phase = p;
         dev.ring_tx_doorbell();
 
         result

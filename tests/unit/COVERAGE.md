@@ -48,3 +48,25 @@ reject (month/day/hour/year); century-register garbage → 20xx fallback.
   not that non-leap Feb-29 is rejected (it is not).
 - **In situ, `decode`'s guarantee holds iff** the RTC presents UTC (documented
   assumption) and the century register is either sane (19–21) or absent (0).
+
+## ENA ring index/phase — `src/net/ena/ring.rs` (`tests/ring.rs`)
+
+**Tested (boundaries):** slot wrap at capacity; SQ phase inverts exactly at the
+depth boundary (and *not* mid-ring); SQ phase period is two full laps; SQ index
+wraps u16 cleanly (depth divides 65536); CQ advance wrap + phase flip;
+`entry_ready` is phase equality (bit-0 only); `free_slots` empty/full + the kept
+slot; `free_slots` correct across the u16 wrap (avail/used indices disagree).
+
+**Not covered / seam:**
+- The impure seam is `device.rs`'s volatile descriptor reads/writes, the doorbell
+  MMIO, and DMA coherence. The pure functions decide *which* slot and *when* the
+  phase flips; they do **not** verify the descriptor bytes actually reached DMA
+  memory, that a doorbell write reached the NIC, or that the device's phase
+  convention matches ours. A coherence or doorbell bug yields the same
+  intermittent stall the phase math would — invisible here; only a Nitro
+  serve-verify catches it.
+- Tests assume a power-of-two depth (`IO_DEPTH = 256`) so the `& mask` slot
+  arithmetic holds; a non-power-of-two depth would break `slot`/`sq_advance` and
+  is not guarded.
+- **In situ, the guarantees hold iff** the device honors the ENA phase-bit
+  protocol (toggle per wrap) and the completion queue's write-back DMA is coherent.

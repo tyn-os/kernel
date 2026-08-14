@@ -8,6 +8,7 @@
 pub mod admin;
 pub mod device;
 pub mod regs;
+pub mod ring;
 
 use crate::serial_println;
 use core::ptr::read_volatile;
