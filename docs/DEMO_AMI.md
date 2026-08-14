@@ -63,8 +63,11 @@ The app listens on **:8080**. Open TCP 8080 in the security group.
 granted the AMI-lifecycle perms and the account's AMI block-public-access was disabled for the
 region to allow it.
 
-**Cleanup still owed** (deliberately deferred): the stale `ami-09619e2d139f2a57d` (`tyn-20260719`,
-pre-feature-wave) is *still public* alongside this one — deregister it + delete `snap-02439cf571e0c479c`
-so there is a single current official artifact. (Optionally also the older private
-`ami-0286718a83e0f8bfc` / `ami-0a5f9bdbe6527dd7c` + their snapshots.) Keep `ami-03e6489b48f9aea90`
-(build-host base).
+**Cleanup done** (2026-08-14): the stale `ami-09619e2d139f2a57d` (`tyn-20260719`, pre-feature-wave)
+was deregistered and its backing `snap-02439cf571e0c479c` deleted, so this AMI is now the single
+public/official artifact. Two unrelated orphaned VM-import snapshots (`snap-023c8d6c086aef71a`,
+`snap-0fd26d7737a17164e`, backing no AMI) were cleared at the same time. Verified non-destructive
+first: no instances or launch templates referenced the old AMI, the new AMI was available+public,
+and each snapshot was unreferenced by any remaining AMI before deletion. (Still optional: the older
+*private* `ami-0286718a83e0f8bfc` / `ami-0a5f9bdbe6527dd7c` + their snapshots. Keep
+`ami-03e6489b48f9aea90` — the build-host base.)
