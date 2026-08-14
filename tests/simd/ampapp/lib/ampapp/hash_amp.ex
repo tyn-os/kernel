@@ -37,8 +37,43 @@ defmodule Ampapp.HashAmp do
       "rflags" -> fsbase_run(:rflags_probe, "RFLAGS", rt, wk)
       "xmm"    -> fsbase_run(:xmm_probe, "XMM", rt, wk)
       "redzone" -> fsbase_run(:redzone_probe, "REDZONE", rt, wk)
+      "xmm_poison" -> fsbase_run(:xmm_poison, "XMMPOISON", rt, wk)
+      "suite" -> suite_run(wk)
       _ -> amp_run()
     end
+  end
+
+  # Layer-0 probe suite: run every register/red-zone survival probe in ONE boot,
+  # each for a short window, plus the xmm_poison TEETH. Labels distinguish the
+  # class (register: FSBASE/GP/RFLAGS/XMM; memory: REDZONE) so the md5-is-scalar
+  # conflation can't recur. A clean kernel yields bad=0 for all survival probes;
+  # XMMPOISON MUST yield bad>0 — it deliberately corrupts xmm before readback, so a
+  # 0 there means the whole spin+readback+compare detection harness is inert.
+  # Each probe is guarded by probe_bound?/1 so the suite runs whatever the linked
+  # probe beam actually exports (functions not bound print {LABEL}_UNAVAILABLE).
+  defp suite_run(workers) do
+    w = env_int("TYN_SUITE_WINDOW_MS", 4_000)
+    IO.puts("SUITE_BEGIN workers=#{workers} window_ms=#{w} nif_ok=#{if fsbase_probe_ok?(), do: 1, else: 0}")
+    for {fun, label} <- [
+          {:probe, "FSBASE"}, {:gp_probe, "GP"}, {:rflags_probe, "RFLAGS"},
+          {:xmm_probe, "XMM"}, {:redzone_probe, "REDZONE"},
+          {:xmm_poison, "XMMPOISON"}    # teeth — must fire (bad>0)
+        ] do
+      if probe_bound?(fun),
+        do: fsbase_run(fun, label, w, workers),
+        else: IO.puts("#{label}_UNAVAILABLE (nif fn not bound)")
+    end
+    IO.puts("SUITE_DONE")
+  end
+
+  defp fsbase_probe_ok? do
+    try do :fsbase_probe.available() rescue _ -> false catch _, _ -> false end
+  end
+
+  # Is this NIF function actually bound in the linked beam? A tiny probe call that
+  # returns an integer => bound; nif_error (stub) or any raise => not bound.
+  defp probe_bound?(fun) do
+    try do is_integer(apply(:fsbase_probe, fun, [1, 1000])) rescue _ -> false catch _, _ -> false end
   end
 
   # FS_BASE survival probe: spawn `workers` processes, each repeatedly holds its
