@@ -1,0 +1,14 @@
+# Standalone host-target unit tests for the kernel's pure-logic cores (Phase 2
+# Layer 1). NOT part of the kernel build — it #[path]-includes the pure modules
+# (src/cpio.rs, src/rtc_pure.rs, …) and runs their in-file #[cfg(test)] tests via
+# plain `cargo test`. No deps, no qemu, no probe beam — the cheap every-build tier.
+#
+# The empty [workspace] makes this its own workspace root so it is not pulled into
+# the kernel package. Run with:  (cd tests/unit && cargo test)
+[package]
+name = "tyn-unit-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]

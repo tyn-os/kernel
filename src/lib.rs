@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod apic;
+pub mod cpio;
 pub mod drivers;
 pub mod elf;
 pub mod interrupts;
@@ -16,6 +17,7 @@ pub mod net;
 pub mod percpu;
 pub mod rng;
 pub mod rtc;
+pub mod rtc_pure;
 pub mod sched;
 pub mod serial;
 pub mod smp;

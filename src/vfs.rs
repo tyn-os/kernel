@@ -81,71 +81,15 @@ static OPEN_FILES: spin::Mutex<[Option<OpenFile>; MAX_OPEN]> = spin::Mutex::new(
     [NONE; MAX_OPEN]
 });
 
-/// Parse a cpio newc header field (fixed-width hex ASCII).
-fn parse_hex(bytes: &[u8]) -> u64 {
-    let mut val = 0u64;
-    for &b in bytes {
-        let digit = match b {
-            b'0'..=b'9' => (b - b'0') as u64,
-            b'a'..=b'f' => (b - b'a' + 10) as u64,
-            b'A'..=b'F' => (b - b'A' + 10) as u64,
-            _ => 0,
-        };
-        val = (val << 4) | digit;
-    }
-    val
-}
+// The newc header-field parser lives in the pure, host-unit-tested `crate::cpio`
+// module (see tests/unit/). The other cpio scans below reuse it.
+use crate::cpio::parse_hex;
 
-/// Look up a file in the cpio archive by path. Returns (data_offset, data_len).
+/// Look up a file in the embedded cpio archive by path. Returns (data_offset,
+/// data_len). The newc parsing lives in `crate::cpio::lookup` — bounds- and
+/// overflow-checked on malformed input; this just supplies the embedded bytes.
 fn cpio_lookup(path: &[u8]) -> Option<(usize, usize)> {
-    let data = cpio_data();
-    let mut offset = 0usize;
-
-    while offset + 110 <= data.len() {
-        // Check magic "070701"
-        if &data[offset..offset + 6] != b"070701" {
-            break;
-        }
-
-        let filesize = parse_hex(&data[offset + 54..offset + 62]) as usize;
-        let namesize = parse_hex(&data[offset + 94..offset + 102]) as usize;
-
-        // Name starts at offset + 110, padded to 4-byte boundary
-        let name_start = offset + 110;
-        let name_end = name_start + namesize - 1; // exclude NUL terminator
-        let data_start = (name_start + namesize + 3) & !3; // 4-byte align
-        let data_end = data_start + filesize;
-        let next_entry = (data_end + 3) & !3; // 4-byte align
-
-        if name_end > data.len() || data_end > data.len() {
-            break;
-        }
-
-        let entry_name = &data[name_start..name_end];
-
-        // Check for TRAILER
-        if entry_name == b"TRAILER!!!" {
-            break;
-        }
-
-        // Compare with requested path (normalize leading / and ./)
-        let normalized = if path.starts_with(b"/") {
-            &path[1..]
-        } else if path.starts_with(b"./") {
-            &path[2..]
-        } else {
-            path
-        };
-        let matches = entry_name == normalized;
-
-        if matches {
-            return Some((data_start, filesize));
-        }
-
-        offset = next_entry;
-    }
-
-    None
+    crate::cpio::lookup(cpio_data(), path)
 }
 
 /// Open a file from the VFS. Returns fd on success, -ENOENT on failure.

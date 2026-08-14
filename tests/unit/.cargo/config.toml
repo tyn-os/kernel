@@ -1,0 +1,4 @@
+# Escape the repo-root bare-metal config: these host unit tests use prebuilt std,
+# not build-std, and target the host (the runner passes --target <host>).
+[unstable]
+build-std = []

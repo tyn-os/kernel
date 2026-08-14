@@ -83,74 +83,17 @@ pub fn read_rtc_unix_secs() -> Option<u64> {
     }
 
     let status_b = unsafe { cmos_read(0x0B) };
-    let is_bcd = status_b & 0x04 == 0; // bit 2 clear => BCD
-    let is_12h = status_b & 0x02 == 0; // bit 1 clear => 12-hour
-    let dec = |v: u8| -> u64 {
-        if is_bcd {
-            ((v & 0x0F) as u64) + (((v >> 4) & 0x0F) as u64) * 10
-        } else {
-            v as u64
-        }
+    // The pure decode (BCD/century/leap/range-validation) lives in
+    // `crate::rtc_pure`, which is host-unit-tested (tests/unit/). This layer only
+    // does the port I/O read above.
+    let raw = crate::rtc_pure::RawFields {
+        sec: last.sec,
+        min: last.min,
+        hour: last.hour,
+        day: last.day,
+        mon: last.mon,
+        year: last.year,
+        cent: last.cent,
     };
-
-    let sec = dec(last.sec);
-    let min = dec(last.min);
-    // Hour: in 12-hour mode the PM flag is bit 0x80 of the raw byte (before BCD).
-    let hour = if is_12h {
-        let pm = last.hour & 0x80 != 0;
-        let h = dec(last.hour & 0x7F);
-        if pm { (h % 12) + 12 } else { h % 12 }
-    } else {
-        dec(last.hour)
-    };
-    let day = dec(last.day);
-    let mon = dec(last.mon);
-    let yy = dec(last.year);
-    // Century: use register 0x32 if it decodes to something plausible (19–21),
-    // else assume 20xx. RTC year is two digits; this is the documented assumption.
-    let cent = dec(last.cent);
-    let year = if (19..=21).contains(&cent) {
-        cent * 100 + yy
-    } else {
-        2000 + yy
-    };
-
-    // Reject garbage so we fall back to 1970+uptime instead of a wild clock.
-    if !(1..=12).contains(&mon)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || min > 59
-        || sec > 60
-        || !(2020..=2100).contains(&year)
-    {
-        return None;
-    }
-
-    let days = days_since_epoch(year, mon as u8, day as u8);
-    Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
-}
-
-fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-/// Days from 1970-01-01 to `year-month-day` (proleptic Gregorian, all inputs
-/// already validated by the caller).
-fn days_since_epoch(year: u64, month: u8, day: u8) -> u64 {
-    let mut days = 0u64;
-    let mut y = 1970;
-    while y < year {
-        days += if is_leap(y) { 366 } else { 365 };
-        y += 1;
-    }
-    const MDAYS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut m = 1u8;
-    while m < month {
-        days += MDAYS[(m - 1) as usize];
-        if m == 2 && is_leap(year) {
-            days += 1;
-        }
-        m += 1;
-    }
-    days + (day as u64 - 1)
+    crate::rtc_pure::decode(&raw, status_b)
 }
