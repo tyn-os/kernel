@@ -57,18 +57,27 @@ kill -9 $QP 2>/dev/null; pkill -9 -f qemu-system 2>/dev/null
 clean() { tr -d '\000' < "$LOG" 2>/dev/null; }
 crash=$(clean | grep -acE "#GP|#PF|panic")
 begin=$(clean | grep -acE "AMP_BEGIN")
-total_line=$(clean | grep -aoE "AMP_TOTAL iters=[0-9]+ mismatches=[0-9]+ exceptions=[0-9]+" | head -1)
-mism=$(echo "$total_line" | grep -oE "mismatches=[0-9]+" | cut -d= -f2)
+# TIMEOUT in the AMP_TOTAL line means some workers never reported — an incomplete
+# run, not a clean pass.
+timeout_seen=$(clean | grep -acE "AMP_TOTAL.*TIMEOUT")
+total_line=$(clean | grep -aoE "AMP_TOTAL small_md5=[0-9]+ large_md5=[0-9]+" | head -1)
+small=$(echo "$total_line" | grep -oE "small_md5=[0-9]+" | cut -d= -f2)
+large=$(echo "$total_line" | grep -oE "large_md5=[0-9]+" | cut -d= -f2)
 
-echo "--- SIMD regression ---"
-echo "boot(AMP_BEGIN)=$begin  crash(#GP/#PF/panic)=$crash"
+echo "--- SIMD / red-zone regression (BUG-1 memory-corruption class) ---"
+echo "boot(AMP_BEGIN)=$begin  crash(#GP/#PF/panic)=$crash  timeout=$timeout_seen"
 echo "${total_line:-<no AMP_TOTAL — run did not complete>}"
-clean | grep -aE "AMP_MISMATCH" | head -5
+clean | grep -aE "AMP_TRANSIENT|AMP_INPUT_CORRUPT|AMP_REF_BAD" | head -5
 
-if [ "$begin" = "1" ] && [ "$crash" = "0" ] && [ -n "$mism" ] && [ "$mism" = "0" ]; then
-  echo "SIMD: PASS (0 mismatches, no fault, run completed)"
+# PASS: booted, no fault, all workers reported (no timeout), and BOTH the
+# trap-continuation large-md5 (control) AND the no-trap small-md5 anchor came back
+# 0. A transient wrong digest under preemption is exactly BUG-1's red-zone clobber.
+# Behaviour-based and exact: asserts the COUNT, never a status.
+if [ "$begin" = "1" ] && [ "$crash" = "0" ] && [ "$timeout_seen" = "0" ] \
+   && [ -n "$small" ] && [ -n "$large" ] && [ "$small" = "0" ] && [ "$large" = "0" ]; then
+  echo "SIMD: PASS (small_md5=0 large_md5=0, no fault, run completed)"
   exit 0
 else
-  echo "SIMD: FAIL (mismatches=${mism:-?}, crash=$crash, begin=$begin)"
+  echo "SIMD: FAIL (small_md5=${small:-?} large_md5=${large:-?}, crash=$crash, begin=$begin, timeout=$timeout_seen)"
   exit 1
 fi
