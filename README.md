@@ -45,7 +45,8 @@ A public AMI is available in `us-east-1` — under two minutes, no build require
 ```bash
 aws ec2 run-instances --image-id ami-0c13cb4a868a6e441 \
     --instance-type c5.large --region us-east-1
-# open port 8080 in your security group, wait ~90s for boot, then:
+# open TCP 8080 in your security group; the instance takes ~1-2 min to launch
+# (Tyn itself boots in ~5s — the rest is EC2 provisioning), then:
 curl http://<public-ip>:8080/                          # → Phoenix landing page
 curl -s http://<public-ip>:8080/assets/app.js | wc -c   # → 125737, a static asset via kernel sendfile
 # then open http://<public-ip>:8080/counter in a browser — the LiveView counter increments live
@@ -85,8 +86,8 @@ Tyn runs a real, unmodified OTP 27 + Phoenix stack, but it is a specialized runt
 
 - **No in-guest TLS.** `ssl`, `public_key`, and `asn1` are stubs — they satisfy the dependency graph but provide no functions. **Terminate TLS at the load balancer** and serve plain HTTP in-guest. An `https:` listener starts cleanly and then `:undef`s at request time; `tyn-pack` warns when it detects one.
 - **Crypto is from-scratch and unreviewed.** It passes known-answer vectors and matches upstream OTP byte-for-byte, but has had **no outside security review** — don't trust it for production session security until it has. Boot also **panics without a hardware RNG** (RDRAND/RDSEED; present on the c5/m5/t3 Nitro families).
-- **Wall clock is pinned at the epoch (1970).** Monotonic time is correct. Anything depending on *absolute* wall-clock time breaks: TLS certificate date validation (another reason to terminate TLS at the LB), absolute cookie/token expiry, `Date` headers. Relative timers and `Phoenix.Token` max-age are fine. No RTC/kvmclock yet.
-- **No writable filesystem.** The VFS is a read-only cpio. Writes to `/tmp`, cwd, or `/dev/shm` return `enoent`; file uploads (`Plug.Upload`) and anything needing scratch disk do not work.
+- **Wall clock is RTC-seeded, second-resolution, and drifts.** `CLOCK_REALTIME` is seeded from the hardware RTC at boot (real UTC — fine for `DateTime.utc_now`, logs, `Date` headers), but it's second-resolution and drifts with the TSC over long uptimes; no NTP/kvmclock sync. Monotonic time is exact.
+- **Writable storage is in-memory only.** `/tmp` and `/dev/shm` are a volatile tmpfs (4 MiB cap, lost on reboot), so `Plug.Upload` and scratch writes work within that budget — no persistent disk. The application VFS is a read-only cpio. (A large-write `#GP` is still open — GP_HUNT #72.)
 - **No distributed Erlang.** No `epmd`, no `net_kernel`. Single node only.
 - **IPv4 only.** IPv6 socket binds are rewritten to IPv4-any at boot (stock Phoenix `runtime.exs` binds IPv6-any).
 - **~3% cold-boot stall.** A residual liveness stall during ERTS SMP init — no crash, no corruption, and **retry always succeeds.** Mitigate with orchestration-layer retry (standard cloud practice); two retries give ~99.97% effective. Full history and the hypothesis ledger: [`docs/FUTEX_HISTORY.md`](docs/FUTEX_HISTORY.md).
