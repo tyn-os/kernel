@@ -70,3 +70,15 @@ slot; `free_slots` correct across the u16 wrap (avail/used indices disagree).
   is not guarded.
 - **In situ, the guarantees hold iff** the device honors the ENA phase-bit
   protocol (toggle per wrap) and the completion queue's write-back DMA is coherent.
+
+## serial ring — `src/serial.rs` — N/A (no ring buffer)
+
+**Confirmed N/A, no test written.** `src/serial.rs` is direct 16550 UART port
+I/O: `_print` / `raw_str` / `raw_hex` (+ `_nolock` variants) spin on the LSR
+transmit-ready bit (port `0x3FD` & `0x20`) and write bytes straight to COM1 (port
+`0x3F8`), gated only by a `QUIET` `AtomicBool`. There is no ring buffer, no
+head/tail/phase state, no index arithmetic — **no pure logic to extract, and no
+test written.** (Serial *input* for the eval shell reads on demand in
+`syscall.rs`; also not a ring.) Recorded as a truthful gap rather than a
+manufactured test — a green count padded with a fake serial-ring test is exactly
+the failure mode this whole exercise exists to catch.
