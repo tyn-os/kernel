@@ -33,6 +33,7 @@
 //! range check), so a closed-and-recycled number can't be misrouted.
 
 use crate::serial_println;
+use crate::tmpfs_tree::{grant_write, is_mount_path, is_under, norm, parent};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, Ordering};
@@ -120,46 +121,12 @@ pub fn init() {
     serial_println!("[tmpfs] mounted /tmp and /dev/shm (cap {} KiB)", CAP / 1024);
 }
 
-/// Normalise a path: ensure leading `/`, strip a leading `./`, and drop any
-/// trailing slash (except for root). Does NOT resolve `..` or `.` components
-/// beyond a leading `./` — the callers we serve (Elixir/ERTS temp paths) pass
-/// already-clean absolute paths.
-fn norm(path: &[u8]) -> Vec<u8> {
-    let mut p = path;
-    if p.starts_with(b"./") {
-        p = &p[1..]; // "./tmp/x" -> "/tmp/x"
-    }
-    let mut v: Vec<u8> = if p.starts_with(b"/") {
-        p.to_vec()
-    } else {
-        let mut x = Vec::with_capacity(p.len() + 1);
-        x.push(b'/');
-        x.extend_from_slice(p);
-        x
-    };
-    while v.len() > 1 && *v.last().unwrap() == b'/' {
-        v.pop();
-    }
-    v
-}
-
-/// The parent directory path of a normalised path. `/tmp/a/b` -> `/tmp`,
-/// `/tmp` -> `/` (which is never a tmpfs node, so creating directly in a mount
-/// root works but creating in `/` does not).
-fn parent(path: &[u8]) -> Vec<u8> {
-    match path.iter().rposition(|&c| c == b'/') {
-        Some(0) => b"/".to_vec(),
-        Some(i) => path[..i].to_vec(),
-        None => b"/".to_vec(),
-    }
-}
-
 /// True if `path` is inside a tmpfs mount (or is a mount root). This is the
 /// routing predicate the syscall layer uses to decide "does tmpfs own this
-/// path?" before falling through to the cpio VFS.
+/// path?" before falling through to the cpio VFS. (Normalisation + the
+/// prefix-trap-safe membership test are the pure `tmpfs_tree` core.)
 pub fn owns_path(path: &[u8]) -> bool {
-    let n = norm(path);
-    n == b"/tmp" || n.starts_with(b"/tmp/") || n == b"/dev/shm" || n.starts_with(b"/dev/shm/")
+    is_mount_path(&norm(path))
 }
 
 /// True if `fd` is a live tmpfs descriptor (membership, not range).
@@ -313,20 +280,12 @@ unsafe fn write_at(fs: &mut Tmpfs, path: &[u8], at: usize, buf: *const u8, count
     if count == 0 {
         return 0;
     }
-    // Growth needed to write n bytes at `at` is grow(n) = max(0, at + n - len):
-    // it includes any zero-filled GAP when at > len (a sparse write past EOF),
-    // not just the payload. Bytes overwriting existing content (at < len) are
-    // free. Solve grow(n) <= allowed_grow for the largest n <= count so the cap
-    // is honored even for sparse writes.
+    // How many of `count` bytes may land under the cap — accounts for the
+    // zero-filled gap of a sparse write past EOF, and treats in-place overwrite
+    // as free. The arithmetic (with its off-by-one teeth) lives in the pure
+    // tmpfs_tree::grant_write core; unit-tested at the cap boundary.
     let len = node.data.len();
-    let allowed_grow = CAP.saturating_sub(fs.total);
-    let max_n = if at >= len {
-        // gap (at - len) plus payload must fit; if the gap alone overflows, 0.
-        allowed_grow.saturating_sub(at - len)
-    } else {
-        (len - at) + allowed_grow // free overwrite region + growable tail
-    };
-    let n = count.min(max_n);
+    let n = grant_write(fs.total, CAP, at, len, count);
     if n == 0 {
         return ENOSPC; // no room (even the gap doesn't fit), nothing written
     }
@@ -659,11 +618,11 @@ pub fn rename(old: &[u8], new: &[u8]) -> i64 {
     0
 }
 
-/// True if any node has `dir` as its immediate parent.
+/// True if any node is a (possibly deep) descendant of `dir` — the
+/// delete-non-empty gate. The prefix-trap-safe predicate is the pure
+/// `tmpfs_tree::is_under` core.
 fn has_children(fs: &Tmpfs, dir: &[u8]) -> bool {
-    let mut prefix = dir.to_vec();
-    prefix.push(b'/');
-    fs.nodes.keys().any(|k| k.starts_with(&prefix))
+    fs.nodes.keys().any(|k| is_under(k, dir))
 }
 
 /// mkdir(2). Parent must exist and be a directory.

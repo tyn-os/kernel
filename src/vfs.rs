@@ -68,13 +68,9 @@ static NEXT_VFS_FD: AtomicU64 = AtomicU64::new(1000);
 /// Maximum number of simultaneously open VFS files.
 const MAX_OPEN: usize = 256;
 
-/// An open VFS file — tracks position within the archive data.
-struct OpenFile {
-    fd: i32,
-    data_offset: usize, // offset into cpio_data() where file content starts
-    data_len: usize,     // file size
-    pos: usize,          // current read position
-}
+// The open-file table's slot type and the pure allocate/find/free logic live in
+// the host-unit-tested `crate::fd_table` module (see tests/unit/).
+use crate::fd_table::{self, OpenFile};
 
 static OPEN_FILES: spin::Mutex<[Option<OpenFile>; MAX_OPEN]> = spin::Mutex::new({
     const NONE: Option<OpenFile> = None;
@@ -112,14 +108,10 @@ pub fn open(path: &[u8]) -> i64 {
     let fd = NEXT_VFS_FD.fetch_add(1, Ordering::Relaxed) as i32;
 
     let mut files = OPEN_FILES.lock();
-    for slot in files.iter_mut() {
-        if slot.is_none() {
-            *slot = Some(OpenFile { fd, data_offset, data_len, pos: 0 });
-            return fd as i64;
-        }
+    match fd_table::alloc(&mut files[..], OpenFile { fd, data_offset, data_len, pos: 0 }) {
+        Some(_) => fd as i64,
+        None => -24, // -EMFILE
     }
-
-    -24 // -EMFILE
 }
 
 /// Duplicate an open VFS fd (dup(2)). Returns a new fd referring to the same
@@ -129,108 +121,83 @@ pub fn open(path: &[u8]) -> i64 {
 /// receives a bogus fd and fails — which is why static assets 500'd.
 pub fn dup(oldfd: i32) -> i64 {
     let mut files = OPEN_FILES.lock();
-    // Copy the source file's backing info (drops the immutable borrow before we
-    // mutate the table to claim a slot).
-    let mut src = None;
-    for slot in files.iter() {
-        if let Some(ref f) = slot {
-            if f.fd == oldfd {
-                src = Some((f.data_offset, f.data_len, f.pos));
-                break;
-            }
+    // Copy the source file's backing info before we mutate the table for a slot.
+    let (data_offset, data_len, pos) = match fd_table::find(&files[..], oldfd) {
+        Some(i) => {
+            let f = files[i].as_ref().unwrap();
+            (f.data_offset, f.data_len, f.pos)
         }
-    }
-    let (data_offset, data_len, pos) = match src {
-        Some(x) => x,
         None => return -9, // -EBADF — not an open VFS fd
     };
     let fd = NEXT_VFS_FD.fetch_add(1, Ordering::Relaxed) as i32;
-    for slot in files.iter_mut() {
-        if slot.is_none() {
-            *slot = Some(OpenFile { fd, data_offset, data_len, pos });
-            return fd as i64;
-        }
+    match fd_table::alloc(&mut files[..], OpenFile { fd, data_offset, data_len, pos }) {
+        Some(_) => fd as i64,
+        None => -24, // -EMFILE
     }
-    -24 // -EMFILE
 }
 
 /// Read from an open VFS file. Returns bytes read, 0 for EOF.
 pub fn read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     let mut files = OPEN_FILES.lock();
-    for slot in files.iter_mut() {
-        if let Some(ref mut file) = slot {
-            if file.fd == fd {
-                let remaining = file.data_len - file.pos;
-                if remaining == 0 { return 0; }
-                let to_read = count.min(remaining);
-                let src = &cpio_data()[file.data_offset + file.pos..];
-                // SAFETY: buf is in identity-mapped user memory.
-                unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), buf, to_read); }
-                file.pos += to_read;
-                return to_read as i64;
-            }
-        }
-    }
-    -9 // -EBADF
+    let i = match fd_table::find(&files[..], fd) {
+        Some(i) => i,
+        None => return -9, // -EBADF
+    };
+    let file = files[i].as_mut().unwrap();
+    let remaining = file.data_len - file.pos;
+    if remaining == 0 { return 0; }
+    let to_read = count.min(remaining);
+    let src = &cpio_data()[file.data_offset + file.pos..];
+    // SAFETY: buf is in identity-mapped user memory.
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), buf, to_read); }
+    file.pos += to_read;
+    to_read as i64
 }
 
 /// Read at a specific offset without changing file position (atomic pread).
 pub fn pread(fd: i32, buf: *mut u8, count: usize, offset: usize) -> i64 {
     let files = OPEN_FILES.lock();
-    for slot in files.iter() {
-        if let Some(ref file) = slot {
-            if file.fd == fd {
-                if offset >= file.data_len { return 0; }
-                let remaining = file.data_len - offset;
-                let to_read = count.min(remaining);
-                let src = &cpio_data()[file.data_offset + offset..];
-                unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), buf, to_read); }
-                return to_read as i64;
-            }
-        }
-    }
-    -9 // -EBADF
+    let i = match fd_table::find(&files[..], fd) {
+        Some(i) => i,
+        None => return -9, // -EBADF
+    };
+    let file = files[i].as_ref().unwrap();
+    if offset >= file.data_len { return 0; }
+    let remaining = file.data_len - offset;
+    let to_read = count.min(remaining);
+    let src = &cpio_data()[file.data_offset + offset..];
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), buf, to_read); }
+    to_read as i64
 }
 
 /// Get file size for fstat.
 pub fn fstat_size(fd: i32) -> Option<usize> {
     let files = OPEN_FILES.lock();
-    for slot in files.iter() {
-        if let Some(ref file) = slot {
-            if file.fd == fd { return Some(file.data_len); }
-        }
-    }
-    None
+    fd_table::find(&files[..], fd).map(|i| files[i].as_ref().unwrap().data_len)
 }
 
 /// Seek within an open VFS file. Returns new position.
 pub fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     let mut files = OPEN_FILES.lock();
-    for slot in files.iter_mut() {
-        if let Some(ref mut file) = slot {
-            if file.fd == fd {
-                let new_pos = match whence {
-                    0 => offset.max(0) as usize,                              // SEEK_SET
-                    1 => (file.pos as i64).saturating_add(offset).max(0) as usize, // SEEK_CUR
-                    2 => (file.data_len as i64).saturating_add(offset).max(0) as usize, // SEEK_END
-                    _ => return -22, // -EINVAL
-                };
-                file.pos = new_pos.min(file.data_len);
-                return file.pos as i64;
-            }
-        }
-    }
-    -9 // -EBADF
+    let i = match fd_table::find(&files[..], fd) {
+        Some(i) => i,
+        None => return -9, // -EBADF
+    };
+    let file = files[i].as_mut().unwrap();
+    let new_pos = match whence {
+        0 => offset.max(0) as usize,                                        // SEEK_SET
+        1 => (file.pos as i64).saturating_add(offset).max(0) as usize,      // SEEK_CUR
+        2 => (file.data_len as i64).saturating_add(offset).max(0) as usize, // SEEK_END
+        _ => return -22, // -EINVAL
+    };
+    file.pos = new_pos.min(file.data_len);
+    file.pos as i64
 }
 
 /// Close a VFS file descriptor.
 pub fn close(fd: i32) -> i64 {
     let mut files = OPEN_FILES.lock();
-    for slot in files.iter_mut() {
-        if let Some(ref file) = slot {
-            if file.fd == fd { *slot = None; return 0; }
-        }
-    }
+    fd_table::free(&mut files[..], fd); // close of an unknown fd is a benign no-op
     0
 }
 
@@ -244,7 +211,7 @@ pub fn close(fd: i32) -> i64 {
 /// wall this caused.
 pub fn is_vfs_fd(fd: i32) -> bool {
     let files = OPEN_FILES.lock();
-    files.iter().any(|slot| matches!(slot, Some(f) if f.fd == fd))
+    fd_table::find(&files[..], fd).is_some()
 }
 
 /// Initialize and log archive stats.

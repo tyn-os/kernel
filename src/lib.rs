@@ -11,6 +11,7 @@ pub mod apic;
 pub mod cpio;
 pub mod drivers;
 pub mod elf;
+pub mod fd_table;
 pub mod interrupts;
 pub mod memory;
 pub mod net;
@@ -25,6 +26,7 @@ pub mod syscall;
 pub mod pipe;
 pub mod thread;
 pub mod tmpfs;
+pub mod tmpfs_tree;
 pub mod vfs;
 
 /// Halt the CPU in a loop, waking only on interrupts.
