@@ -25,8 +25,25 @@ parses, not that it *refuses* garbage safely.
 oversized-name / huge-filesize) against it. The zero-namesize and size-overflow
 cases are the teeth. Fixed with `checked_add`/`checked_sub` + `slice::get()` + a
 `namesize == 0` guard — malformed input now returns `None`, never panics/OOBs.
-Boot-verified behavior-preserving on the real archive (`AMP_BEGIN=1`,
-`small_md5=0 large_md5=0`, no fault).
+Boot-verified behavior-preserving on the real (well-formed) archive
+(`AMP_BEGIN=1`, `small_md5=0 large_md5=0`, no fault).
+
+**Crash eliminated, not relocated — caller trace.** Returning `None` on malformed
+input only helps if callers don't then `.unwrap()` it. Audited: `cpio_lookup` has
+exactly two callers, neither of which unwraps — `vfs::exists` maps `None → false`
+(`.is_some()`), and `vfs::open` maps `None → return -2` (-ENOENT). No `unwrap` or
+`expect` on the lookup exists anywhere in `src/`. So the malformed path traces
+end to end: malformed archive → `lookup` returns `None` (unit-tested) → `open`
+returns `-ENOENT` / `exists` returns `false` → no panic at the parser *or* the
+caller. (The parser's boundary tests cover the parser half; this audit covers the
+caller half — the well-formed boot-verify only exercises the happy path.)
+
+Note the caller-side `None` arm is not merely audited — it is exercised at *every*
+boot: the kernel does many `cpio_lookup`s for paths that are legitimately absent
+(the newc format has always returned `None` on not-found), and each takes the
+same `None → -ENOENT / false` arm a malformed archive now takes. The change only
+moved malformed input from "panic in the parser" onto that already-boot-proven
+`None` path.
 
 **The data point.** Defects concentrate on the paths real workloads never take
 (cf. BUG-1: the SMP-only IPI vector, exercised by nothing until a probe forced
