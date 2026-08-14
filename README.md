@@ -43,11 +43,11 @@ The full path is `ENA hardware → admin queue → I/O queues → smoltcp → DH
 A public AMI is available in `us-east-1` — under two minutes, no build required.
 
 ```bash
-aws ec2 run-instances --image-id ami-09619e2d139f2a57d \
+aws ec2 run-instances --image-id ami-0c13cb4a868a6e441 \
     --instance-type c5.large --region us-east-1
-# open port 8080 in your security group, wait ~10s, then:
+# open port 8080 in your security group, wait ~90s for boot, then:
 curl http://<public-ip>:8080/                          # → Phoenix landing page
-curl -s http://<public-ip>:8080/assets/big.bin | wc -c  # → 1500000, a static asset via kernel sendfile
+curl -s http://<public-ip>:8080/assets/app.js | wc -c   # → 125737, a static asset via kernel sendfile
 # then open http://<public-ip>:8080/counter in a browser — the LiveView counter increments live
 ```
 

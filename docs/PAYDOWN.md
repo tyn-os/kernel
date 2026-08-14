@@ -42,17 +42,23 @@ overlap. Not ranked; each notes what it is, why it bites, and the fix if known.
   in any tracked config. *Bite:* a fresh operator can't reproduce the DB path.
   *Fix:* record provenance + where it's set; decide tracked-secret vs
   documented-external.
-- **IAM: `tyn-build-role` is missing perms (a recurring gap-class).** Two instances
-  hit so far: (1) no **`ec2:RevokeSecurityGroupIngress`**, so ≥2 in-VPC SG rules opened
+- **IAM: `tyn-build-role` is missing perms (a recurring gap-class).** Instances hit so
+  far: (1) no **`ec2:RevokeSecurityGroupIngress`**, so ≥2 in-VPC SG rules opened
   during testing (**9100** dist, **6432** TLS/pgbouncer) are **un-revokable** by the
   tooling and linger; (2) no **`iam:PassRole`** for `tyn-build-role`, so the build host
   **can't launch a fresh build instance *with* the `tyn-build-profile`** — a fresh host
   comes up with no aws access, which blocks it from self-serving the metal cut and
-  forces keeping the old (role-bearing) host alive just for aws (paying double). *Fix:*
-  one IAM policy addition on `tyn-build-role` grants the class — add `iam:PassRole` (on
-  `tyn-build-role`) + `ec2:RevokeSecurityGroupIngress`; then a fresh build host is
-  self-sufficient (attach the profile at launch) and stale SG rules can be revoked.
-  Audit the role for the whole ec2/iam action set the build/deploy flow needs, once.
+  forces keeping the old (role-bearing) host alive just for aws (paying double);
+  (3) **the whole AMI-lifecycle publish/cleanup set** — no **`ec2:ModifyImageAttribute`**
+  (can't make a demo AMI public), **`ec2:DescribeImageAttribute`**, **`ec2:DeregisterImage`**,
+  **`ec2:DeleteSnapshot`** — so the build host can build + validate a demo AMI but **can't
+  publish it or deregister stale AMIs / delete their snapshots** (the `REBUILD_DEMO_AMI`
+  flow stalls at publish; done via console instead). *Fix:* one IAM policy addition on
+  `tyn-build-role` grants the class — `iam:PassRole` (on `tyn-build-role`) +
+  `ec2:RevokeSecurityGroupIngress` + `ec2:ModifyImageAttribute` + `ec2:DescribeImageAttribute`
+  + `ec2:DeregisterImage` + `ec2:DeleteSnapshot`; then a fresh build host is self-sufficient
+  and the demo-AMI lifecycle is self-serve. Audit the role for the whole ec2/iam action set
+  the build/deploy flow needs, once.
 
 ## Kernel hardening
 
