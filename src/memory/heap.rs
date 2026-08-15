@@ -36,3 +36,21 @@ pub fn init_static() {
         ALLOCATOR.lock().init(start, HEAP_SIZE);
     }
 }
+
+/// Total heap size in bytes (the static array).
+pub const fn total_bytes() -> usize {
+    HEAP_SIZE
+}
+
+/// Current free bytes in the kernel heap. O(1) — `linked_list_allocator`
+/// tracks `used` incrementally, so this is `size − used`, not a list walk.
+///
+/// Used by the socket accept path for heap-headroom backpressure (BUG-8): a
+/// connection flood otherwise grows the smoltcp `SocketSet` (~34 KiB of buffers
+/// per accepted stream — a 2 KiB RX + a 32 KiB TX; that 32 KiB TX is the exact
+/// allocation that failed at the panic) until a failed alloc panics the kernel.
+/// Reading free heap and refusing to accept below a reserve caps the heap
+/// directly, independent of per-connection cost.
+pub fn free_bytes() -> usize {
+    ALLOCATOR.lock().free()
+}

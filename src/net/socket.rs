@@ -47,6 +47,28 @@ const MAX_SOCKETS: usize = 256;
 /// taken literally as a socket count.
 const LISTENER_POOL_SIZE: usize = 64;
 
+/// BUG-8 — kernel-heap reserve that gates the accept path against a
+/// connection-flood DoS.
+///
+/// The bug: a single unauthenticated client holding ~1000–1250 concurrent TCP
+/// connections exhausted the shared 16 MiB kernel heap and panicked the kernel
+/// (`alloc.rs:573`, a failed 32 KiB allocation — which is exactly the 32 KiB TX
+/// buffer `install_fresh_listener` reserves per connection: see LISTENER_BUF_SIZE
+/// / the TX buffer below, ~34 KiB total per accepted stream). tmpfs already caps
+/// itself to protect this heap; the accept path did not.
+///
+/// The fix is heap-headroom **backpressure**, not a connection *count* cap — the
+/// per-connection cost (~34 KiB) makes a safe count hard to pin, whereas free
+/// heap is the invariant that actually matters and self-tunes. `sys_accept`
+/// refuses to consume a new established connection while free heap is below this
+/// reserve; the connection stays in the listener pool and smoltcp RSTs the
+/// overflow at the SYN — a clean reject, no heap growth, no panic. The reserve
+/// (4 MiB) keeps room for tmpfs (≤4 MiB is its own cap), the scheduler, and
+/// in-flight allocation spikes, and is far above any single allocation (the
+/// 32 KiB TX buffer, the ~216 KiB SocketSet `Vec` growth) so an accept can never
+/// be the allocation that fails.
+const ACCEPT_HEAP_RESERVE: usize = 4 * 1024 * 1024;
+
 /// Socket type
 #[derive(Clone, Copy, PartialEq)]
 enum SockType {
@@ -364,6 +386,16 @@ pub fn sys_bind(fd: i32, addr_ptr: *const u8, _addrlen: u32) -> i64 {
 /// refills the slot. The user-passed `backlog` is ignored — see the
 /// LISTENER_POOL_SIZE docs.
 pub fn sys_listen(fd: i32, _backlog: i32) -> i64 {
+    // BUG-8: baseline heap at listen time, so the accept-reserve can be sized/
+    // read against a real number (free must stay comfortably above the reserve
+    // for legit concurrency; free never dropping below it is what stops the DoS).
+    serial_println!(
+        "[net] listen fd={} — kernel heap free {} KiB / {} KiB (accept reserve {} KiB)",
+        fd,
+        crate::memory::heap::free_bytes() / 1024,
+        crate::memory::heap::total_bytes() / 1024,
+        ACCEPT_HEAP_RESERVE / 1024
+    );
     with_socket(fd, |sock| {
         sock.sock_type = SockType::TcpListener;
         crate::net::with_net(|net| {
@@ -445,6 +477,20 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
 
         let result = with_socket(fd, |sock| {
             crate::net::with_net(|net| {
+                // BUG-8 heap-headroom backpressure decision, evaluated once per
+                // capture attempt (under SOCKETS + NET): below the reserve we must
+                // not create a new stream (each retains ~34 KiB and consuming one
+                // also installs a fresh ~34 KiB listener — a flood otherwise grows
+                // the SocketSet until a 32 KiB TX-buffer alloc fails and panics the
+                // kernel). But we must NOT simply leave the established connection
+                // in the pool: that strands it in a pool slot forever, and once all
+                // 64 slots are stranded the listener is dead even after the flood
+                // ends (no recovery). Instead, when over budget, we RESET the
+                // connection's socket back to a listener in place — abort() RSTs the
+                // client, listen() reuses the same buffers (no alloc under low heap)
+                // — so the pool stays full and the node recovers once the flood
+                // stops and heap frees.
+                let over_budget = crate::memory::heap::free_bytes() < ACCEPT_HEAP_RESERVE;
                 let endpoint = if listen_addr == Ipv4Address::UNSPECIFIED {
                     IpListenEndpoint { addr: None, port: listen_port }
                 } else {
@@ -462,6 +508,15 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
                 if primary_state == tcp::State::Established
                     || primary_state == tcp::State::CloseWait
                 {
+                    if over_budget {
+                        // Reject in place: RST + re-listen on the same socket,
+                        // reusing its buffers. Keeps the pool slot alive so the
+                        // node recovers after the flood.
+                        let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                        tcp.abort();
+                        tcp.listen(endpoint).ok();
+                        return None;
+                    }
                     let accepted = sock.handle;
                     let remote = net.sockets
                         .get_mut::<tcp::Socket>(accepted)
@@ -477,6 +532,12 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
                     if state == tcp::State::Established
                         || state == tcp::State::CloseWait
                     {
+                        if over_budget {
+                            let tcp = net.sockets.get_mut::<tcp::Socket>(h);
+                            tcp.abort();
+                            tcp.listen(endpoint).ok();
+                            return None;
+                        }
                         let remote = net.sockets
                             .get_mut::<tcp::Socket>(h)
                             .remote_endpoint();
