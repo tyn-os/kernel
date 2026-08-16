@@ -150,3 +150,27 @@ test written.** (Serial *input* for the eval shell reads on demand in
 `syscall.rs`; also not a ring.) Recorded as a truthful gap rather than a
 manufactured test — a green count padded with a fake serial-ring test is exactly
 the failure mode this whole exercise exists to catch.
+
+## Layer-3 fuzz — `tests/fuzz.rs`
+
+Coverage-*un*guided, high-volume random hammering of the attacker-influenced pure
+cores with **content invariants** (not just no-panic), deterministic PRNG (fixed
+seed, reproducible), ~6.5M inputs, part of the every-build `cargo test` tier.
+
+**Tested (invariants):** cpio::lookup never returns an out-of-bounds `(off,len)`
+range + parse_hex never panics; tmpfs_tree path helpers never panic + `norm`
+idempotent; `grant_write` never lets accounted bytes exceed the cap; fd_table
+alloc/find/free keep the live set consistent. Teeth-proven: a planted OOB (dropped
+`data_end` bounds check in cpio) fails the suite.
+
+**Not covered / gap (named, not faked):**
+- **In-situ syscall fuzzing of memory pointer/size args is BLOCKED** (read/write/
+  sendfile/recv …). Tyn identity-maps 0–4 GiB, so a bad pointer/oversized length
+  **silently corrupts adjacent memory instead of faulting** (the SYSTEMIC HAZARD in
+  BUGS.md) — a kernel-side fuzzer there would corrupt, not cleanly report, so the
+  result would be inconclusive. Guard pages under thread stacks/buffers would turn
+  this class into clean faults and unblock it. The fd/flag/int arg space *is* safely
+  in-situ-fuzzable (a kernel harness driving the dispatch) — the next Layer-3 step.
+- **Not coverage-guided.** This is the zero-setup random tier; cargo-fuzz/libfuzzer
+  (coverage-guided) would reach edges a fixed-seed random walk misses — an upgrade
+  once the toolchain (cargo-fuzz + clang/llvm) is installed on the build host.
