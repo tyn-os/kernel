@@ -143,8 +143,21 @@ static RECYCLED_FDS: spin::Mutex<Vec<i32>> = spin::Mutex::new(Vec::new());
 /// `gc_closed_handles()` observes the state has reached `Closed`.
 ///
 /// Lock order: SOCKETS → CLOSING_HANDLES → NET_LOCK.
-static CLOSING_HANDLES: spin::Mutex<Vec<SocketHandle>> =
+///
+/// Each entry pairs the handle with the uptime-ms it entered closing, so the
+/// BUG-8 teardown reaper (`gc_closed_handles`) can age out sockets stranded in a
+/// half-closed state (a connection flood FIN-closes accepted streams whose peers
+/// have vanished; they sit in FinWait forever and never reach Closed, leaking
+/// ~34 KiB each — which pins the heap at the accept reserve and blocks recovery).
+static CLOSING_HANDLES: spin::Mutex<Vec<(SocketHandle, u64)>> =
     spin::Mutex::new(Vec::new());
+
+/// BUG-8 teardown-reaper timeout. A socket in the CLOSING_HANDLES list that has
+/// not reached Closed/TimeWait within this window is force-`abort()`ed (RST) so
+/// the reap path frees it. Sized to spare legitimate slow closes (which complete
+/// in ms–seconds) while reaping the stranded flood sockets (which sit forever):
+/// 15 s is well past any real close but a bounded recovery delay after a flood.
+const CLOSING_REAP_MS: u64 = 15_000;
 
 /// Check if an fd is a socket fd.
 pub fn is_socket_fd(fd: i32) -> bool {
@@ -558,7 +571,7 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
         crate::sched::yield_current();
     };
 
-    crate::serial_println!("[accept] connection established!");
+    crate::vdbg!("[accept] connection established!");
 
     let new_fd = alloc_fd();
     let nonblock = (flags & 0x800) != 0;
@@ -596,7 +609,7 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
         }
     }
 
-    crate::serial_println!("[accept] returning new_fd={}", new_fd);
+    crate::vdbg!("[accept] returning new_fd={}", new_fd);
     new_fd as i64
 }
 
@@ -992,7 +1005,7 @@ pub fn close(fd: i32) {
                 // sequential 1000). Stick with FIN; the larger
                 // SocketSet is the lesser cost.
                 tcp.close();
-                CLOSING_HANDLES.lock().push(sock.handle);
+                CLOSING_HANDLES.lock().push((sock.handle, net.uptime_ms()));
             }
             SockType::TcpListener => {
                 let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
@@ -1028,12 +1041,28 @@ pub fn close(fd: i32) {
 ///
 /// Caller holds NET_LOCK (via `with_net`).
 pub fn gc_closed_handles(net: &mut crate::net::NetState) {
+    // SMP note: called from NetState::poll() under the net lock, so the
+    // state read + abort() + remove() below are serialized with the accept path
+    // (which also touches the SocketSet only under that lock). No other CPU can
+    // mutate a socket mid-reap. CLOSING_HANDLES is a leaf lock (same order as
+    // close(): net -> CLOSING_HANDLES).
+    let now = net.uptime_ms();
     let mut closing = CLOSING_HANDLES.lock();
     let mut i = 0;
     while i < closing.len() {
-        let h = closing[i];
+        let (h, t0) = closing[i];
         let state = net.sockets.get::<tcp::Socket>(h).state();
-        if state == tcp::State::Closed || state == tcp::State::TimeWait {
+        let done = state == tcp::State::Closed || state == tcp::State::TimeWait;
+        // BUG-8 teardown reaper: a socket still not Closed after CLOSING_REAP_MS
+        // is stranded mid-teardown (the flood signature — the peer vanished after
+        // our FIN, so it sits in FinWait/LastAck forever, leaking ~34 KiB). Force
+        // it to Closed with abort() so it frees this pass. The timeout spares
+        // legit closes (ms–seconds); only genuinely-stuck sockets age out.
+        let stranded = !done && now.wrapping_sub(t0) >= CLOSING_REAP_MS;
+        if stranded {
+            net.sockets.get_mut::<tcp::Socket>(h).abort();
+        }
+        if done || stranded {
             net.sockets.remove(h);
             closing.swap_remove(i);
         } else {

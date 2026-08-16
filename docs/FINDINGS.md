@@ -23,19 +23,22 @@ where Layer 2 (adversarial) aimed: crash-under-hostile-input on an unreached pat
 The reproducer (`tests/resiliency/fd_flood.py` + `nitro_flood_repro.sh`) pins it
 deterministically on real SMP: ramp 250/500/750/1000 healthy → 1250 panic.
 
-**Fix status: PARTIAL (do not consider BUG-8 closed).** Heap-headroom
-backpressure — `sys_accept` refuses to consume an established connection while
-free heap < a 4 MiB reserve (`src/memory/heap.rs::free_bytes()`,
-`ACCEPT_HEAP_RESERVE`). Validated on real Nitro: **no kernel panic under a
-sustained 4000-connection flood** (the security-critical kernel-death is closed).
-It is SMP-correct by construction (the shared state is the real heap, maintained
-atomically by the allocator; no manual counter to drift). **Open:** the node does
-not *recover* after the flood (serves 0/80 afterward) — a wedge not resolved by
-the reject-in-place pool reset, cause not yet pinned (held streams not closing /
-BEAM-level wedge / slow recovery). Needs an instrumented diagnostic pass, not more
-blind Nitro iteration. An earlier accepted-stream **count** cap failed because the
-per-connection cost (~34 KiB) makes a safe count sit below the panic point and
-hard to size — free-heap backpressure measures the real invariant instead.
+**Fix status: CLOSED (2026-08-16) — see BUGS.md BUG-8; two parts.** (1)
+Heap-headroom backpressure — `sys_accept` refuses to consume an established
+connection while free heap < a 4 MiB reserve (`src/memory/heap.rs::free_bytes()`,
+`ACCEPT_HEAP_RESERVE`) → no kernel panic under a sustained 4000-connection flood.
+SMP-correct by construction (the shared state is the real heap, no manual counter
+to drift). (2) A teardown reaper — the panic-fix exposed a second defect: accepted
+flood streams get FIN-closed but the abandoned peers never finish the handshake,
+so sockets strand in FinWait forever (`gc_closed_handles` only reaped Closed/
+TimeWait), leaking ~34 KiB each (measured 219 ≈ 7.5 MiB) → heap pinned at the
+reserve → no recovery. The reaper force-`abort()`s sockets stuck in a half-closed
+state past `CLOSING_REAP_MS` (15 s, spares legit closes) → heap recovers. Both
+**named/proven by direct measurement** (the `[diag]` heap+socket-state trace):
+post-flood `heap_free` 4→11.5 MiB, `closing` 219→0, /health recovers, 80/80
+legit-close churn served. An earlier accepted-stream **count** cap failed because
+the per-connection cost (~34 KiB) makes a safe count sit below the panic point —
+cap the resource that actually fails (free heap), not a proxy.
 
 **The data point.** Same lesson as BUG-1 and the cpio OOB: defects concentrate on
 paths real workloads never take (here, hostile connection floods). And: a *count*

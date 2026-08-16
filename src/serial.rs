@@ -52,6 +52,58 @@ pub fn _print(args: ::core::fmt::Arguments) {
     });
 }
 
+/// Like `_print`, but ignores `QUIET` — for logging that must survive the
+/// post-boot `set_quiet(true)` (written when the app signals boot-complete,
+/// syscall.rs). Used by diagnostic instrumentation that needs to trace a running
+/// node past boot, when routine logging is otherwise suppressed to keep the
+/// serial-console eval shell clean. (See PAYDOWN: QUIET suppressing *all*
+/// post-boot serial logging makes the console unusable for post-boot diagnostics.)
+#[doc(hidden)]
+pub fn _print_always(args: ::core::fmt::Arguments) {
+    use core::fmt::Write;
+    use x86_64::instructions::interrupts;
+    interrupts::without_interrupts(|| {
+        let _ = SERIAL1.lock().write_fmt(args);
+    });
+}
+
+/// `serial_println!` that bypasses `QUIET` (see `_print_always`).
+#[macro_export]
+macro_rules! serial_println_always {
+    () => { $crate::serial::_print_always(format_args!("\n")) };
+    ($($arg:tt)*) => {
+        $crate::serial::_print_always(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// Verbose/debug boot logging, **off by default**. Distinct from `QUIET` (which
+/// silences routine logging only *after* boot): high-volume per-item boot spam
+/// (`[vfs] open …` per beam file, `[accept]` per connection) fills the ~64 KB
+/// EC2 console buffer *at* boot and drowns everything else, which broke
+/// console-based post-boot diagnosis (BUG-8). Gate that spam behind `vdbg!` so
+/// boot is quiet by default; flip `set_verbose(true)` to bring it back.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// Enable (`true`) or disable (`false`) verbose/debug boot logging (`vdbg!`).
+pub fn set_verbose(v: bool) {
+    VERBOSE.store(v, Ordering::Relaxed);
+}
+
+/// Whether verbose/debug logging is enabled.
+pub fn verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
+
+/// `serial_println!` gated behind the verbose flag — quiet by default.
+#[macro_export]
+macro_rules! vdbg {
+    ($($arg:tt)*) => {
+        if $crate::serial::verbose() {
+            $crate::serial_println!($($arg)*);
+        }
+    };
+}
+
 /// Prints to the serial port (COM1).
 #[macro_export]
 macro_rules! serial_print {

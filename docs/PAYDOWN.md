@@ -108,3 +108,18 @@ overlap. Not ranked; each notes what it is, why it bites, and the fix if known.
   unit/resiliency/fuzz/soak layers are planned, not shipped
   (`directions/AUDIT_AND_TESTING_PLAN.md`). Networking claims must be measured on
   **Nitro, not QEMU** (QEMU has faked bottlenecks/truncation repeatedly).
+
+## Observability / debuggability
+
+- **Post-boot serial diagnosis is hard by default — surfaced by BUG-8.** Two mechanisms
+  make the serial console unusable for diagnosing a *running* node: (1) `set_quiet(true)`
+  (`syscall.rs`, fired when the app writes `"serial_shell ready"`) suppresses **all**
+  routine `_print` logging after boot (to keep the eval shell clean), and (2) the verbose
+  `[vfs] open …` per-beam-file boot logging fills the ~64 KB EC2 console buffer. Together
+  they cost a whole Nitro diagnostic run in the BUG-8 recovery hunt (the `[diag]` trace was
+  silently dropped). **Partly paid down:** a default-off `VERBOSE`/`vdbg!` gate now hides
+  the `[vfs]`/`[accept]` boot spam, and `serial_println_always!` bypasses `QUIET` for
+  diagnostics that must survive post-boot (the `[diag]` net trace uses it, behind `VERBOSE`).
+  *Still owed:* a first-class way to **toggle `VERBOSE` at runtime** (boot.config flag /
+  serial-console command) so a running node can be traced without a rebuild, and an audit
+  of other high-volume boot logging for the same `vdbg!` gating.

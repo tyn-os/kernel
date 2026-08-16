@@ -170,10 +170,58 @@ impl NetState {
             }
         }
         socket::gc_closed_handles(self);
+
+        // [diag] BUG-8 recovery instrumentation (TEMPORARY — remove with the fix).
+        // Every ~2s: free heap + a TCP-state histogram over the whole SocketSet,
+        // to trace after a connection flood whether (a) the heap recovers or stays
+        // pinned (fix strands refused connections / teardown bug), (b) the listener
+        // pool returns to Listen or stays stuck, and (c) the kernel keeps logging
+        // while HTTP won't serve (BEAM-level wedge). now_ms() is TSC-based (no lock,
+        // no syscall), so this is safe in the poll path.
+        {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static LAST_MS: AtomicU64 = AtomicU64::new(0);
+            let ms = now_ms(self.start_tsc);
+            // Gated behind the VERBOSE debug flag (default OFF) so it's silent in
+            // production; enable with set_verbose(true) to trace a running node.
+            // Prints via serial_println_always! (below) to survive post-boot QUIET.
+            if crate::serial::verbose()
+                && ms.wrapping_sub(LAST_MS.load(Ordering::Relaxed)) >= 2000 {
+                LAST_MS.store(ms, Ordering::Relaxed);
+                let (mut total, mut listen, mut estab, mut closewait, mut closing, mut closed) =
+                    (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+                for (_h, s) in self.sockets.iter() {
+                    if let smoltcp::socket::Socket::Tcp(t) = s {
+                        total += 1;
+                        match t.state() {
+                            smoltcp::socket::tcp::State::Listen => listen += 1,
+                            smoltcp::socket::tcp::State::Established => estab += 1,
+                            smoltcp::socket::tcp::State::CloseWait => closewait += 1,
+                            smoltcp::socket::tcp::State::Closed => closed += 1,
+                            _ => closing += 1,
+                        }
+                    }
+                }
+                // _always: bypass QUIET (set true post-boot), else these are
+                // dropped exactly when we need them — during the flood/recovery.
+                crate::serial_println_always!(
+                    "[diag] t={}s heap_free={}KiB tcp[total={} listen={} estab={} closewait={} closing={} closed={}]",
+                    ms / 1000,
+                    crate::memory::heap::free_bytes() / 1024,
+                    total, listen, estab, closewait, closing, closed
+                );
+            }
+        }
     }
 
     fn now(&self) -> Instant {
         Instant::from_millis(now_ms(self.start_tsc) as i64)
+    }
+
+    /// Milliseconds since boot (TSC-based, coarse). Used by the BUG-8 teardown
+    /// reaper to age sockets stranded in a half-closed state.
+    pub(crate) fn uptime_ms(&self) -> u64 {
+        now_ms(self.start_tsc)
     }
 }
 

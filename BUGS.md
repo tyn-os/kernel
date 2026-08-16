@@ -18,6 +18,50 @@ would have made this class debuggable." Feed into the hardening backlog.
 
 ---
 
+## BUG-8 — remote connection-flood kernel-panic DoS (+ post-flood recovery wedge)
+
+**Severity:** high (security — remote, unauthenticated, single-client kernel-death DoS;
+contradicts the small-TCB/secure thesis).
+**Status:** **CLOSED (2026-08-16) — validated on real Nitro SMP (c5.xlarge).**
+
+**Measured.** A single client holding ~1000–1250 concurrent TCP connections exhausted
+the static 16 MiB shared kernel heap; a failed 32 KiB allocation (`alloc.rs:573`)
+panicked the kernel. The 32 KiB is exactly the per-connection TX buffer
+(`LISTENER_TX_BUF_SIZE`: each accepted stream/pool listener reserves 2 KiB RX + 32 KiB
+TX ≈ 34 KiB), so 16 MiB ≈ ~470 connections. Deterministic reproducer pins it — ramp
+250/500/750/1000 healthy → 1250 KERNEL PANIC (`tests/resiliency/fd_flood.py` +
+`nitro_flood_repro.sh`). tmpfs caps itself to protect this heap; the accept path did not.
+
+**Root cause = two parts.** (1) No bound on the accept path → heap exhaustion → panic.
+(2) A second defect the panic-fix exposed: accepted flood streams get FIN-closed by
+Bandit but the abandoned clients never finish the handshake, so the sockets strand in
+FinWait/LastAck forever; `gc_closed_handles` only reaped Closed/TimeWait, so they leaked
+~34 KiB each (measured: 219 sockets ≈ 7.5 MiB) → heap pinned at the reserve → node never
+recovers. Named by direct measurement (`[diag]` heap/socket-state trace on Nitro).
+
+**Fix = two parts (`src/net/socket.rs`, `src/memory/heap.rs`).**
+- **Heap-headroom backpressure:** `sys_accept` refuses to consume a new established
+  connection while free heap < a 4 MiB reserve (`ACCEPT_HEAP_RESERVE`); the connection
+  stays in the pool and smoltcp RSTs the overflow at the SYN. Caps the resource that
+  actually fails (free heap), self-tunes, SMP-correct by construction (the shared state
+  is the real heap, maintained atomically by the allocator). Baseline free ≈ 11.8 MiB →
+  ~230-connection capacity; free can never drop below the reserve, so the 32 KiB TX alloc
+  can never be the one that fails.
+- **Teardown reaper:** `gc_closed_handles` force-`abort()`s sockets stranded in a
+  half-closed state past `CLOSING_REAP_MS` (15 s — spares legit ms–s closes, reaps the
+  forever-stuck), driving them to Closed so the reap path frees the ~34 KiB → heap
+  recovers → backpressure disengages → node serves again. Synchronized under the net lock
+  (serialized with poll/accept — the BUG-1 concurrency lesson).
+
+**Validated on real Nitro SMP** (measured in the `[diag]` trace, not inferred): no panic
+under a sustained 4000-conn flood; post-flood `heap_free` climbs 4 MiB→11.5 MiB, `closing`
+drains 219→0, /health recovers (~+90 s), 80/80 legit-close churn served (no early abort =
+no data-loss regression). A *count* cap was tried and reverted (512 × 34 KiB > the heap,
+so it sat above the panic point and never engaged — cap the resource that fails, not a
+proxy). Reproducer + regression harness: `tests/resiliency/`.
+
+---
+
 ## BUG-1 — preemption trampoline clobbers the interrupted thread's SysV red zone
 
 **Severity:** high (silent wrong results — `:erlang.md5`/`binary.copy` return wrong
