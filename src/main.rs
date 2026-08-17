@@ -124,6 +124,11 @@ extern "C" fn main(mbi: *const u8) -> ! {
     // read 1970 + uptime. Monotonic time is unaffected.
     tyn_kernel::syscall::seed_wall_clock();
 
+    // Upgrade CLOCK_REALTIME to kvmclock (host-exact scaling + drift correction,
+    // ns resolution) when the hypervisor exposes it; the RTC seed above stays as
+    // the fallback. Never worse than the RTC-seeded clock.
+    tyn_kernel::pvclock::init();
+
     // Discover CPUs via ACPI MADT and initialize APIC
     let acpi_info = tyn_kernel::acpi::discover_cpus();
     if let Some(ref info) = acpi_info {

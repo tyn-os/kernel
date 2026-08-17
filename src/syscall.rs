@@ -2074,11 +2074,33 @@ pub fn seed_wall_clock() {
     }
 }
 
-/// Real wall-clock ns (UTC) = boot offset + monotonic. When unseeded the offset
-/// is 0, so this equals `monotonic_ns()` (1970+uptime) — the prior behavior.
+/// Real wall-clock ns (UTC). Prefers kvmclock (the hypervisor's exact TSC→ns
+/// scaling + host drift correction, ns resolution); falls back to the RTC-seed +
+/// calibrated-TSC path (`boot offset + monotonic`, unseeded = 1970+uptime) so it
+/// is never worse than before. Monotonic is unchanged (kvmclock is realtime-only).
 #[inline]
 fn realtime_ns() -> u64 {
+    // Pass rdtsc normalized to the BSP TSC frame — the frame the pvclock page's
+    // tsc_timestamp lives in (the STABLE reference is fixed at boot, so this need
+    // not be atomic with the page read).
+    if let Some(ns) = crate::pvclock::realtime_ns(corrected_tsc_bsp()) {
+        return ns;
+    }
     monotonic_ns().wrapping_add(WALL_OFFSET_NS.load(Ordering::Relaxed))
+}
+
+/// rdtsc normalized to the BSP TSC epoch (raw + this CPU's measured offset).
+/// Interrupts off so a migration can't apply another CPU's offset to our rdtsc.
+#[inline]
+fn corrected_tsc_bsp() -> u64 {
+    let were = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let raw = unsafe { core::arch::x86_64::_rdtsc() };
+    let cpu = unsafe { *((0xFEE0_0020u64) as *const u32) >> 24 } as usize;
+    let offset = if cpu < 16 { TSC_OFFSETS[cpu].load(Ordering::Relaxed) } else { 0 };
+    let r = (raw as i64 + offset) as u64;
+    if were { x86_64::instructions::interrupts::enable(); }
+    r
 }
 
 /// Per-CPU last returned ns; used to detect kernel-level backwards regressions.

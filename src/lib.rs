@@ -16,6 +16,7 @@ pub mod interrupts;
 pub mod memory;
 pub mod net;
 pub mod percpu;
+pub mod pvclock;
 pub mod rng;
 pub mod rtc;
 pub mod rtc_pure;
