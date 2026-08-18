@@ -1,0 +1,21 @@
+[package]
+name = "tyn_tls_nif"
+version = "0.1.0"
+edition = "2021"
+
+# staticlib -> nifs/tyn_tls.a -> tyn_tls_nif_init (static into beam.smp on Tyn).
+# cdylib    -> loadable .so with nif_init (local iteration on stock BEAM).
+[lib]
+name = "tyn_tls"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = { git = "https://github.com/RustCrypto/rustls-rustcrypto", default-features = false, features = ["alloc", "tls12", "logging"] }
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+getrandom = { version = "0.4", default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = 3

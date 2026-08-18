@@ -7,3 +7,5 @@ nifs/*.a
 nifs/*.o
 rust-nif/target/
 crypto-nif/target/
+tls-nif/target/
+tls-nif/Cargo.lock

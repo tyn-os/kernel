@@ -49,7 +49,16 @@ WORKDIR /build/otp_src_${OTP_VERSION}
 # GUI/optional apps that we never ship and that only slow the build.
 ENV CFLAGS="-O2" \
     CXXFLAGS="-O2 -std=c++17" \
-    LDFLAGS="-static"
+    # -z muldefs: two independent Rust static NIF archives (crypto = no_std,
+    # tyn_tls = std) each bundle the Rust runtime lang-items (rust_begin_unwind,
+    # __rust_alloc_error_handler, the __rust_alloc allocator shims). Linking both
+    # is a legit multiple-definition. muldefs takes the FIRST archive's copy; with
+    # crypto.a ordered first (NIF_MODULES="crypto tyn_tls") its COMPLETE EnifAlloc
+    # allocator set + panic handler win uniformly, so there is no split-allocator
+    # hazard and rustls's heap routes through enif_alloc (ERTS-accounted). Proper
+    # fix later: merge both NIFs into one crate (one runtime) — the ":crypto
+    # unify onto one primitive layer" roadmap item.
+    LDFLAGS="-static -Wl,-z,muldefs"
 # Baseline configure flags (kept identical whether or not we add static NIFs, so
 # the only variable in the spike is the NIF linkage — the bisection the plan asks
 # for). --without-ssl: Tyn has no OpenSSL (the reason for the crypto NIF work).
@@ -77,12 +86,19 @@ RUN set -eux; \
         elif [ ! -f /build/nifs/${m}.a ]; then \
           echo "FATAL: no /build/nifs/${m}.c or ${m}.a"; exit 1; \
         fi; \
-        NIF_LIST="${NIF_LIST:+${NIF_LIST},}/build/nifs/${m}.a"; \
+        # SPACE-separated, not comma: OTP's Makefile.in does
+        # `$(subst $(comma),$(space),STATIC_NIFS)` but $(space) expands empty in
+        # this context, concatenating multiple archives into one bogus path
+        # (crypto.a,tyn_tls.a -> crypto.atyn_tls.a). Passing spaces up front makes
+        # that subst a no-op. Single-NIF is unaffected (no separator).
+        NIF_LIST="${NIF_LIST:+${NIF_LIST} }/build/nifs/${m}.a"; \
       done; \
       STATIC_NIF_ARG="--enable-static-nifs=${NIF_LIST}"; \
     fi; \
     # 3. (re)configure with the static-NIF archive, then build the emulator.
-    ./configure ${CFG} ${STATIC_NIF_ARG}; \
+    # Quote STATIC_NIF_ARG so a multi-archive (space-separated) list stays ONE
+    # configure argument; skip it entirely when no NIFs (baseline build).
+    if [ -n "${STATIC_NIF_ARG}" ]; then ./configure ${CFG} "${STATIC_NIF_ARG}"; else ./configure ${CFG}; fi; \
     make -j"$(nproc)" emulator \
       || echo "NOTE: 'make emulator' returned nonzero — the erts/etc helper" \
               "binaries (erlexec, epmd, ...) don't link under -static, but Tyn" \

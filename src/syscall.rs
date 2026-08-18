@@ -856,7 +856,10 @@ fn syscall_dispatch_inner(
             }
         }
         _ => {
-            serial_println!("[syscall] UNHANDLED nr={}", nr);
+            // UNHANDLED must be loud even post-boot (set_quiet suppresses
+            // serial_println!): an unserviced syscall on the identity-map has
+            // no fault net, so it must never be silent. Trustworthy run-half.
+            crate::serial_println_always!("[syscall] UNHANDLED nr={}", nr);
             -38 // -ENOSYS
         }
     }

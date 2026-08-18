@@ -1,0 +1,4 @@
+# rustls entropy comes from OUR RDSEED->ChaCha20 CSPRNG (src/rng.rs construction),
+# via getrandom's custom backend -- NOT raw RDRAND, NOT the getrandom syscall.
+[build]
+rustflags = ['--cfg', 'getrandom_backend="custom"']
