@@ -21,6 +21,10 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 subtle = { version = "2", default-features = false }
+# A' outbound: ECDHE for OTP :ssl (generate_key/compute_key). Same crates as tls-nif.
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdh", "arithmetic"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdh", "arithmetic"] }
 
 [profile.release]
 panic = "abort"

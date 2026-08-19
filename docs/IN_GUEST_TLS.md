@@ -91,8 +91,56 @@ TLS-1.3 *signing* server) · sha2/hmac/hkdf · getrandom (thin — the CSPRNG is
 target). Overlaps the shipped `:crypto` NIF at newer versions → the "unify onto one
 primitive layer" follow-up.
 
+## Outbound TLS (client-side) — architecture: A′ (complete the crypto NIF → OTP `:ssl`)
+
+Outbound is **not** inbound reversed. Inbound needed a private key (present a cert);
+outbound needs a **CA trust store** and correct **peer verification** — the failure mode
+isn't "won't connect", it's "connects to an attacker and doesn't notice". And unlike
+inbound (Bandit's swappable `ThousandIsland.Transport` seam), **every outbound client
+hardcodes OTP `:ssl`** — `:httpc`, Mint (→ Finch → Req), and Postgrex all bottom out at
+`:ssl.connect/3` with no app-swappable transport (confirmed: `docs/CAPABILITY_MAP.md`
+row 5b, `ssl.erl:2221`).
+
+Three options were weighed:
+- **A′ — complete the crypto NIF so OTP's real `:ssl` works** (chosen).
+- **B — a rustls-backed `:ssl`-client shadow** (thesis-consistent, but reimplements the
+  `:ssl` client API incl. active-mode messages — and puts cert verification, the
+  silent-MITM surface, in the *largest new code*).
+- **C — a rustls opt-in client** (rustls, low risk, but does NOT transparently cover
+  existing libs — Postgrex/Finch keep hitting the `:ssl` wall; misses the actual use case).
+
+**A′ chosen because:** transparent for existing libs (Postgrex/Finch/`:httpc` just work —
+the real use case is TLS-to-DB + external APIs); **verification stays in battle-tested OTP
+`:ssl`**, not a hand-built shadow (B's risk placement is backwards — the highest-stakes
+part in the newest code); it **reuses the RustCrypto crates already in `tls-nif`** (barely
+moves the audit surface); and the thesis cost is small *today* (the small-safe-TCB claim is
+already isolation-pending, so "outbound on OTP Erlang TLS" dents nothing currently true —
+and OTP `:ssl` could later serve inbound too → a potential *unify*, not fragment).
+**Cost accepted:** two TLS stacks for now (rustls inbound, OTP `:ssl` outbound); outbound
+is not in a rustls TCB.
+
+### Sized scope (bounded to the TLS-1.3-client path — not "reimplement OpenSSL")
+OTP `:ssl` exercises a bounded `:crypto` surface (read from OTP source), every algorithm
+already in `tls-nif`:
+- **Wall 1:** `crypto:supports/0` must report real `public_keys`/`curves` (today `[]`);
+  then `generate_key(ecdh,·)` / `compute_key(ecdh,·)` (x25519, secp256r1/384) and
+  `verify(Alg,·)` (RSA-PSS, ECDSA, Ed25519) for the cert chain + CertificateVerify.
+  `sign` (client-cert/mTLS) is deferred. Tyn's `crypto.erl` is a shim we control, so we
+  own **both sides** of the `crypto.erl ↔ NIF` term-encoding contract (the finicky part).
+- **Wall 2:** cert/clock — clock already fixed (kvmclock); remaining = `:public_key`/`:asn1`
+  decode (asn1 pure-Erlang fallback is an empirical unknown — the probe decides) + a **CA
+  bundle** (Mozilla set, compiled in for v1; boot-config trust as follow-on).
+
+### `verify` is the security keystone
+A′'s entire advantage is that verification runs in mature OTP `:ssl` — but `:ssl` calls
+*our* `verify` NIF to check the chain. A `verify` that returns true on a bad/tampered/
+malformed input = the exact silent MITM A′ was chosen to avoid. So `verify` is
+**adversarially isolation-tested (valid→true; tampered/wrong-key/malformed→false-or-clean-
+error, NEVER true) before it is trusted under `:ssl`** — the false-cases are the teeth.
+This is A′'s RNG-equivalent: the small function where a subtle bug is catastrophic + silent.
+
 ## Follow-ups
-- Outbound TLS (client-side rustls + embedded CA bundle).
+- Outbound TLS build (A′, above): crypto-NIF asymmetric surface → OTP `:ssl`.
 - Merge `crypto` + `tyn_tls` into one crate (one runtime; retires the muldefs hack) =
   the ":crypto unify onto one primitive layer" item.
 - mTLS / client-cert verify (zero-trust-complete inbound).

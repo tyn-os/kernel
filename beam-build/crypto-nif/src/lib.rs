@@ -430,6 +430,130 @@ extern "C" fn nif_aead(env: *mut ErlNifEnv, argc: c_int, argv: *const ErlNifTerm
     }
 }
 
+// ---------- A' outbound: ECDHE for OTP :ssl ----------
+// crypto:generate_key(ecdh, Curve) -> {Public, Private} in OTP's encodings:
+//   x25519    -> {raw 32-byte public, raw 32-byte private}
+//   secp256r1 -> {uncompressed point <<4,X,Y>> (65B), scalar (32B)}
+//   secp384r1 -> {uncompressed point (97B), scalar (48B)}
+extern "C" fn nif_generate_key(env: *mut ErlNifEnv, argc: c_int, a: *const ErlNifTerm) -> ErlNifTerm {
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    unsafe {
+        if argc != 2 {
+            badarg!(env);
+        }
+        let a = core::slice::from_raw_parts(a, 2);
+        let mut tb = [0u8; 24];
+        let mut cb = [0u8; 24];
+        if get_atom(env, a[0], &mut tb) != Some("ecdh") {
+            badarg!(env);
+        }
+        let curve = match get_atom(env, a[1], &mut cb) {
+            Some(c) => c,
+            None => badarg!(env),
+        };
+        match curve {
+            "x25519" => {
+                let mut sk = [0u8; 32];
+                if getrandom(sk.as_mut_ptr(), 32, 0) != 32 {
+                    badarg!(env);
+                }
+                let secret = x25519_dalek::StaticSecret::from(sk);
+                let public = x25519_dalek::PublicKey::from(&secret);
+                tuple2(env, make_bin(env, public.as_bytes()), make_bin(env, &secret.to_bytes()))
+            }
+            "secp256r1" => loop {
+                let mut fb = [0u8; 32];
+                if getrandom(fb.as_mut_ptr(), 32, 0) != 32 {
+                    badarg!(env);
+                }
+                if let Ok(sk) = p256::SecretKey::from_slice(&fb) {
+                    let pt = sk.public_key().as_affine().to_sec1_point(false);
+                    return tuple2(env, make_bin(env, pt.as_bytes()), make_bin(env, sk.to_bytes().as_slice()));
+                }
+            },
+            "secp384r1" => loop {
+                let mut fb = [0u8; 48];
+                if getrandom(fb.as_mut_ptr(), 48, 0) != 48 {
+                    badarg!(env);
+                }
+                if let Ok(sk) = p384::SecretKey::from_slice(&fb) {
+                    let pt = sk.public_key().as_affine().to_sec1_point(false);
+                    return tuple2(env, make_bin(env, pt.as_bytes()), make_bin(env, sk.to_bytes().as_slice()));
+                }
+            },
+            _ => badarg!(env),
+        }
+    }
+}
+
+// crypto:compute_key(ecdh, PeerPublic, MyPrivate, Curve) -> SharedSecret
+//   x25519 -> 32-byte shared; NIST -> x-coordinate of the shared point.
+extern "C" fn nif_compute_key(env: *mut ErlNifEnv, argc: c_int, a: *const ErlNifTerm) -> ErlNifTerm {
+    unsafe {
+        if argc != 4 {
+            badarg!(env);
+        }
+        let a = core::slice::from_raw_parts(a, 4);
+        let mut tb = [0u8; 24];
+        let mut cb = [0u8; 24];
+        if get_atom(env, a[0], &mut tb) != Some("ecdh") {
+            badarg!(env);
+        }
+        let peer = match get_bin(env, a[1]) {
+            Some(x) => x,
+            None => badarg!(env),
+        };
+        let mine = match get_bin(env, a[2]) {
+            Some(x) => x,
+            None => badarg!(env),
+        };
+        let curve = match get_atom(env, a[3], &mut cb) {
+            Some(c) => c,
+            None => badarg!(env),
+        };
+        match curve {
+            "x25519" => {
+                if mine.len() != 32 || peer.len() != 32 {
+                    badarg!(env);
+                }
+                let mut s = [0u8; 32];
+                s.copy_from_slice(mine);
+                let mut p = [0u8; 32];
+                p.copy_from_slice(peer);
+                let secret = x25519_dalek::StaticSecret::from(s);
+                let peerpub = x25519_dalek::PublicKey::from(p);
+                let shared = secret.diffie_hellman(&peerpub);
+                make_bin(env, shared.as_bytes())
+            }
+            "secp256r1" => {
+                let sk = match p256::SecretKey::from_slice(mine) {
+                    Ok(s) => s,
+                    Err(_) => badarg!(env),
+                };
+                let pk = match p256::PublicKey::from_sec1_bytes(peer) {
+                    Ok(p) => p,
+                    Err(_) => badarg!(env),
+                };
+                let shared = p256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
+                make_bin(env, shared.raw_secret_bytes().as_slice())
+            }
+            "secp384r1" => {
+                let sk = match p384::SecretKey::from_slice(mine) {
+                    Ok(s) => s,
+                    Err(_) => badarg!(env),
+                };
+                let pk = match p384::PublicKey::from_sec1_bytes(peer) {
+                    Ok(p) => p,
+                    Err(_) => badarg!(env),
+                };
+                let shared = p384::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
+                make_bin(env, shared.raw_secret_bytes().as_slice())
+            }
+            _ => badarg!(env),
+        }
+    }
+}
+
 // ---------- entry ----------
 const NAME: &[u8] = b"crypto\0";
 const VM_VARIANT: &[u8] = b"beam.vanilla\0";
@@ -441,11 +565,13 @@ const F_PBKDF2: &[u8] = b"pbkdf2_hmac\0";
 const F_EXOR: &[u8] = b"exor\0";
 const F_HEQ: &[u8] = b"hash_equals\0";
 const F_AEAD: &[u8] = b"crypto_one_time_aead\0";
+const F_GENKEY: &[u8] = b"generate_key\0";
+const F_COMPUTEKEY: &[u8] = b"compute_key\0";
 
 struct Sync<T>(T);
 unsafe impl<T> core::marker::Sync for Sync<T> {}
 
-static FUNCS: Sync<[ErlNifFunc; 8]> = Sync([
+static FUNCS: Sync<[ErlNifFunc; 10]> = Sync([
     ErlNifFunc { name: F_RAND.as_ptr() as *const c_char, arity: 1, fptr: nif_strong_rand_bytes, flags: 0 },
     ErlNifFunc { name: F_HASH.as_ptr() as *const c_char, arity: 2, fptr: nif_hash, flags: 0 },
     ErlNifFunc { name: F_MAC.as_ptr() as *const c_char, arity: 4, fptr: nif_mac, flags: 0 },
@@ -456,13 +582,16 @@ static FUNCS: Sync<[ErlNifFunc; 8]> = Sync([
     ErlNifFunc { name: F_HEQ.as_ptr() as *const c_char, arity: 2, fptr: nif_hash_equals, flags: 0 },
     ErlNifFunc { name: F_AEAD.as_ptr() as *const c_char, arity: 6, fptr: nif_aead, flags: 0 },
     ErlNifFunc { name: F_AEAD.as_ptr() as *const c_char, arity: 7, fptr: nif_aead, flags: 0 },
+    // A' ECDHE (dirty CPU — asymmetric keygen/ECDH is heavier than symmetric ops).
+    ErlNifFunc { name: F_GENKEY.as_ptr() as *const c_char, arity: 2, fptr: nif_generate_key, flags: DIRTY_CPU },
+    ErlNifFunc { name: F_COMPUTEKEY.as_ptr() as *const c_char, arity: 4, fptr: nif_compute_key, flags: DIRTY_CPU },
 ]);
 
 static ENTRY: Sync<ErlNifEntry> = Sync(ErlNifEntry {
     major: 2,
     minor: 17,
     name: NAME.as_ptr() as *const c_char,
-    num_of_funcs: 8,
+    num_of_funcs: 10,
     funcs: FUNCS.0.as_ptr(),
     load: None,
     reload: None,
