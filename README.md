@@ -14,7 +14,7 @@ Crucially, Tyn runs the **real, unmodified ERTS** — not a reimplementation. A 
 
 ## Why
 
-- **Security** — a general-purpose kernel carries drivers and subsystems a cloud BEAM workload never touches. Tyn includes only what the BEAM needs, shrinking the trusted computing base to a few thousand lines of Rust.
+- **Security** — a general-purpose kernel carries drivers and subsystems a cloud BEAM workload never touches. Tyn includes only what the BEAM needs, shrinking the trusted computing base to a few thousand lines of Rust. That TCB is *small* today but not yet *confined*: BEAM and kernel share ring 0, so a memory-safety bug in either is unconfined. Isolating them is the load-bearing next step — see [Limitations](#limitations).
 - **Simplicity** — a Tyn image is BEAM bytecode plus the Rust kernel. No OS services, no package manager, no user accounts. Just the application and its runtime.
 - **Density** — images are megabytes, not gigabytes. More nodes per host, lower cost.
 - **Verifiability** — one runtime and a small TCB, structured so that formal verification is tractable.
@@ -58,9 +58,10 @@ The full walkthrough — security groups, the IAM-gated serial console, and depl
 - **Distributed Erlang (basic, two-node)** — native `net_kernel` distribution works node-to-node on Nitro: mutual `connect_node`, `rpc`, large-term transfer byte-exact, tick/`nodedown`. **Caveat:** it currently needs static host mapping — there is no in-guest name resolution for `.internal`-style DNS, so multi-node clustering is not yet turnkey. Single-node is the default; two-node is validated but manual.
 - **AWS Nitro deployment** — boots from a GRUB/multiboot disk image imported as an EBS snapshot. The ENA NIC (`1d0f:ec20`) is found via port-IO PCI config, since Nitro publishes no MCFG/ECAM.
 - **`:crypto`** — a from-scratch Rust NIF (RustCrypto primitives) fed by a kernel CSPRNG (RDSEED → ChaCha20), statically linked into ERTS. Passes known-answer vectors and matches upstream OTP byte-for-byte. **Unreviewed — see [Limitations](#limitations).**
+- **In-guest TLS, inbound *and* outbound** — HTTPS both terminates *and* originates inside the guest, with no plaintext hop to an edge terminator. *Inbound:* the `tyn_tls` rustls NIF behind a `ThousandIsland` transport, wired in config-only (no Bandit or app code changes). *Outbound:* OTP's own `:ssl` does verified client TLS — so `:httpc` / Finch / Postgrex just work — via Tyn's RustCrypto NIF (ECDHE + ECDSA/RSA-PSS/Ed25519 `verify`) and a pure-Erlang asn1 shim. Both proven on Nitro: TLS 1.3, cert-verified, byte-exact; `verify` (the silent-MITM keystone) passes a 22/22 adversarial suite. See [`docs/IN_GUEST_TLS.md`](docs/IN_GUEST_TLS.md), [`examples/tls/`](examples/tls/), [`tests/tls_crypto/`](tests/tls_crypto/). **Unreviewed, and TLS 1.2/mTLS not yet done — see [Limitations](#limitations).**
 - **Live eval shell** — over the AWS serial console (IAM-gated, no open port) or TCP. Evaluate Erlang or Elixir against the running BEAM.
 - **Elixir 1.18.3** on OTP 27.
-- **~50 Linux syscalls** — `mmap`, `read`, `write`, `open`, `stat`, `pipe`, `ppoll`, `futex`, `clone`, `epoll`, `select`, `readv`, `writev`, `sendfile`, `dup`, `getrandom`, …
+- **53 Linux syscalls** — `mmap`, `read`, `write`, `open`, `stat`, `pipe`, `ppoll`, `futex`, `clone`, `epoll`, `select`, `readv`, `writev`, `sendfile`, `dup`, `getrandom`, …
 - **VFS** — read-only cpio (newc) holding the OTP + Elixir `.beam` files; application images are packed by `tyn-pack`.
 - **Boot** — Multiboot1, identity-mapped 4 GiB, ELF loader for static musl binaries.
 
@@ -73,21 +74,22 @@ jit
 
 ## Limitations
 
-Tyn runs a real, unmodified OTP 27 + Phoenix stack, but it is a specialized runtime with deliberate constraints. **Read these before deploying — they are first-class, not footnotes.**
+Tyn is a specialized runtime, and these are first-class, not footnotes. They come in two kinds: **by design** — deliberate consequences of hosting one workload on KVM/Nitro, unlikely to change — and **rough edges** — real gaps being actively closed. Read both before deploying.
 
-- **In-guest TLS, inbound *and* outbound — UNREVIEWED pending audit.** *Inbound:* HTTPS terminates in-guest via the `tyn_tls` rustls NIF + a `ThousandIsland` transport (config-only), no plaintext hop to an edge terminator. *Outbound:* OTP's own `:ssl` does verified client TLS (`:httpc`/Finch/Postgrex just work) via Tyn's RustCrypto NIF (ECDHE + ECDSA/RSA-PSS/Ed25519 verify) + a pure-Erlang asn1 shim. **Both proven on Nitro** (TLS 1.3, cert-verified, byte-exact). See [`docs/IN_GUEST_TLS.md`](docs/IN_GUEST_TLS.md), [`examples/tls/`](examples/tls/), [`tests/tls_crypto/`](tests/tls_crypto/). Caveats: the pure-Rust/RustCrypto surface is **not yet externally reviewed** (RNG-review-first; `verify` is adversarially tested but the whole surface wants outside review); TLS 1.2 and mTLS are not yet done; and this is **not a *confined* TCB** (BEAM and kernel share ring 0 — see "Honest limits").
-- **Crypto is from-scratch and unreviewed.** It passes known-answer vectors and matches upstream OTP byte-for-byte, but has had **no outside security review** — don't rely on it for production session security until it has. Boot also panics without a hardware RNG (RDRAND/RDSEED; present on the c5/m5/t3 Nitro families).
-- **Wall clock is kvmclock-backed on Nitro/KVM, RTC-seeded elsewhere.** On Nitro/KVM, `CLOCK_REALTIME` uses the paravirtual clock (kvmclock) — nanosecond resolution and host-drift-corrected (validated on Nitro: matches real UTC, correct rate). Where kvmclock isn't exposed (e.g. software emulation) it falls back to an RTC-seeded, TSC-extrapolated clock: real UTC but second-resolution and drifts over long uptime. Monotonic time is exact.
+**By design**
+
 - **Writable storage is in-memory only.** `/tmp` and `/dev/shm` are a volatile tmpfs (4 MiB cap, lost on reboot), so `Plug.Upload` and scratch writes work within that budget. The application VFS is a read-only cpio; there is no persistent disk.
-- **Clustering is not turnkey.** Two-node distribution is validated but needs static host mapping (no in-guest DNS for `.internal` names). Fine for a fixed pair; not yet drop-in multi-node discovery.
 - **IPv4 only.** IPv6 socket binds are rewritten to IPv4-any at boot (stock Phoenix `runtime.exs` binds IPv6-any).
-- **Run on KVM or Nitro, not QEMU-TCG.** Under software emulation (`-accel tcg`) some images deterministically `#PF` at boot. Real hardware (Nitro, or KVM with `-enable-kvm`) is unaffected and is the standard of evidence.
-- **LiveView on a bare IP needs `check_origin`.** Phoenix returns `403` on the LiveView WebSocket when the served host doesn't match the configured URL host. `check_origin: false` is fine for a throwaway IP demo, but for production set the real host list — `false` is a cross-site WebSocket-hijacking hole on a real deployment.
+- **Runs on KVM or Nitro, not QEMU-TCG.** Under software emulation (`-accel tcg`) some images deterministically `#PF` at boot. Real hardware (Nitro, or KVM with `-enable-kvm`) is unaffected and is the standard of evidence.
+- **Wall clock is kvmclock-backed on Nitro/KVM, RTC-seeded elsewhere.** On Nitro/KVM, `CLOCK_REALTIME` uses the paravirtual clock — nanosecond resolution, host-drift-corrected (validated on Nitro). Where kvmclock isn't exposed (e.g. software emulation) it falls back to an RTC-seeded, TSC-extrapolated clock: real UTC but second-resolution and drifts over long uptime. Monotonic time is exact.
 
-<!-- TODO(verify): GP_HUNT #72 — the large-write tmpfs #GP. Confirm current status before publishing:
-     if still open, restore a "known issue" line under the tmpfs bullet; if resolved, leave omitted. -->
-<!-- TODO(verify): syscall count — "~50" used here (conservative). Reconcile with the 53 figure in
-     internal docs and state one consistently. -->
+**Working on it**
+
+- **Crypto is from-scratch and unreviewed.** The `:crypto` NIF (RustCrypto primitives, kernel-CSPRNG-fed) passes known-answer vectors and matches upstream OTP byte-for-byte, but has had **no outside security review** — don't rely on it for production session security until it has. Boot panics without a hardware RNG (RDRAND/RDSEED; present on the c5/m5/t3 Nitro families).
+- **TLS is unreviewed and partial.** In-guest TLS works both directions (see [What works](#what-works)), but: the pure-Rust/RustCrypto surface is **not yet externally reviewed** (RNG-review-first; `verify` — the silent-MITM keystone — is adversarially tested, but the whole surface wants outside review); **TLS 1.2 and mTLS are not done**; and it is **not a *confined* TCB** (BEAM and kernel share ring 0), so "TLS inside a small *safe* TCB" isn't fully true until BEAM/kernel isolation lands.
+- **Clustering is not turnkey.** Two-node distribution is validated but needs static host mapping (no in-guest DNS for `.internal` names). Fine for a fixed pair; not yet drop-in multi-node discovery.
+- **LiveView on a bare IP needs `check_origin`.** Phoenix returns `403` on the LiveView WebSocket when the served host doesn't match the configured URL host. `check_origin: false` is fine for a throwaway IP demo, but for production set the real host list — `false` is a cross-site WebSocket-hijacking hole on a real deployment.
+- **Large tmpfs writes can `#GP` (open).** A single large write to the in-memory tmpfs can currently trigger a `#GP` — the same no-guard-page / wild-pointer class as the memory-size boot faults tracked in [`BUGS.md`](BUGS.md) (GP_HUNT). Keep scratch writes within the tmpfs budget.
 
 ## Architecture
 
@@ -100,7 +102,7 @@ Tyn runs a real, unmodified OTP 27 + Phoenix stack, but it is a specialized runt
 │  ERTS / BEAM VM (unmodified · SMP · JIT)│
 ├─────────────────────────────────────────┤
 │  BEAM Host Interface (Rust)             │
-│  ~50 Linux syscalls emulated            │
+│  53 Linux syscalls emulated             │
 ├─────────────────────────────────────────┤
 │  Tyn Kernel (Rust · ~8,000 LOC)         │
 │  SMP · Memory · Networking · VFS · I/O  │
@@ -169,8 +171,7 @@ The bug-class hunts behind the current state, kept because the negative results 
 
 - [`docs/SEND_CORRUPTION.md`](docs/SEND_CORRUPTION.md) — the TCP send-path corruption hunt: eliminated hypotheses, the non-perturbing trace technique that localized it, and the `sys_writev` partial-write root cause.
 - [`docs/FUTEX_HISTORY.md`](docs/FUTEX_HISTORY.md) — the boot-path futex valve: the init-time thread-progress hazard, the ledger of rejected hypotheses, and the workaround-hygiene history.
-- [`docs/SMP_REDZONE.md`](docs/SMP_REDZONE.md) — the SMP corruption residual: how a missing IST on the wakeup IPI let its interrupt frame land in the BEAM red zone under SMP, and the multi-cut exclusion (register state, per-CPU indexing, scheduler paths) that isolated it.
-  <!-- TODO(verify): confirm this doc path/name exists; adjust or drop the link if not. -->
+- [`BUGS.md`](BUGS.md) (BUG-1) — the SMP corruption residual: how a missing IST on the wakeup IPI let its interrupt frame land in the BEAM red zone under SMP, and the multi-cut exclusion (register state, per-CPU indexing, scheduler paths) that isolated it.
 
 ## Design principles
 
