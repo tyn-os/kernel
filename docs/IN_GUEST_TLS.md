@@ -93,6 +93,14 @@ primitive layer" follow-up.
 
 ## Outbound TLS (client-side) — architecture: A′ (complete the crypto NIF → OTP `:ssl`)
 
+**Status: proven on real Nitro.** A real `:httpc` GET to a public HTTPS endpoint with
+`verify_peer` completes in-guest — TLS 1.3, cert chain validated, body byte-exact — the
+whole crypto path (ECDHE → asn1 cert-decode → cert-chain + CertificateVerify **verify** →
+AEAD record layer) running through Tyn's RustCrypto NIF + a pure-Erlang asn1 shim, driven
+by OTP's own `:ssl`. Transparent for existing libraries (`:httpc`/Finch/Postgrex) — they
+just work. Evidence: `tests/tls_crypto` (verify adversarial suite + BER differential),
+`examples/tls/` (the outbound integration + the clean-cpio assembly).
+
 Outbound is **not** inbound reversed. Inbound needed a private key (present a cert);
 outbound needs a **CA trust store** and correct **peer verification** — the failure mode
 isn't "won't connect", it's "connects to an attacker and doesn't notice". And unlike
@@ -140,7 +148,11 @@ error, NEVER true) before it is trusted under `:ssl`** — the false-cases are t
 This is A′'s RNG-equivalent: the small function where a subtle bug is catastrophic + silent.
 
 ## Follow-ups
-- Outbound TLS build (A′, above): crypto-NIF asymmetric surface → OTP `:ssl`.
+- ~~Outbound TLS (A′): crypto-NIF asymmetric surface → OTP `:ssl`~~ — **done, Nitro-proven.**
+- **TLS 1.2** and a real **CA-trust-injection** story (v1 embeds a CA bundle in the cpio);
+  **client-cert / mTLS** (outbound `sign` was deferred).
+- Fold the outbound cpio assembly (`examples/tls/aprime_pack.sh`) into `tyn-pack`
+  (a `--tls` mode) so ssl/public_key/asn1 aren't stubbed when TLS is wanted.
 - Merge `crypto` + `tyn_tls` into one crate (one runtime; retires the muldefs hack) =
   the ":crypto unify onto one primitive layer" item.
 - mTLS / client-cert verify (zero-trust-complete inbound).

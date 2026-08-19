@@ -11,10 +11,43 @@ defmodule L2app.Application do
         # and after an attack (the recovery assertion). Also the "plaintext path
         # un-regressed" control for the TLS work.
         {Bandit, plug: L2app.Router, scheme: :http, port: 8080},
-        %{id: L2app.Cap, start: {Task, :start_link, [&CapProbe.run/0]}, restart: :temporary}
+        %{id: L2app.Cap, start: {Task, :start_link, [&CapProbe.run/0]}, restart: :temporary},
+        # A' OUTBOUND TLS: a real OTP lib (:httpc) makes a verify_peer HTTPS call
+        # in-guest through Tyn's RustCrypto NIF + pure-Erlang asn1. Result logged
+        # to serial and served at /outbound (byte-exact external response).
+        %{id: L2app.Outbound, start: {Task, :start_link, [&outbound_probe/0]}, restart: :temporary}
       ] ++ tls_children()
 
     Supervisor.start_link(children, strategy: :one_for_one, name: L2app.Supervisor)
+  end
+
+  # Outbound HTTPS via OTP :ssl/:httpc (A' path). Runs once at boot after the
+  # network is up; verify_peer against the embedded Mozilla CA bundle. The whole
+  # crypto path (ECDHE, cert-chain verify, AEAD) + asn1 decode runs in-guest.
+  def outbound_probe do
+    Process.sleep(5000)
+    result =
+      try do
+        {:ok, _} = Application.ensure_all_started(:inets)
+        {:ok, _} = Application.ensure_all_started(:ssl)
+        ca_pem = File.read!("/ca-certificates.crt")
+        File.write!("/tmp/cacerts.pem", ca_pem)
+        opts = [{:ssl, [{:verify, :verify_peer}, {:cacertfile, ~c"/tmp/cacerts.pem"},
+                        {:versions, [:"tlsv1.3"]}, {:depth, 10}]}]
+        case :httpc.request(:get, {~c"https://example.com/", []}, opts, []) do
+          {:ok, {{_v, 200, _r}, _hdrs, body}} ->
+            "OUTBOUND-HTTPS: PASS 200 #{length(body)}B cert-verified via A' crypto"
+          other ->
+            "OUTBOUND-HTTPS: FAIL #{inspect(other)}"
+        end
+      rescue
+        e -> "OUTBOUND-HTTPS: ERROR #{inspect(e)}"
+      catch
+        k, v -> "OUTBOUND-HTTPS: CATCH #{inspect({k, v})}"
+      end
+
+    :persistent_term.put(:outbound_result, result)
+    Logger.info(result)
   end
 
   # In-guest inbound TLS via the tyn_tls rustls NIF. Cert+key are injected via

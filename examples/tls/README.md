@@ -21,3 +21,12 @@ tyn-pack <release> --base src/otp-rootfs.cpio -o app.cpio \
 ```
 
 The beam must be built with the NIF: `build-beam.sh --nif-modules "crypto tyn_tls"`.
+
+## Outbound TLS (A′ — OTP `:ssl` via Tyn's RustCrypto NIF)
+
+`application.ex` also shows the outbound side: `outbound_probe/0` makes a real
+`:httpc` verify_peer HTTPS request in-guest at boot (result at `/outbound`). Outbound
+needs OTP's real `:ssl`/`:public_key`/`:asn1` (not the stubs inbound uses) plus Tyn's
+verify-capable `crypto` shim and the pure-Erlang `asn1rt_nif` — **`aprime_pack.sh`** is
+the reference assembly that builds a clean single-version cpio with exactly that module
+set + an embedded CA bundle. (Folding this into `tyn-pack` as a `--tls` mode is a follow-up.)
