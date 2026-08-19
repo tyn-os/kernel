@@ -392,7 +392,18 @@ extern "C" fn nif_aead(env: *mut ErlNifEnv, argc: c_int, argv: *const ErlNifTerm
             badarg!(env); // all supported AEADs use a 12-byte nonce
         }
         let nonce = GenericArray::from_slice(iv);
-        let encrypt = argc == 6;
+        // Encrypt vs decrypt is decided by the trailing EncFlag, NOT argc:
+        //   /6: (Cipher,Key,IV,In,AAD,EncFlag=true)          -> encrypt {ct,tag}
+        //   /7 encrypt: (...,AAD,TagLen,true)                -> encrypt {ct,tag}  (a[5]=taglen)
+        //   /7 decrypt: (...,AAD,Tag,false)                  -> decrypt pt        (a[5]=tag)
+        // TLS 1.3's record layer uses the /7 ENCRYPT form, which the old
+        // `argc == 6` test mis-routed to decrypt (badarg on the taglen int).
+        let encrypt = if argc == 6 {
+            true
+        } else {
+            let mut fb = [0u8; 8];
+            get_atom(env, a[6], &mut fb) == Some("true")
+        };
 
         // returns Some((ct, tag)) for encrypt, Some(pt) for decrypt (with tag)
         macro_rules! run {
@@ -554,6 +565,118 @@ extern "C" fn nif_compute_key(env: *mut ErlNifEnv, argc: c_int, a: *const ErlNif
     }
 }
 
+// ---------- A' outbound: signature VERIFY for OTP :ssl (the security keystone) ----------
+// These are called by :ssl/:public_key to check the server cert chain +
+// CertificateVerify. They MUST return false on any invalid/tampered/malformed
+// input — a false-positive here is a silent MITM. Digests are computed shim-side
+// (crypto:hash) and passed in; Ed25519 gets the full message.
+unsafe fn bool_atom(env: *mut ErlNifEnv, ok: bool) -> ErlNifTerm {
+    atom(env, if ok { "true" } else { "false" })
+}
+
+// ecdsa_verify(Curve, PubPointUncompressed, Digest, SigDER) -> boolean
+extern "C" fn nif_ecdsa_verify(env: *mut ErlNifEnv, argc: c_int, a: *const ErlNifTerm) -> ErlNifTerm {
+    unsafe {
+        if argc != 4 {
+            badarg!(env);
+        }
+        let a = core::slice::from_raw_parts(a, 4);
+        let mut cb = [0u8; 24];
+        let curve = get_atom(env, a[0], &mut cb);
+        let (pt, dg, sg) = match (get_bin(env, a[1]), get_bin(env, a[2]), get_bin(env, a[3])) {
+            (Some(p), Some(d), Some(s)) => (p, d, s),
+            _ => return bool_atom(env, false),
+        };
+        let ok = match curve {
+            Some("secp256r1") => {
+                use p256::ecdsa::signature::hazmat::PrehashVerifier;
+                use p256::ecdsa::{Signature, VerifyingKey};
+                match (VerifyingKey::from_sec1_bytes(pt), Signature::from_der(sg)) {
+                    (Ok(vk), Ok(s)) => vk.verify_prehash(dg, &s).is_ok(),
+                    _ => false,
+                }
+            }
+            Some("secp384r1") => {
+                use p384::ecdsa::signature::hazmat::PrehashVerifier;
+                use p384::ecdsa::{Signature, VerifyingKey};
+                match (VerifyingKey::from_sec1_bytes(pt), Signature::from_der(sg)) {
+                    (Ok(vk), Ok(s)) => vk.verify_prehash(dg, &s).is_ok(),
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        bool_atom(env, ok)
+    }
+}
+
+// ed25519_verify(Pub32, Message, Sig64) -> boolean  (strict: rejects malleable sigs)
+extern "C" fn nif_ed25519_verify(env: *mut ErlNifEnv, argc: c_int, a: *const ErlNifTerm) -> ErlNifTerm {
+    unsafe {
+        if argc != 3 {
+            badarg!(env);
+        }
+        let a = core::slice::from_raw_parts(a, 3);
+        let (pk, msg, sg) = match (get_bin(env, a[0]), get_bin(env, a[1]), get_bin(env, a[2])) {
+            (Some(p), Some(m), Some(s)) => (p, m, s),
+            _ => return bool_atom(env, false),
+        };
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let pk32: Result<[u8; 32], _> = pk.try_into();
+        let sg64: Result<[u8; 64], _> = sg.try_into();
+        let ok = match (pk32, sg64) {
+            (Ok(p), Ok(s)) => match VerifyingKey::from_bytes(&p) {
+                Ok(vk) => vk.verify_strict(msg, &Signature::from_bytes(&s)).is_ok(),
+                Err(_) => false,
+            },
+            _ => false,
+        };
+        bool_atom(env, ok)
+    }
+}
+
+// rsa_verify(Padding, DigestType, E, N, Digest, Sig) -> boolean
+extern "C" fn nif_rsa_verify(env: *mut ErlNifEnv, argc: c_int, a: *const ErlNifTerm) -> ErlNifTerm {
+    use rsa::traits::SignatureScheme;
+    use rsa::{BoxedUint, Pkcs1v15Sign, Pss, RsaPublicKey};
+    use sha2_v011::{Sha256, Sha384, Sha512};
+    unsafe {
+        if argc != 6 {
+            badarg!(env);
+        }
+        let a = core::slice::from_raw_parts(a, 6);
+        let mut pb = [0u8; 32];
+        let mut tb = [0u8; 24];
+        let pad = get_atom(env, a[0], &mut pb);
+        let ty = get_atom(env, a[1], &mut tb);
+        let (e, n, dg, sg) = match (get_bin(env, a[2]), get_bin(env, a[3]), get_bin(env, a[4]), get_bin(env, a[5])) {
+            (Some(e), Some(n), Some(d), Some(s)) => (e, n, d, s),
+            _ => return bool_atom(env, false),
+        };
+        let bn = BoxedUint::from_be_slice(n, (n.len() as u32) * 8);
+        let be = BoxedUint::from_be_slice(e, (e.len() as u32) * 8);
+        let (bn, be) = match (bn, be) {
+            (Ok(bn), Ok(be)) => (bn, be),
+            _ => return bool_atom(env, false),
+        };
+        let key = match RsaPublicKey::new(bn, be) {
+            Ok(k) => k,
+            Err(_) => return bool_atom(env, false),
+        };
+        let is_pss = matches!(pad, Some("rsa_pkcs1_pss_padding"));
+        let ok = match (is_pss, ty) {
+            (true, Some("sha256")) => Pss::<Sha256>::new().verify(&key, dg, sg).is_ok(),
+            (true, Some("sha384")) => Pss::<Sha384>::new().verify(&key, dg, sg).is_ok(),
+            (true, Some("sha512")) => Pss::<Sha512>::new().verify(&key, dg, sg).is_ok(),
+            (false, Some("sha256")) => Pkcs1v15Sign::new::<Sha256>().verify(&key, dg, sg).is_ok(),
+            (false, Some("sha384")) => Pkcs1v15Sign::new::<Sha384>().verify(&key, dg, sg).is_ok(),
+            (false, Some("sha512")) => Pkcs1v15Sign::new::<Sha512>().verify(&key, dg, sg).is_ok(),
+            _ => false,
+        };
+        bool_atom(env, ok)
+    }
+}
+
 // ---------- entry ----------
 const NAME: &[u8] = b"crypto\0";
 const VM_VARIANT: &[u8] = b"beam.vanilla\0";
@@ -567,11 +690,14 @@ const F_HEQ: &[u8] = b"hash_equals\0";
 const F_AEAD: &[u8] = b"crypto_one_time_aead\0";
 const F_GENKEY: &[u8] = b"generate_key\0";
 const F_COMPUTEKEY: &[u8] = b"compute_key\0";
+const F_ECDSA_VERIFY: &[u8] = b"ecdsa_verify\0";
+const F_ED_VERIFY: &[u8] = b"ed25519_verify\0";
+const F_RSA_VERIFY: &[u8] = b"rsa_verify\0";
 
 struct Sync<T>(T);
 unsafe impl<T> core::marker::Sync for Sync<T> {}
 
-static FUNCS: Sync<[ErlNifFunc; 10]> = Sync([
+static FUNCS: Sync<[ErlNifFunc; 13]> = Sync([
     ErlNifFunc { name: F_RAND.as_ptr() as *const c_char, arity: 1, fptr: nif_strong_rand_bytes, flags: 0 },
     ErlNifFunc { name: F_HASH.as_ptr() as *const c_char, arity: 2, fptr: nif_hash, flags: 0 },
     ErlNifFunc { name: F_MAC.as_ptr() as *const c_char, arity: 4, fptr: nif_mac, flags: 0 },
@@ -585,13 +711,17 @@ static FUNCS: Sync<[ErlNifFunc; 10]> = Sync([
     // A' ECDHE (dirty CPU — asymmetric keygen/ECDH is heavier than symmetric ops).
     ErlNifFunc { name: F_GENKEY.as_ptr() as *const c_char, arity: 2, fptr: nif_generate_key, flags: DIRTY_CPU },
     ErlNifFunc { name: F_COMPUTEKEY.as_ptr() as *const c_char, arity: 4, fptr: nif_compute_key, flags: DIRTY_CPU },
+    // A' signature verify (dirty CPU — RSA/ECDSA verify is heavier than symmetric ops).
+    ErlNifFunc { name: F_ECDSA_VERIFY.as_ptr() as *const c_char, arity: 4, fptr: nif_ecdsa_verify, flags: DIRTY_CPU },
+    ErlNifFunc { name: F_ED_VERIFY.as_ptr() as *const c_char, arity: 3, fptr: nif_ed25519_verify, flags: DIRTY_CPU },
+    ErlNifFunc { name: F_RSA_VERIFY.as_ptr() as *const c_char, arity: 6, fptr: nif_rsa_verify, flags: DIRTY_CPU },
 ]);
 
 static ENTRY: Sync<ErlNifEntry> = Sync(ErlNifEntry {
     major: 2,
     minor: 17,
     name: NAME.as_ptr() as *const c_char,
-    num_of_funcs: 10,
+    num_of_funcs: 13,
     funcs: FUNCS.0.as_ptr(),
     load: None,
     reload: None,

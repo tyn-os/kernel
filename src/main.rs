@@ -180,7 +180,7 @@ extern "C" fn main(mbi: *const u8) -> ! {
     // the initialized `_dl_ns` pointer used by musl's __libc_setup_tls,
     // crashing JIT boots with #GP at 0x99cae4 / r14 = garbage). 16 MiB
     // gives headroom for any plausible BEAM build.
-    const CPIO_COPY_BASE: usize = ELF_COPY_BASE + 0x100_0000; // +16 MiB = 336 MiB
+    const CPIO_COPY_BASE: usize = ELF_COPY_BASE + 0x180_0000; // +24 MiB = 344 MiB
     assert!(HELLO_ELF.len() <= CPIO_COPY_BASE - ELF_COPY_BASE,
         "embedded ELF would overlap CPIO buffer — bump CPIO_COPY_BASE");
     // SAFETY: Destination regions are identity-mapped and above the kernel.
