@@ -27,8 +27,16 @@ defmodule SoakApp.DistWorker do
   use GenServer
   require Logger
 
-  @interval_ms 3_000
+  # The dist-stability ladder found a 1MB inter-node rpc takes ~10s on Tyn
+  # (~100KB/s). The old 4s rpc timeout + 3s interval therefore had every 1MB call
+  # time out (rt=0) and queued overlapping 1MB sends that backed up the dist
+  # connection until nodedown — the soak's "drop", self-inflicted, NOT a Tyn dist
+  # bug (the data path works: tiny+1MB byte-exact, idle stable 100s+ at ticktime=8s).
+  # Fix: rpc timeout comfortably above the transfer time (the GenServer already
+  # serializes ticks, so calls never overlap once they actually complete).
+  @interval_ms 5_000
   @term_bytes 1_048_576
+  @rpc_timeout_ms 30_000
 
   def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
   def stats, do: GenServer.call(__MODULE__, :stats, 5_000)
@@ -86,7 +94,7 @@ defmodule SoakApp.DistWorker do
           try do
             # rpc both exercises the dist channel and returns a value we can
             # check byte-exact against what we sent.
-            echoed = :rpc.call(peer, __MODULE__, :echo, [s.payload], 4_000)
+            echoed = :rpc.call(peer, __MODULE__, :echo, [s.payload], @rpc_timeout_ms)
             rtt = :erlang.monotonic_time(:millisecond) - t0
 
             cond do

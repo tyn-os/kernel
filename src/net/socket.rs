@@ -214,7 +214,17 @@ fn install_fresh_listener(
     let tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; LISTENER_TX_BUF_SIZE]);
     let listener = tcp::Socket::new(rx_buf, tx_buf);
     let h = net.sockets.add(listener);
-    net.sockets.get_mut::<tcp::Socket>(h).listen(endpoint).ok();
+    {
+        let s = net.sockets.get_mut::<tcp::Socket>(h);
+        s.listen(endpoint).ok();
+        // Nagle OFF by default. smoltcp defaults it ON; combined with delayed-ACK
+        // that collapsed throughput to ~100 KB/s (a 1 MB dist term took ~10 s).
+        // ERTS sets TCP_NODELAY on dist sockets but Tyn's setsockopt no-ops it, so
+        // default it off at creation — covers accepted (acceptor-side) connections,
+        // incl. the dist acceptor and Bandit's HTTP sockets, without relying on
+        // which fd the app targets. NODELAY is the right default for a BEAM host.
+        s.set_nagle_enabled(false);
+    }
     h
 }
 
@@ -326,6 +336,9 @@ pub fn sys_connect(fd: i32, addr_ptr: *const u8, _addrlen: u32) -> i64 {
                     // split borrow: connect needs iface context + the socket
                     let iface = &mut net.iface;
                     let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                    // Nagle OFF by default (see install_fresh_listener) — covers
+                    // the initiator side: dist connect_node + all outbound TCP.
+                    tcp.set_nagle_enabled(false);
                     match tcp.connect(iface.context(), remote, local_port) {
                         Ok(()) => -115, // -EINPROGRESS
                         Err(_) => {
@@ -687,7 +700,9 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
     match (level, optname) {
         (1, 2) | (1, 7) | (1, 8) | (1, 9) | (1, 12) | (1, 13) => 0, // SOL_SOCKET options
         (0, 1) => 0, // IP_TOS
-        (6, 1) => 0, // TCP_NODELAY
+        (6, 1) => 0, // TCP_NODELAY — no-op: Nagle is already OFF by default on all
+                     // Tyn TCP sockets (see install_fresh_listener / connect), which
+                     // is what NODELAY=1 asks for, so accepting it is correct.
         _ => 0,      // Accept all others silently
     }
 }
