@@ -95,6 +95,37 @@ fn parse_multiboot_module(mbi: *const u8) -> Option<(u32, u32)> {
 }
 
 #[unsafe(no_mangle)]
+/// Read the optional per-image distribution cookie from the cpio (`tyn_cookie`,
+/// written by `tyn-pack --cookie`). Its presence is what opts an image into
+/// distributed boot — the committable, per-deployment replacement for the old
+/// hardcoded `-setcookie` kernel constant. Returns the trimmed cookie, or None
+/// if the file is absent or empty. Called after `vfs::init()`.
+fn read_dist_cookie() -> Option<alloc::string::String> {
+    if !tyn_kernel::vfs::exists(b"tyn_cookie") {
+        return None;
+    }
+    let fd = tyn_kernel::vfs::open(b"tyn_cookie");
+    if fd < 0 {
+        return None;
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: buf is a live, identity-mapped kernel stack buffer.
+    let n = tyn_kernel::vfs::read(fd as i32, buf.as_mut_ptr(), buf.len());
+    if n <= 0 {
+        return None;
+    }
+    // Trim surrounding ASCII whitespace (a trailing newline from `printf`/`echo`).
+    let raw = &buf[..n as usize];
+    let start = raw.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(raw.len());
+    let end = raw.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |i| i + 1);
+    let trimmed = &raw[start..end];
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(alloc::string::String::from_utf8_lossy(trimmed).into_owned())
+    }
+}
+
 extern "C" fn main(mbi: *const u8) -> ! {
     serial_println!("=== Tyn Kernel v{} ===", env!("CARGO_PKG_VERSION"));
 
@@ -271,6 +302,18 @@ extern "C" fn main(mbi: *const u8) -> ! {
     }
     serial_println!("[boot] stack zeroed");
 
+    // Distributed boot is OPT-IN per image: only when the cpio carries a
+    // `tyn_cookie` file (tyn-pack --cookie) do we resolve the node's own address
+    // (drives DHCP to completion on ENA/Nitro; immediate on virtio's static IP)
+    // and inject the dist flags below. No cookie → non-distributed, and we skip
+    // the DHCP wait entirely.
+    let dist_cookie = read_dist_cookie();
+    let dist_name = if dist_cookie.is_some() {
+        tyn_kernel::net::wait_for_dist_name(15_000)
+    } else {
+        None
+    };
+
     // Build initial stack for musl CRT.
     // musl _start expects: [rsp]=argc, [rsp+8..]=argv ptrs, NULL, envp ptrs, NULL, auxv
     let mut sp = user_stack_top;
@@ -299,6 +342,13 @@ extern "C" fn main(mbi: *const u8) -> ! {
             b"-noshell\0",
             b"-noinput\0",
             b"-kernel\0", b"inet_backend\0", b"inet\0",
+            // Distribution is OPT-IN per image: a node boots distributed iff the
+            // cpio carries a `tyn_cookie` file (written by `tyn-pack --cookie`).
+            // When present, the dist flags (-name n@<dhcp-ip>, -setcookie <it>,
+            // -start_epmd false, -epmd_module tyn_epmd, fixed dist port 9100) are
+            // injected after the args loop below — per-deployment config, no
+            // hardcoded cookie in the shared kernel. Absent → non-distributed,
+            // the unchanged default.
             // Bisection probe: does proc_lib:spawn work? does
             // gen_server:start_link work? Each stage prints before AND
             // after so we can see exactly which step stalls.
@@ -367,13 +417,39 @@ extern "C" fn main(mbi: *const u8) -> ! {
             // pre-1c boot exactly.
             b"-eval\0", b"tyn_boot:start().\0",
         ];
-        let mut arg_ptrs = [0u64; 24];
+        let mut arg_ptrs = [0u64; 40];
         for (i, arg) in args.iter().enumerate() {
             sp -= 2048; // must fit longest arg (diagnostic eval strings can be 1500+ bytes)
             core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
             arg_ptrs[i] = sp;
         }
-        let argc = args.len();
+        let mut argc = args.len();
+
+        // OPT-IN distributed boot: iff the image carries a `tyn_cookie` file AND
+        // we resolved an IPv4, inject the full dist flag set — a dynamic
+        // `-name n@<dhcp-ip>` (the proven boot-arg path, made dynamic), the
+        // per-image `-setcookie <tyn_cookie>` (replaces the old hardcoded spike
+        // constant), and the EPMD-less setup (`-start_epmd false`,
+        // `-epmd_module tyn_epmd`, fixed dist port 9100). Absent either → the node
+        // boots non-distributed, the unchanged default.
+        if let (Some(name), Some(cookie)) = (dist_name.as_ref(), dist_cookie.as_ref()) {
+            let dist_args: [&[u8]; 14] = [
+                b"-name", name.as_bytes(),
+                b"-setcookie", cookie.as_bytes(),
+                b"-start_epmd", b"false",
+                b"-epmd_module", b"tyn_epmd",
+                b"-kernel", b"inet_dist_listen_min", b"9100",
+                b"-kernel", b"inet_dist_listen_max", b"9100",
+            ];
+            for a in dist_args.iter() {
+                sp -= 2048;
+                core::ptr::copy_nonoverlapping(a.as_ptr(), sp as *mut u8, a.len());
+                *((sp + a.len() as u64) as *mut u8) = 0; // NUL-terminate
+                arg_ptrs[argc] = sp;
+                argc += 1;
+            }
+            crate::serial_println!("[dist] booting distributed as {} (cookie from tyn_cookie)", name);
+        }
 
         // Put environment variables
         let envs: &[&[u8]] = &[

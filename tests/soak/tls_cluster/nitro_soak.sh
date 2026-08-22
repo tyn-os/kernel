@@ -22,9 +22,15 @@ set -u
 REGION=us-east-1
 DUR="${DUR:-9000}"                          # ~2.5 h
 INSTANCE_TYPE="${INSTANCE_TYPE:-c5.xlarge}"
-IMAGE="${IMAGE:-/dev/shm/soak-disk.raw}"
+IMAGE="${IMAGE:-/dev/shm/soak2-disk.raw}"
 SG_ID="${SG_ID:?set SG_ID (must allow 8080/8443 from you + dist ports between nodes)}"
-COOKIE="${COOKIE:-soak_$(od -An -N4 -tx1 /dev/urandom | tr -d ' ')}"
+# The dist-boot kernel sets `-setcookie tyn_spike_cookie`, so BOTH nodes share
+# that cookie already; /connect passes the same value (must match, else the
+# handshake fails auth). Not a random cookie.
+COOKIE="${COOKIE:-tyn_spike_cookie}"
+KDIR=/home/ubuntu/kernel
+REL="${REL:-/home/ubuntu/soak_app/_build/prod/rel/soak_app}"
+KERNEL="${KERNEL:-$KDIR/target/x86_64-tyn/release/tyn-kernel}"   # the dist-boot kernel
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUCKET="tyn-images-$(aws sts get-caller-identity --query Account --output text)"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -47,6 +53,21 @@ trap cleanup EXIT INT TERM
 # whole process group so instances never linger silently accruing cost.
 ( sleep $((DUR + 1800)); echo "!! DEADMAN fired — killing run"; kill -TERM -$$ 2>/dev/null ) &
 DEADMAN=$!
+
+# Build the disk with the dist-boot KERNEL + soak_app + a TLS cert (drives the
+# rustls HTTPS boundary under load). REBUILD=0 to reuse an existing IMAGE.
+if [ "${REBUILD:-1}" = 1 ]; then
+  echo "=== build disk (dist kernel=$(basename "$KERNEL")) ==="
+  CERT=/home/ubuntu/work/soak2_cert.pem; KEY_F=/home/ubuntu/work/soak2_key.pem
+  [ -f "$CERT" ] || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -nodes -keyout "$KEY_F" -out "$CERT" -days 3 -subj "/CN=soak.local" >/dev/null 2>&1
+  CPIO=/home/ubuntu/work/soak2.cpio
+  "$KDIR/tyn-pack" "$REL" --base "$KDIR/src/otp-rootfs.cpio" --cookie "$COOKIE" \
+    --env TYN_TLS_CERT_B64="$(base64 -w0 "$CERT")" --env TYN_TLS_KEY_B64="$(base64 -w0 "$KEY_F")" \
+    -o "$CPIO" >/dev/null 2>&1 || { echo "FAIL pack"; exit 1; }
+  ( cd "$KDIR" && CPIO="$CPIO" IMAGE="$IMAGE" KERNEL="$KERNEL" ./build-disk.sh ) \
+    >/tmp/soak2_bd.log 2>&1 || { echo "FAIL build-disk"; tail -6 /tmp/soak2_bd.log; exit 1; }
+fi
 
 echo "=== S3 upload + snapshot import ==="
 S3_KEY="tyn-tlssoak-${TS}.raw"
@@ -96,8 +117,9 @@ echo "=== host-driven cluster formation (IP-literal names, no DNS) ==="
 curl -s -X POST "http://$IP1:8080/connect?node=n@$PRIV2&cookie=$COOKIE"; echo
 curl -s -X POST "http://$IP2:8080/connect?node=n@$PRIV1&cookie=$COOKIE"; echo
 sleep 3
-P=$(curl -s "http://$IP1:8080/diag" | python3 -c 'import sys,json;print(json.load(sys.stdin)["dist"]["peers_connected"])' 2>/dev/null)
-[ "$P" = 1 ] || { echo "FAIL: cluster did not form (peers=$P) — check dist boot name + SG dist ports"; exit 1; }
+# Tolerant extraction (grep, not a full JSON parse — robust to any other field).
+P=$(curl -s "http://$IP1:8080/diag" | grep -oE '"peers_connected":[0-9]+' | grep -oE '[0-9]+$')
+[ "${P:-0}" -ge 1 ] 2>/dev/null || { echo "FAIL: cluster did not form (peers=$P) — check dist boot name + SG dist ports"; exit 1; }
 echo "  clustered (peers=1 both sides)"
 
 echo "=== SOAK: ${DUR}s, both nodes, restart probe ==="

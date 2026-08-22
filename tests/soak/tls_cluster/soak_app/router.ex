@@ -29,7 +29,7 @@ defmodule SoakApp.Router do
 
   get "/work" do
     body =
-      case SoakApp.DistWorker.stats() do
+      case SoakApp.DistWorker.stats_nonblocking() do
         %{peers_connected: 0} -> "WORK: no peer connected"
         %{roundtrips: n, mismatches: 0, errors: e} -> "WORK: ok roundtrips=#{n} errors=#{e}"
         %{mismatches: m} -> "WORK: MISMATCH count=#{m}"

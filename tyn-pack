@@ -63,7 +63,7 @@ EOF
 # fails to load against Tyn's Rust crypto NIF (built for the shim's function set),
 # taking :crypto (and therefore :ssl) down. Script-relative defaults fix that.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-REL=""; OUT=""; BASE="$SCRIPT_DIR/src/otp-rootfs.cpio"; TYN_ERL="$SCRIPT_DIR/src/erl"
+REL=""; OUT=""; BASE="$SCRIPT_DIR/src/otp-rootfs.cpio"; TYN_ERL="$SCRIPT_DIR/src/erl"; DIST_COOKIE=""
 APP=""; PORT=8080; PLUG=""; START_MFA=""; ENV_VARS=""
 # OTP lib dir to source core .app files (compiler/sasl/...) not bundled by an
 # include_erts:false release. Defaults to the build host's system OTP.
@@ -85,6 +85,9 @@ while [ $# -gt 0 ]; do
     --start-mfa) START_MFA="$2"; shift 2;;
     --env) ENV_VARS="$ENV_VARS
 $2"; shift 2;;   # KEY=VAL, repeatable; -> boot.config {env,...} for runtime.exs
+    --cookie) DIST_COOKIE="$2"; shift 2;;  # write /tyn_cookie -> kernel boots the node
+                                           # DISTRIBUTED (-name n@<ip> -setcookie <it>,
+                                           # EPMD-less fixed port 9100). Opt-in per image.
     -h|--help) usage;;
     -*) die "unknown option $1";;
     *) [ -z "$REL" ] && REL="$1" || die "unexpected arg $1"; shift;;
@@ -204,6 +207,14 @@ note "release layout: $nlibs apps -> lib/<app>-<vsn>/ebin/.app ($npriv with priv
 for b in crypto.beam crypto.app; do
   [ -f "$TYN_ERL/$b" ] && cp "$TYN_ERL/$b" "$STAGE/$b"
 done
+# Dist opt-in: a `tyn_cookie` file at the cpio root makes the kernel boot the node
+# distributed (n@<dhcp-ip>, that cookie, EPMD-less on port 9100). Per-image and
+# per-deployment — the committable replacement for the old hardcoded kernel cookie.
+if [ -n "$DIST_COOKIE" ]; then
+  printf '%s' "$DIST_COOKIE" > "$STAGE/tyn_cookie"
+  note "tyn_cookie -> cpio root (node boots DISTRIBUTED; needs tyn_epmd in the app ebin)"
+fi
+
 SYSCFG=$(find "$REL/releases" -name sys.config 2>/dev/null | head -1)
 [ -n "$SYSCFG" ] && cp "$SYSCFG" "$STAGE/sys.config" && note "sys.config -> cpio root"
 # Part C: ship runtime.exs so tyn_boot can evaluate it on boot (secret_key_base,

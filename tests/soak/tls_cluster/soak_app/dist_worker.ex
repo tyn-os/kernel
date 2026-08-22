@@ -106,12 +106,38 @@ defmodule SoakApp.DistWorker do
           end
       end
 
+    publish(s)
     schedule()
     {:noreply, s}
   end
 
   @doc "Remote entry point for the round-trip: echo the term straight back."
   def echo(term), do: term
+
+  @doc """
+  Non-blocking stats snapshot for /diag: reads the last published counters from
+  persistent_term and takes `peers_connected` live from Node.list(). This does
+  NOT call the GenServer — so /diag never blocks behind a tick's in-flight rpc
+  (which was 500ing /diag once a peer was connected).
+  """
+  def stats_nonblocking do
+    base = :persistent_term.get(:soak_dist_stats, %{
+      peers_configured: 0, roundtrips: 0, mismatches: 0, errors: 0,
+      last_rtt_ms: 0, last_error: "none"
+    })
+    Map.put(base, :peers_connected, length(Node.list()))
+  end
+
+  defp publish(s) do
+    :persistent_term.put(:soak_dist_stats, %{
+      peers_configured: length(s.peers),
+      roundtrips: s.roundtrips,
+      mismatches: s.mismatches,
+      errors: s.errors,
+      last_rtt_ms: s.last_rtt_ms,
+      last_error: to_string(s.last_error || "none")
+    })
+  end
 
   defp schedule, do: Process.send_after(self(), :tick, @interval_ms)
 

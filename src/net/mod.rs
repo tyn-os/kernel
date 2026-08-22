@@ -402,3 +402,50 @@ pub fn poll() {
 pub fn is_initialized() -> bool {
     unsafe { NET_STATE.is_some() }
 }
+
+/// The configured IPv4 formatted as an ERTS longname `n@a.b.c.d`, or None if no
+/// IPv4 is set yet. Formats via the address's `Display` (avoids depending on a
+/// particular smoltcp octet accessor). Used at boot to inject a dynamic `-name`
+/// so the node comes up distributed on the address it actually got.
+pub fn dist_node_name() -> Option<alloc::string::String> {
+    if !is_initialized() {
+        return None;
+    }
+    with_net(|net| {
+        net.iface.ip_addrs().iter().find_map(|cidr| match cidr {
+            IpCidr::Ipv4(v4) => Some(alloc::format!("n@{}", v4.address())),
+            _ => None,
+        })
+    })
+}
+
+/// Pump the interface (drives the DHCP DISCOVER→ACK exchange) until an IPv4
+/// lease is configured or `timeout_ms` elapses, then return the `n@<ip>`
+/// longname. Bounded so a NIC-less or DHCP-timeout boot never hangs — returns
+/// None and the node boots non-distributed (unchanged behavior). Called ONCE at
+/// boot, before the ERTS argv is built, so the address is known in time for
+/// `-name`. On virtio (static IP) this returns immediately; on ENA/Nitro it
+/// spins the poll loop until DHCP completes (~1–2 s typical).
+pub fn wait_for_dist_name(timeout_ms: u64) -> Option<alloc::string::String> {
+    if !is_initialized() {
+        crate::serial_println!("[dist] net not initialized — non-distributed boot");
+        return None;
+    }
+    crate::serial_println!("[dist] waiting up to {}ms for an IPv4 (DHCP)…", timeout_ms);
+    let deadline =
+        crate::syscall::monotonic_ns().saturating_add(timeout_ms.saturating_mul(1_000_000));
+    let mut polls: u64 = 0;
+    loop {
+        poll();
+        polls += 1;
+        if let Some(name) = dist_node_name() {
+            crate::serial_println!("[dist] got {} after {} polls", name, polls);
+            return Some(name);
+        }
+        if crate::syscall::monotonic_ns() >= deadline {
+            crate::serial_println!("[dist] no IPv4 after {}ms / {} polls — non-distributed", timeout_ms, polls);
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+}

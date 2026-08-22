@@ -30,6 +30,10 @@ defmodule SoakApp.Diag do
     %{
       # BEAM wall-clock uptime in ms (first element of the {total, since_last} pair).
       t_uptime_ms: elem(:erlang.statistics(:wall_clock), 0),
+      # Distribution readiness (dist-boot wiring): the node's own name + whether
+      # it is distributed. `nonode@nohost` / alive=false means dist-boot failed.
+      node: to_string(node()),
+      alive: :erlang.is_alive(),
       mem: %{
         total: :erlang.memory(:total),
         processes: :erlang.memory(:processes),
@@ -43,7 +47,7 @@ defmodule SoakApp.Diag do
         atom_count: :erlang.system_info(:atom_count),
         ets_count: length(:ets.all())
       },
-      dist: SoakApp.DistWorker.stats(),
+      dist: SoakApp.DistWorker.stats_nonblocking(),
       clock: %{
         system_ms: :os.system_time(:millisecond),
         monotonic_ms: :erlang.monotonic_time(:millisecond)
@@ -61,8 +65,14 @@ defmodule SoakApp.Diag do
   end
 
   defp enc(v) when is_map(v), do: to_json(v)
-  defp enc(v) when is_atom(v), do: "\"#{v}\""
-  defp enc(v) when is_binary(v), do: "\"#{v}\""
+  defp enc(v) when is_atom(v), do: enc(to_string(v))
+  # Escape backslash + quote so a last_error like inspect(...) (which contains
+  # quotes/braces) can't produce malformed JSON — that broke the soak driver's
+  # scrape and the formation peers-check.
+  defp enc(v) when is_binary(v) do
+    esc = v |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
+    "\"" <> esc <> "\""
+  end
   defp enc(v) when is_list(v), do: "[" <> Enum.map_join(v, ",", &enc/1) <> "]"
   defp enc(v) when is_integer(v), do: Integer.to_string(v)
   defp enc(v), do: "\"#{inspect(v)}\""
