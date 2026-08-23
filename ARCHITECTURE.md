@@ -61,12 +61,24 @@ Open defects: **`BUGS.md`**. Regression suites: **`tests/README.md`**,
 
 ## Honest limits
 
-- **Ring-0 everything.** No user/kernel privilege separation; BEAM and kernel share
-  ring 0. A memory-safety bug in either is unconfined.
-- **Identity-mapped 0–4 GiB, no guard pages.** A stack under/overflow does **not**
-  fault — it silently corrupts adjacent memory (`BUGS.md` → systemic hazard).
-  Guard pages under stacks are the top hardening item. Also caps images/heap near
-  the 4 GiB wall.
+- **Ring-0 everything (confinement still open).** No user/kernel privilege
+  separation; BEAM and kernel share ring 0, so a memory-safety bug in either is
+  unconfined. Enforced confinement is the **Isolation arc**
+  (`docs/ISOLATION_SCOPING.md`); Stage 0 (paging + stack guards, below) is the first
+  step, but the ring-3 / US-page boundary that would actually *confine* BEAM is not
+  yet built.
+- **Paging + partial stack guards (Isolation Stage 0, done).** The boot 1 GiB
+  huge-page map is replaced at boot by a **hybrid identity map** (`src/memory/paging.rs`):
+  GiB 0 is a splittable **2 MiB/4 KiB** hierarchy; GiB 1–3 stay **1 GiB** huge pages
+  (kept coarse — blanket 2 MiB cost a measured ~17% single-connection serving
+  throughput, and only GiB 0 needs fine granularity today). **Guard pages are
+  installed under the per-thread scheduler kernel stacks** (the `KSTACK` arena at
+  `0x0700_0000`, `src/sched.rs`): an overflow there now takes a clean `#PF` at the
+  guard instead of silently corrupting the neighbor. **Still unguarded:** the
+  per-CPU stacks (`kernel_stack`/`ist_stack`, `src/percpu.rs`, heap-embedded) and
+  thread 0's static `syscall_stack_0`. Everything stays identity-mapped and
+  supervisor-only (no US/NX yet — that is a later Isolation stage). Still caps
+  images/heap near the 4 GiB wall.
 - **BUG-1 open.** The preemption trampoline clobbers the interrupted thread's SysV
   red zone → occasional wrong `:erlang.md5`/`binary.copy`. Root cause measured,
   correct fix (Path A) pending against `docs/STACK_ALLOCATOR_INVENTORY.md`.

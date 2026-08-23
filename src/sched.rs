@@ -428,19 +428,39 @@ pub fn spawn(
     }
 
     // Allocate kernel stack. BUG-1 Path A: reserve PREEMPT_REGION_SIZE ABOVE each
-    // stack (bump the allocator by it) so the timer trampoline's per-thread preempt
-    // region [kstack_top .. +SIZE] doesn't overlap the next thread's stack base.
-    // This is the contiguous-bump path the naive red-zone fix underflowed; the
-    // usable stack stays 16 KiB, the region lives in the reserved slack above it.
+    // stack so the timer trampoline's per-thread preempt region [kstack_top .. +SIZE]
+    // doesn't overlap the next thread's stack base. The usable stack stays 16 KiB.
     // (thread 0 uses syscall_stack_0 whose region is free above it — the dead
     // syscall_stack_1 — so only this allocator needs the bump. See
     // docs/STACK_ALLOCATOR_INVENTORY.md.)
+    //
+    // Isolation Stage 0: put a 4 KiB GUARD page BELOW each stack (the overflow
+    // direction — stacks grow down) so an overflow #PFs on the guard instead of
+    // silently corrupting the neighbor (ARCHITECTURE.md's top hardening item).
+    // Per-slot layout, all 4 KiB-aligned so the guard stays page-aligned:
+    //   [ guard 4 KiB ][ usable 16 KiB ][ pad 4 KiB ] = 24 KiB stride.
+    // The 256 B preempt region lives in the top pad (invariant preserved). The
+    // arena (paging::KSTACK_ARENA_*, 16 MiB) is pre-split to 4 KiB at
+    // paging::init, so map_guard_page is a pure PTE clear (no TLB shootdown).
     const KSTACK_USABLE: u64 = 16384;
+    const GUARD_SIZE: u64 = 4096;
+    const KSTACK_STRIDE: u64 = GUARD_SIZE + KSTACK_USABLE + 4096; // 24 KiB, 4 KiB-aligned
     static KSTACK_NEXT: core::sync::atomic::AtomicU64 =
-        core::sync::atomic::AtomicU64::new(0x0700_0000);
-    let kstack_base = KSTACK_NEXT.fetch_add(
-        KSTACK_USABLE + crate::interrupts::PREEMPT_REGION_SIZE, Ordering::Relaxed);
+        core::sync::atomic::AtomicU64::new(crate::memory::paging::KSTACK_ARENA_BASE);
+    let slot = KSTACK_NEXT.fetch_add(KSTACK_STRIDE, Ordering::Relaxed);
+    // Stay within the pre-split arena (else the guard would need a runtime 2 MiB
+    // split + cross-core shootdown). 16 MiB ≈ 680 stacks — far above BEAM's count.
+    debug_assert!(
+        slot + KSTACK_STRIDE
+            <= crate::memory::paging::KSTACK_ARENA_BASE + crate::memory::paging::KSTACK_ARENA_SIZE,
+        "kernel-stack arena exhausted"
+    );
+    let guard_page = slot;
+    let kstack_base = slot + GUARD_SIZE;
     let kstack_top = kstack_base + KSTACK_USABLE;
+    // SAFETY: guard_page is the dead 4 KiB below a fresh stack, inside the
+    // pre-split arena; nothing has mapped-use of it. Not-present → overflow faults.
+    unsafe { crate::memory::paging::map_guard_page(guard_page); }
 
     // Build a kernel stack frame for the child that mirrors the syscall
     // exit path. When context-switched to, the child "returns" from the

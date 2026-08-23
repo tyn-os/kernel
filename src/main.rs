@@ -138,6 +138,16 @@ extern "C" fn main(mbi: *const u8) -> ! {
     tyn_kernel::drivers::virtio::hal::init_dma();
     tyn_kernel::interrupts::init_idt();
 
+    // Isolation Stage 0: replace the boot 1 GiB huge-page identity map with a
+    // splittable 2 MiB/4 KiB hierarchy (behavior-preserving — same 0-4 GiB
+    // identity), so guard pages (and later per-page US/NX) become expressible.
+    // Runs after init_idt (a fault during the CR3 switch is then diagnosable)
+    // and before smp::boot_aps (APs inherit this CR3 from the BSP). See
+    // docs/ISOLATION_SCOPING.md.
+    // SAFETY: called once on the BSP before APs boot; the new map is
+    // identity-equivalent to the boot map, so the CR3 switch is transparent.
+    unsafe { tyn_kernel::memory::paging::init(); }
+
     // Clear CR0.TS (Task Switched) to allow SSE instructions in user code.
     // SAFETY: Clearing TS only affects FPU/SSE lazy state saving.
     unsafe {

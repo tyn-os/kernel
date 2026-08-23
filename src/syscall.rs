@@ -445,9 +445,56 @@ extern "C" fn syscall_dispatch(
 }
 
 #[inline(always)]
+/// Isolation Stage-0 T2 harness (feature `guard_selftest`, OFF by default; never
+/// in production). One-shot: the first syscall arriving on a guarded KSTACK-arena
+/// kernel stack writes the byte just below the usable stack — i.e. the first
+/// address a downward stack overflow crosses into — which lives in the 4 KiB
+/// guard page. With the guard installed that write `#PF`s at the guard (the #PF
+/// handler prints CR2 + halts, proving the guard FIRES); the "NO FAULT" line only
+/// prints if the guard is absent (the mutation: silent corruption). A full
+/// organic recursive overflow would land in the same page but risks a #PF-during-
+/// handler #DF that obscures the address — this probes the identical mechanism
+/// with a clean, reportable fault.
+#[cfg(feature = "guard_selftest")]
+fn guard_selftest_maybe() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    let sp: u64;
+    // SAFETY: reads RSP only.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    let lo = crate::memory::paging::KSTACK_ARENA_BASE;
+    let hi = lo + crate::memory::paging::KSTACK_ARENA_SIZE;
+    if sp < lo || sp >= hi {
+        return; // not on a guarded scheduler kstack (e.g. thread 0's static stack)
+    }
+    if FIRED.swap(true, Ordering::Relaxed) {
+        return; // one-shot
+    }
+    const STRIDE: u64 = 24576; // matches sched.rs KSTACK_STRIDE
+    let guard = lo + ((sp - lo) / STRIDE) * STRIDE; // this stack's guard page base
+    let overflow_addr = guard + 4095; // kstack_base - 1: first byte an overflow hits
+    crate::serial_println!(
+        "[guard_selftest] sp={:#x}, writing guard {:#x} (expect #PF at {:#x})",
+        sp, overflow_addr, overflow_addr
+    );
+    // SAFETY: deliberately faults — this is the T2 probe. With the guard present
+    // the write #PFs and never returns; if it returns, the guard did not fire.
+    unsafe {
+        core::ptr::write_volatile(overflow_addr as *mut u8, 0xAA);
+    }
+    crate::serial_println!(
+        "[guard_selftest] NO FAULT at {:#x} — guard did NOT fire (silent corruption)",
+        overflow_addr
+    );
+}
+
 fn syscall_dispatch_inner(
     nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, _a4: u64,
 ) -> i64 {
+    #[cfg(feature = "guard_selftest")]
+    guard_selftest_maybe();
     match nr {
         SYS_WRITE => sys_write(a0 as i32, a1 as *const u8, a2 as usize),
         SYS_READ => sys_read(a0 as i32, a1 as *mut u8, a2 as usize),

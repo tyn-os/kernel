@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 authors = ["James James"]
 
+[features]
+# Isolation Stage-0 T2 harness (OFF by default; build --features guard_selftest).
+# The first syscall on a guarded kernel stack writes that stack's guard page to
+# prove the guard #PFs. Never compiled into production.
+guard_selftest = []
+
 [dependencies]
 x86_64 = "0.14"
 uart_16550 = "0.2"
