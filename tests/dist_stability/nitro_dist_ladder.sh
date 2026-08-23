@@ -76,6 +76,19 @@ echo "=== L1: tiny rpc (100B) — does ANY term frame traverse? [step-3-first di
 curl -s --max-time 8 "http://$IP1:8080/rpc?bytes=100&timeout=6000"; echo
 echo "=== L2: 1MB rpc — large-term byte-exact? ==="
 curl -s --max-time 12 "http://$IP1:8080/rpc?bytes=1048576&timeout=10000"; echo
+echo "=== L2b: SIZE SWEEP (the scaling test — throughput vs size) ==="
+echo "    rising-with-size => window/buffer-bound (#4); flat => poll-cadence/per-RT (#3/#2)"
+for B in 10000 100000 500000 1000000 2000000 4000000; do
+  R=$(curl -s --max-time 120 "http://$IP1:8080/rpc?bytes=$B&timeout=115000")
+  RTT=$(echo "$R" | grep -oE '"rtt_ms":[0-9]+' | grep -oE '[0-9]+$')
+  BX=$(echo "$R" | grep -oE '"byte_exact":true')
+  if [ -n "$RTT" ] && [ "$RTT" -gt 0 ]; then
+    KBPS=$(( 2 * B / RTT ))   # 2*B bytes (send+echo) / RTT ms  ~=  KB/s
+    echo "  bytes=$B rtt=${RTT}ms  ~${KBPS} KB/s  byte_exact=${BX:-NO}"
+  else
+    echo "  bytes=$B -> $R"
+  fi
+done
 echo "=== L3: idle stability at ticktime=8s (poll peer_count ~100s) ==="
 for i in $(seq 1 20); do
   pc1=$(curl -s --max-time 4 "http://$IP1:8080/diststat" | grep -oE '"peer_count":[0-9]+' | grep -oE '[0-9]+$')
