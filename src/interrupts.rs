@@ -41,6 +41,26 @@ pub fn init_idt() {
             .set_stack_index(0);
         // Spurious interrupt handler for APIC (vector 0xFF)
         IDT[0xFF].set_handler_fn(spurious_handler);
+
+        // Isolation Stage 2: DPL=3 int-gates for the ring-3 transition shim, so a
+        // ring-3 `int 0x80/0x81` is permitted to invoke them (a DPL=0 gate would
+        // #GP the ring-3 int — that mis-DPL is one of the mutation-teeth). Handlers
+        // are naked global_asm (swapgs/iretq); interrupt gates run IF=0. Feature-
+        // gated — never in production.
+        #[cfg(feature = "stage2_shim")]
+        {
+            extern "C" {
+                fn stage2_int80_entry();
+                fn stage2_int81_entry();
+            }
+            IDT[0x80]
+                .set_handler_addr(x86_64::VirtAddr::new(stage2_int80_entry as u64))
+                .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+            IDT[0x81]
+                .set_handler_addr(x86_64::VirtAddr::new(stage2_int81_entry as u64))
+                .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+        }
+
         IDT.load_unsafe();
     }
 }

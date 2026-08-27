@@ -202,6 +202,12 @@ extern "C" fn main(mbi: *const u8) -> ! {
     // RDRAND/RDSEED — we refuse to serve weak entropy to userspace crypto.
     tyn_kernel::rng::init();
 
+    // Isolation Stage 2: prove the ring-3 transition on a trivial shim (feature-
+    // gated, never in production). Runs on the BSP after APs are up (real -smp),
+    // before BEAM loads. BEAM still runs ring 0 this stage — the shim is additive.
+    #[cfg(feature = "stage2_shim")]
+    tyn_kernel::stage2_shim::run();
+
     // Timer starts at first clone (sys_clone sets timer_active, calls init_timer).
     // Pre-clone init must run without interrupts — timer interferes with spin-waits.
 

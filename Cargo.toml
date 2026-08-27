@@ -10,6 +10,14 @@ authors = ["James James"]
 # prove the guard #PFs. Never compiled into production.
 guard_selftest = []
 
+# Isolation Stage-2 ring-3 transition shim (OFF by default; --features stage2_shim).
+# A trivial ring-3 program proves the DPL=3 int-gate + RSP0 + swapgs + iretq
+# round-trip (T1/T3 + timing + the swapgs mutation-teeth). Never in production.
+stage2_shim = []
+# Sub-mutation: makes the excursion push a malformed iretq CS → the return-frame
+# mutation-teeth (#GP on iretq). Run separately (it halts). Implies stage2_shim.
+stage2_mut_iret = ["stage2_shim"]
+
 [dependencies]
 x86_64 = "0.14"
 uart_16550 = "0.2"

@@ -30,6 +30,29 @@ static mut PER_CPU: [*mut PerCpuData; MAX_CPUS] = [core::ptr::null_mut(); MAX_CP
 static mut GDT_PTRS: [*mut GlobalDescriptorTable; MAX_CPUS] = [core::ptr::null_mut(); MAX_CPUS];
 static mut TSS_SELS: [u16; MAX_CPUS] = [0; MAX_CPUS];
 
+/// Isolation Stage 2: DPL=3 user code/data selectors (same in every per-CPU GDT).
+/// Used to build the ring-3 `iretq` frame for the transition shim.
+static mut USER_CODE_SEL: u16 = 0;
+static mut USER_DATA_SEL: u16 = 0;
+
+/// The ring-3 user CS/SS selectors (RPL=3). Valid after the BSP's `alloc_cpu`.
+pub fn user_selectors() -> (u16, u16) {
+    unsafe {
+        (
+            *core::ptr::addr_of!(USER_CODE_SEL),
+            *core::ptr::addr_of!(USER_DATA_SEL),
+        )
+    }
+}
+
+/// RSP0 (clean kernel stack top) for `cpu_id`, or 0 if not allocated.
+pub fn rsp0(cpu_id: u32) -> u64 {
+    unsafe {
+        let p = PER_CPU[cpu_id as usize];
+        if p.is_null() { 0 } else { (*p).kernel_stack.as_ptr() as u64 + 16384 }
+    }
+}
+
 /// Allocate per-CPU data, GDT, and TSS on the heap. Can be called from any CPU.
 /// Does NOT load the GDT/TSS — call `load_cpu` on the target CPU for that.
 pub fn alloc_cpu(cpu_id: u32, apic_id: u32) {
@@ -45,16 +68,30 @@ pub fn alloc_cpu(cpu_id: u32, apic_id: u32) {
     let tss = Box::leak(Box::new(TaskStateSegment::new()));
     let ist_top = data.ist_stack.as_ptr() as u64 + 16384;
     tss.interrupt_stack_table[0] = VirtAddr::new(ist_top);
+    // Isolation Stage 2: RSP0 = the clean per-CPU kernel stack the CPU loads on a
+    // ring3→ring0 transition (the ring-3 shim's int-gate; unused while all ring 0).
+    // This is the clean-stack mechanism the scoping doc expects to dissolve BUG-1
+    // at Stage 3 (a CPL-changing interrupt no longer lands on the user red zone).
+    let kstack_top = data.kernel_stack.as_ptr() as u64 + 16384;
+    tss.privilege_stack_table[0] = VirtAddr::new(kstack_top);
 
     let gdt = Box::leak(Box::new(GlobalDescriptorTable::new()));
     gdt.add_entry(Descriptor::kernel_code_segment());  // 0x08
     gdt.add_entry(Descriptor::kernel_code_segment());  // 0x10 (CS)
     gdt.add_entry(Descriptor::kernel_data_segment());  // 0x18
-    let tss_sel = gdt.add_entry(Descriptor::tss_segment(tss)); // 0x20
+    let tss_sel = gdt.add_entry(Descriptor::tss_segment(tss)); // 0x20 (2 slots)
+    // Isolation Stage 2: DPL=3 user segments for the ring-3 transition (shim now,
+    // BEAM at Stage 3). Present but unused while everything runs ring 0 — adding
+    // GDT descriptors is inert for the ring-0 path.
+    let user_data_sel = gdt.add_entry(Descriptor::user_data_segment());
+    let user_code_sel = gdt.add_entry(Descriptor::user_code_segment());
 
     unsafe {
         GDT_PTRS[cpu_id as usize] = gdt as *mut GlobalDescriptorTable;
         TSS_SELS[cpu_id as usize] = tss_sel.0;
+        // Same layout in every per-CPU GDT, so a single global copy suffices.
+        USER_CODE_SEL = user_code_sel.0;
+        USER_DATA_SEL = user_data_sel.0;
     }
 
     serial_println!("[percpu] CPU {} (APIC {}) allocated, IST1={:#x}",

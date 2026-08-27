@@ -23,6 +23,8 @@ pub mod rtc_pure;
 pub mod sched;
 pub mod serial;
 pub mod smp;
+#[cfg(feature = "stage2_shim")]
+pub mod stage2_shim;
 pub mod syscall;
 pub mod pipe;
 pub mod thread;

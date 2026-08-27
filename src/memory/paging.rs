@@ -94,7 +94,12 @@ pub unsafe fn init() {
         for i in 0..512usize {
             pd0.entries[i] = (i as u64) * TWO_MIB | PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE;
         }
-        (*pdpt).entries[0] = phys_of(pd0) | PAGE_PRESENT | PAGE_WRITABLE;
+        // US=1 on the upper-level entries covering GiB 0 is PERMISSIVE, not a grant:
+        // the effective US is the AND across PML4E→PDPTE→PDE→PTE, so ring-3 access
+        // is decided by the *leaf* (kernel leaves stay US=0 → denied; BEAM/shim
+        // leaves marked US=1 → allowed). Without US here, a US=1 leaf is still
+        // unreachable from ring 3 (this was the Stage-1 attribution's latent gap).
+        (*pdpt).entries[0] = phys_of(pd0) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
         // GiB 1-3: keep 1 GiB huge pages (PDPTE.PS). Nothing here needs fine
         // granularity in Stage 0, so preserving the boot map's 1 GiB TLB reach
         // avoids the measured ~17% serving-throughput cost of blanket 2 MiB pages
@@ -105,7 +110,8 @@ pub unsafe fn init() {
                 gib * GIB | PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE;
         }
         let pml4 = core::ptr::addr_of_mut!(PML4);
-        (*pml4).entries[0] = phys_of(core::ptr::addr_of!(PDPT)) | PAGE_PRESENT | PAGE_WRITABLE;
+        (*pml4).entries[0] =
+            phys_of(core::ptr::addr_of!(PDPT)) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
 
         // Pre-split the kernel-stack guard arena to 4 KiB before any core (incl.
         // this one, post-CR3) can cache a 2 MiB entry for it. Guard installs are
@@ -239,6 +245,11 @@ unsafe fn attribute_regions() {
         // bss+heap, DMA, ELF-copy, cpio) — kernel .text (below 0x0F200000), the low
         // trampoline, and the kstack arena are left executable/untouched here.
         set_attrs(0x0F20_0000, 0x1A00_0000, false, true); // kernel non-exec data (NX)
+        // Isolation Stage 2: the ring-3 transition shim runs from a US=1 page in the
+        // otherwise-unused gap at 0x0C00_0000. US=1 so ring 3 can fetch/access it;
+        // executable (NX=false) so ring 3 can run the shim code. Advisory at ring 0.
+        #[cfg(feature = "stage2_shim")]
+        set_attrs(0x0C00_0000, 0x0C20_0000, true, false);
         crate::serial_println!(
             "[paging] Stage-1 US/NX attributed (BEAM US=1, kernel data NX; advisory at ring 0)"
         );
