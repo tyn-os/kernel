@@ -171,6 +171,24 @@ impl NetState {
         }
         socket::gc_closed_handles(self);
 
+        // Stage-3 P2: dump the hot-serving-path syscall counters every ~1s so a
+        // large /big fetch's syscall delta can be read from the serial (measures
+        // syscalls/MB). Feature-gated (`syscall_count`); never in production.
+        #[cfg(feature = "syscall_count")]
+        {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static SC_LAST: AtomicU64 = AtomicU64::new(0);
+            let ms = now_ms(self.start_tsc);
+            if ms.wrapping_sub(SC_LAST.load(Ordering::Relaxed)) >= 1000 {
+                SC_LAST.store(ms, Ordering::Relaxed);
+                let (w, wv, r, ep, sf, t) = crate::syscall::scount::snapshot();
+                crate::serial_println_always!(
+                    "[SYSCT] t={}ms w={} wv={} r={} ep={} sf={} total={}",
+                    ms, w, wv, r, ep, sf, t
+                );
+            }
+        }
+
         // [diag] BUG-8 recovery instrumentation (TEMPORARY — remove with the fix).
         // Every ~2s: free heap + a TCP-state histogram over the whole SocketSet,
         // to trace after a connection flood whether (a) the heap recovers or stays

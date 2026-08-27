@@ -490,9 +490,47 @@ fn guard_selftest_maybe() {
     );
 }
 
+/// Stage-3 P2 forecast: hot-serving-path syscall counters (feature `syscall_count`).
+#[cfg(feature = "syscall_count")]
+pub mod scount {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    pub static WRITE: AtomicU64 = AtomicU64::new(0);
+    pub static WRITEV: AtomicU64 = AtomicU64::new(0);
+    pub static READ: AtomicU64 = AtomicU64::new(0);
+    pub static EPOLL: AtomicU64 = AtomicU64::new(0);
+    pub static SENDFILE: AtomicU64 = AtomicU64::new(0);
+    pub static TOTAL: AtomicU64 = AtomicU64::new(0);
+    #[inline]
+    pub fn bump(nr: u64) {
+        TOTAL.fetch_add(1, Ordering::Relaxed);
+        let c = match nr {
+            1 => &WRITE,
+            20 => &WRITEV,
+            0 => &READ,
+            232 => &EPOLL,
+            40 => &SENDFILE,
+            _ => return,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+    /// (write, writev, read, epoll_wait, sendfile, total)
+    pub fn snapshot() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            WRITE.load(Ordering::Relaxed),
+            WRITEV.load(Ordering::Relaxed),
+            READ.load(Ordering::Relaxed),
+            EPOLL.load(Ordering::Relaxed),
+            SENDFILE.load(Ordering::Relaxed),
+            TOTAL.load(Ordering::Relaxed),
+        )
+    }
+}
+
 fn syscall_dispatch_inner(
     nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, _a4: u64,
 ) -> i64 {
+    #[cfg(feature = "syscall_count")]
+    scount::bump(nr);
     #[cfg(feature = "guard_selftest")]
     guard_selftest_maybe();
     match nr {

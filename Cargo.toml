@@ -18,6 +18,12 @@ stage2_shim = []
 # mutation-teeth (#GP on iretq). Run separately (it halts). Implies stage2_shim.
 stage2_mut_iret = ["stage2_shim"]
 
+# Stage-3 P2 forecast: count serving syscalls (write/writev/read/epoll_wait/
+# sendfile) + dump periodically to serial, to measure syscalls/MB on the hot
+# serving path (converts the derived ~50-100/MB into a measured number). Off by
+# default; never in production.
+syscall_count = []
+
 [dependencies]
 x86_64 = "0.14"
 uart_16550 = "0.2"
