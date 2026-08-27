@@ -27,7 +27,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_WRITABLE: u64 = 1 << 1;
+const PAGE_USER: u64 = 1 << 2; // US: user/supervisor (advisory at ring 0)
 const PAGE_HUGE: u64 = 1 << 7; // PS: 2 MiB page at PD level
+const PAGE_NX: u64 = 1 << 63; // NX: no-execute (honored — EFER.NXE is set at boot)
 /// Physical-address field of a PTE (bits 12..52), 4 KiB-aligned.
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -115,6 +117,10 @@ pub unsafe fn init() {
             off += TWO_MIB;
         }
 
+        // Isolation Stage 1: label the map (BEAM US=1, kernel US=0, NX on kernel
+        // data). Advisory at ring 0 — inert, but ready for Stage-3 ring-3 SMEP/SMAP.
+        attribute_regions();
+
         let cr3 = phys_of(pml4);
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
         crate::serial_println!(
@@ -155,6 +161,87 @@ unsafe fn ensure_pt(addr: u64) -> *mut PageTable {
             pd.entries[pd_idx] = phys_of(pt as *const PageTable) | PAGE_PRESENT | PAGE_WRITABLE;
         }
         (pd.entries[pd_idx] & ADDR_MASK) as *mut PageTable
+    }
+}
+
+#[inline]
+fn apply_attrs(entry: u64, us: bool, nx: bool) -> u64 {
+    let mut v = entry;
+    if us { v |= PAGE_USER } else { v &= !PAGE_USER }
+    if nx { v |= PAGE_NX } else { v &= !PAGE_NX }
+    v
+}
+
+/// Set US (user) and NX bits on every present page in `[start, end)`. Both bounds
+/// must be 2 MiB-aligned. Operates at the current granularity: a 2 MiB huge PDE is
+/// set on the PDE; a split (4 KiB) region is set on each present PTE (not-present
+/// guard pages are left alone). GiB 1–3 (1 GiB huge pages in the hybrid map) are
+/// skipped — nothing needing per-region US/NX lives there in Stage 1 (deferred to
+/// the Stage-3 split). Only the address/attribute bits change; the mapping does not.
+///
+/// # Safety
+/// Mutates the live page tables; call single-threaded (during `init`, before the
+/// CR3 load) or with the caller guaranteeing no concurrent walkers.
+unsafe fn set_attrs(start: u64, end: u64, us: bool, nx: bool) {
+    unsafe {
+        let mut a = start & !(TWO_MIB - 1);
+        while a < end {
+            let gib = (a / GIB) as usize;
+            if gib >= 4 {
+                break;
+            }
+            // GiB 1–3 are 1 GiB huge pages in the hybrid map — skip (Stage 3 splits).
+            if (*core::ptr::addr_of!(PDPT)).entries[gib] & PAGE_HUGE != 0 {
+                a += TWO_MIB;
+                continue;
+            }
+            let pd = &mut (*core::ptr::addr_of_mut!(PDS))[gib];
+            let pd_idx = ((a % GIB) / TWO_MIB) as usize;
+            let e = pd.entries[pd_idx];
+            if e == 0 {
+                // not mapped (shouldn't happen in the identity map) — skip
+            } else if e & PAGE_HUGE != 0 {
+                pd.entries[pd_idx] = apply_attrs(e, us, nx);
+            } else {
+                let pt = &mut *((e & ADDR_MASK) as *mut PageTable);
+                for j in 0..512usize {
+                    if pt.entries[j] & PAGE_PRESENT != 0 {
+                        pt.entries[j] = apply_attrs(pt.entries[j], us, nx);
+                    }
+                }
+            }
+            a += TWO_MIB;
+        }
+    }
+}
+
+/// Isolation Stage 1: attribute the identity map — BEAM regions US=1, kernel
+/// regions US=0, NX on non-executable data. **Advisory at ring 0** (US is ignored
+/// for access control while CPL=0, and NX only bites pages nothing executes from),
+/// so this is behaviorally INERT — it labels the map for the Stage-3 ring-3
+/// SMEP/SMAP enforcement without changing any runtime behavior now. All bounds are
+/// fixed 2 MiB-aligned constants (see docs memory map): kernel `.text` is in
+/// `[0x0F00_0000, 0x0F200000)` so everything in `[0x0F200000, 0x1A00_0000)` is
+/// non-exec kernel data regardless of exact section end. GiB 0 only (the 2 MiB PD);
+/// the JIT/MMIO in GiB 1–2 stay coarse until Stage 3 splits them for enforcement.
+///
+/// # Safety
+/// Call once during `init`, before the CR3 load.
+unsafe fn attribute_regions() {
+    unsafe {
+        // BEAM / user (US=1). ELF+brk block contains BeamAsm-independent native
+        // text (0x600000+) so it must stay executable (NX=false); the JIT region is
+        // user-RWX by necessity. Only the user stack is NX among the BEAM regions.
+        set_attrs(0x0040_0000, 0x0700_0000, true, false); // BEAM ELF image + brk heap
+        set_attrs(0x0E00_0000, 0x0E20_0000, true, true); // BEAM user stack (NX)
+        set_attrs(0x1A00_0000, 0x4000_0000, true, false); // BEAM JIT/mmap low (RWX)
+        // Kernel (US=0). NX the contiguous non-exec data block (rodata tail, data,
+        // bss+heap, DMA, ELF-copy, cpio) — kernel .text (below 0x0F200000), the low
+        // trampoline, and the kstack arena are left executable/untouched here.
+        set_attrs(0x0F20_0000, 0x1A00_0000, false, true); // kernel non-exec data (NX)
+        crate::serial_println!(
+            "[paging] Stage-1 US/NX attributed (BEAM US=1, kernel data NX; advisory at ring 0)"
+        );
     }
 }
 

@@ -147,10 +147,16 @@ valuable. No stage requires the next.
   2 MiB/4 KiB hierarchy; unmap a page under each kernel stack. *Teeth:* a deliberate
   kernel stack overflow **faults** (was: silent corruption). Delivers the machinery
   §3b needs. Independent win.
-- **Stage 1 — US/NX bits + SMEP/SMAP (still ring 0).** Mark BEAM regions US=1,
-  kernel US=0; enable SMEP/SMAP. Nothing changes behaviorally yet (BEAM still ring 0,
-  so US is advisory) but the *map* is now correct and SMEP/SMAP-clean — proven by a
-  kernel that boots + serves with SMAP on and `stac`/`clac` only at the copy points.
+- **Stage 1 — US/NX *attribution* only (still ring 0). [DONE]** Mark BEAM regions
+  US=1, kernel US=0, NX on non-exec data (`src/memory/paging.rs::attribute_regions`).
+  **Do NOT enable SMEP/SMAP here** — they gate on CPL, and with BEAM still at ring 0
+  they would fault on BEAM's *own* execution/data access (SMEP on US=1 code fetch,
+  SMAP on US=1 data read). SMEP/SMAP + the SMAP-driven copy-site *discovery* are only
+  clean once BEAM is at ring 3 (Stage 3). So Stage 1 is pure attribution — **advisory
+  and behaviorally inert** (proven: boots + serves byte-exact, throughput unchanged),
+  labeling the map for Stage-3 enforcement. It also produces a **static copy-site
+  draft** (`docs/ISOLATION_COPY_SITES.md`) by reading the ~53 handlers — the starting
+  list Stage 2/3 build against, to be SMAP-validated-complete at Stage 3.
 - **Stage 2 — Ring-3 transition plumbing (no BEAM yet).** DPL=3 segments, `TSS.RSP0`,
   `swapgs` entry/exit, `sysretq`/`iretq` return. Drive a **trivial ring-3 test shim**
   (not BEAM): it makes a few syscalls and then deliberately faults. *Teeth:* syscalls
@@ -158,11 +164,16 @@ valuable. No stage requires the next.
   kernel survives). The confinement enforcement point (today's halting `#PF` handler)
   is reworked here to *contain* rather than *halt* for ring-3 faults.
 - **Stage 3 — Move BEAM to ring 3.** Enter BEAM via `iretq` to ring 3; convert the
-  syscall return path to `sysretq`+`swapgs`; add `copy_from_user`/`copy_to_user` +
-  pointer bounds-checks across the ~53 syscalls; **rework the BUG-1 preemption
-  trampoline** for a CPL-changing timer interrupt (the frame now carries SS:RSP, and
-  `TSS.RSP0` gives a clean kernel stack — this may *simplify* BUG-1, see §7).
-  Re-validate **all** baselines. This is the stage that realizes the wedge claim.
+  syscall return path to `sysretq`+`swapgs`; **enable SMEP/SMAP** — now meaningful,
+  since CPL distinguishes kernel (0) from BEAM (3) for free (no ring-0 AC-inversion).
+  Add `copy_from_user`/`copy_to_user` + pointer bounds-checks across the ~53 syscalls;
+  the **SMAP fault-hunt under exercised load (serving + dist + file I/O) validates and
+  completes the Stage-1 static copy-site draft** (`docs/ISOLATION_COPY_SITES.md`) — any
+  site SMAP faults on that the draft lacked is a caught gap; the empirical-completeness
+  guarantee is earned here. **Rework the BUG-1 preemption trampoline** for a
+  CPL-changing timer interrupt (the frame now carries SS:RSP, and `TSS.RSP0` gives a
+  clean kernel stack — this may *simplify* BUG-1, see §7). Re-validate **all**
+  baselines. This is the stage that realizes the wedge claim.
 - **Stage 4 — Separate page tables (optional, later).** Per-domain PML4 + CR3 switch
   on syscall for address-space separation / speculative-channel defense. Costs a CR3
   reload + TLB per syscall — **only if** the threat model needs it and **only if**
