@@ -1185,15 +1185,29 @@ extern "C" fn clone_child_return() {
 
     // Switch to child's user stack and return to musl's __clone child path.
     unsafe {
+        // Stage 3a: a cloned BEAM scheduler enters RING 3 too (iretq to DPL=3),
+        // not a ring-0 jmp — else it would run at a different privilege than the
+        // main thread. Same shape as jump_to_user: cli, swapgs, build the iretq
+        // frame with the child's user stack + resume RIP, set r9=fn / rax=0, iretq.
+        let (ucode, udata) = crate::percpu::user_selectors();
+        let cs = (ucode | 3) as u64;
+        let ss = (udata | 3) as u64;
         core::arch::asm!(
-            "mov rsp, {stack}",
-            "mov r9, {r9}",
-            "xor eax, eax",  // RAX = 0
-            "sti",
-            "jmp {rcx}",
+            "cli",
+            "swapgs",
+            "push {ss}",
+            "push {stack}",
+            "push 0x202",       // RFLAGS: IF=1 + reserved bit 1
+            "push {cs}",
+            "push {rcx}",       // resume RIP (child path after __clone)
+            "mov r9, {r9}",     // child fn pointer (musl __clone)
+            "xor eax, eax",     // RAX = 0 (clone returns 0 to the child)
+            "iretq",
             stack = in(reg) stack,
             r9 = in(reg) r9,
             rcx = in(reg) rcx,
+            cs = in(reg) cs,
+            ss = in(reg) ss,
             options(noreturn),
         );
     }

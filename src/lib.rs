@@ -8,6 +8,8 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod apic;
+#[cfg(feature = "confine_probe")]
+pub mod confine_probe;
 pub mod cpio;
 pub mod drivers;
 pub mod elf;

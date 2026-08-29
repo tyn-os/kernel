@@ -100,14 +100,34 @@ pub unsafe fn init() {
         // leaves marked US=1 → allowed). Without US here, a US=1 leaf is still
         // unreachable from ring 3 (this was the Stage-1 attribution's latent gap).
         (*pdpt).entries[0] = phys_of(pd0) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+        // ---- Stage 3a TEMPORARY, BOUNDED relaxation (TRACKED — remove before ship) ----
+        // Ring-3 confinement surfaced latent NULL-base / low-address reads in *stock
+        // ERTS startup* that ring 0 silently tolerated (it iterates `&NULL[i]`, whose
+        // element null-check passes for i>0, then derefs a low kernel address — e.g.
+        // #PF cr2=0x2be4 at beam.smp:0x8f17da with rdx=0). To reach the interrupt-path
+        // and confinement teeth we boot-first: grant ring-3 READ of ONLY the low 2 MiB
+        // (0x0–0x200000: SMP trampoline + BIOS/low structures). This is bounded to
+        // pd0.entries[0] alone — the kernel image (0x0F00_0000+, pd0[0x78]), the KSTACK
+        // guard arena (0x0700_0000, pd0[0x38]), and all MMIO (GiB 3) stay US=0, so the
+        // T-confine probe (deliberate ring-3 write/read of a US=0 kernel address) still
+        // faults-and-contains. Revisit: either fix ERTS's latent low reads at source or
+        // keep this documented as a known confinement carve-out. See ISOLATION_SCOPING.
+        pd0.entries[0] |= PAGE_USER;
+        // ------------------------------------------------------------------------------
         // GiB 1-3: keep 1 GiB huge pages (PDPTE.PS). Nothing here needs fine
         // granularity in Stage 0, so preserving the boot map's 1 GiB TLB reach
         // avoids the measured ~17% serving-throughput cost of blanket 2 MiB pages
         // — it covers JIT code (the BeamAsm mmap region spills into GiB 1-2) and
         // MMIO (GiB 3). A later stage needing US/NX up here would split them then.
         for gib in 1..4u64 {
-            (*pdpt).entries[gib as usize] =
-                gib * GIB | PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE;
+            let mut e = gib * GIB | PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE;
+            // Stage 3a: GiB 1-2 hold the upper BEAM JIT/mmap (MMAP_LIMIT=0xA000_0000);
+            // ring-3 BEAM must reach it, so US=1 (permissive 1 GiB, advisory at ring 0).
+            // GiB 3 (0xC000_0000+, MMIO/APIC) stays US=0 — kernel only.
+            if gib < 3 {
+                e |= PAGE_USER;
+            }
+            (*pdpt).entries[gib as usize] = e;
         }
         let pml4 = core::ptr::addr_of_mut!(PML4);
         (*pml4).entries[0] =
@@ -178,6 +198,40 @@ fn apply_attrs(entry: u64, us: bool, nx: bool) -> u64 {
     v
 }
 
+/// US-AND-across-levels INVARIANT enforcer. The effective US of a page is the AND of
+/// PML4E·PDPTE·PDE·PTE, so a leaf marked US=1 is STILL unreachable from ring 3 unless
+/// every covering level is also US=1. This trap has bitten TWICE — Stage-2 (the page
+/// walk needed US=1 on PML4[0]/PDPT[0], not just leaves) and Stage-3a (`ensure_pt`
+/// builds split PDEs US=0, masking a US=1 PTE). So it is now structurally impossible:
+/// EVERY path that marks a leaf US=1 (`set_attrs`, `set_page_us`) first calls this,
+/// which walks `addr` and marks each covering level (strictly above the leaf) US=1.
+/// Permissive — the leaf itself still enforces (kernel leaves stay US=0). Idempotent.
+///
+/// # Safety
+/// Mutates live page tables; single-threaded (init) or caller guarantees no concurrent
+/// walkers of `addr`'s upper tables.
+unsafe fn mark_user_covering_levels(addr: u64) {
+    unsafe {
+        let gib = (addr / GIB) as usize;
+        if gib >= 4 {
+            return;
+        }
+        // PML4E always covers GiB 0–3 in this single-PML4 identity map.
+        (*core::ptr::addr_of_mut!(PML4)).entries[0] |= PAGE_USER;
+        let pdpt = core::ptr::addr_of_mut!(PDPT);
+        if (*pdpt).entries[gib] & PAGE_HUGE != 0 {
+            return; // PDPTE is the 1 GiB leaf (caller sets it); its only cover, PML4E, is done
+        }
+        (*pdpt).entries[gib] |= PAGE_USER;
+        let pd = &mut (*core::ptr::addr_of_mut!(PDS))[gib];
+        let pd_idx = ((addr % GIB) / TWO_MIB) as usize;
+        if pd.entries[pd_idx] & PAGE_HUGE != 0 {
+            return; // PDE is the 2 MiB leaf (caller sets it); covers PML4E+PDPTE done
+        }
+        pd.entries[pd_idx] |= PAGE_USER; // PDE covers the 4 KiB PT leaf
+    }
+}
+
 /// Set US (user) and NX bits on every present page in `[start, end)`. Both bounds
 /// must be 2 MiB-aligned. Operates at the current granularity: a 2 MiB huge PDE is
 /// set on the PDE; a split (4 KiB) region is set on each present PTE (not-present
@@ -200,6 +254,11 @@ unsafe fn set_attrs(start: u64, end: u64, us: bool, nx: bool) {
             if (*core::ptr::addr_of!(PDPT)).entries[gib] & PAGE_HUGE != 0 {
                 a += TWO_MIB;
                 continue;
+            }
+            // US-AND invariant: before marking any leaf US=1, make its covering levels
+            // permissive (else the leaf is silently unreachable from ring 3).
+            if us {
+                mark_user_covering_levels(a);
             }
             let pd = &mut (*core::ptr::addr_of_mut!(PDS))[gib];
             let pd_idx = ((a % GIB) / TWO_MIB) as usize;
@@ -265,6 +324,38 @@ unsafe fn attribute_regions() {
 /// `addr` is rounded down to its 4 KiB page. Returns the guarded page base, or 0
 /// if the split-PT pool is exhausted (logged; guard not installed).
 ///
+/// Stage 3a confinement teeth (feature `confine_probe`): flip the US bit on the
+/// single 4 KiB page containing `addr`, splitting its 2 MiB region to 4 KiB first.
+/// Used to (a) make one kernel-`.text` page ring-3-executable for the probe stub,
+/// and (b) toggle a scratch page's US bit to prove enforcement (US=0) is the SOLE
+/// difference between "faults+contained" and "write succeeds+corrupts". Flushes the
+/// page's TLB entry. Single-threaded / boot-thread use only (no cross-core shootdown).
+///
+/// # Safety
+/// Mutates live page tables; `addr` must lie in the 0–4 GiB identity region and the
+/// caller must guarantee no concurrent walkers of that page on other cores.
+pub unsafe fn set_page_us(addr: u64, us: bool) {
+    unsafe {
+        let page = addr & !(FOUR_KIB - 1);
+        let pt = ensure_pt(page);
+        if pt.is_null() {
+            crate::serial_println!("[paging] set_page_us {:#x} FAILED (split pool)", page);
+            return;
+        }
+        // US-AND invariant: making the PTE US=1 requires every covering level US=1
+        // (`ensure_pt` builds split PDEs US=0). Route through the single enforcer so a
+        // US=1 leaf is never silently masked. Only for us=true — a US=0 leaf is denied
+        // regardless of uppers, and other split pages in the 2 MiB may need US=1.
+        if us {
+            mark_user_covering_levels(page);
+        }
+        let idx = ((page % TWO_MIB) / FOUR_KIB) as usize;
+        let e = (*pt).entries[idx];
+        (*pt).entries[idx] = if us { e | PAGE_USER } else { e & !PAGE_USER };
+        core::arch::asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags));
+    }
+}
+
 /// # Safety
 /// `addr` must lie in the 0–4 GiB identity region and must NOT be actively used
 /// as mapped memory (it is about to become unmapped). Intended for the dead page

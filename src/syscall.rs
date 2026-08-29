@@ -34,8 +34,12 @@ pub fn init_cpu_msrs(cpu_id: usize) {
     unsafe {
         use x86_64::registers::model_specific::Msr;
 
-        // STAR: kernel CS/SS in bits 47:32. User segment not used (ring 0).
-        Msr::new(0xC000_0081).write(0x10u64 << 32);
+        // STAR: SYSCALL loads CS=STAR[47:32]=0x10 (kernel code), SS=+8=0x18. Stage 3a:
+        // SYSRETQ loads CS=STAR[63:48]+16, SS=STAR[63:48]+8 (RPL forced to 3). The
+        // per-CPU GDT lays out user_data=0x30, user_code=0x38 (= user_data+8), so
+        // STAR[63:48]=0x28 yields SS=0x30|3=0x33, CS=0x38|3=0x3b — the ring-3
+        // selectors. Inert until sysretq is actually used (BEAM still ring 0 here).
+        Msr::new(0xC000_0081).write((0x28u64 << 48) | (0x10u64 << 32));
 
         // LSTAR: syscall entry point.
         Msr::new(0xC000_0082).write(syscall_entry as u64);
@@ -73,6 +77,12 @@ pub fn init_cpu_msrs(cpu_id: usize) {
         }
         let gs_base = &raw const PERCPU_SYSCALL[apic_id] as u64;
         Msr::new(0xC000_0101).write(gs_base); // IA32_GS_BASE
+        // Stage 3a: IA32_KERNEL_GS_BASE holds the value `swapgs` swaps IN when
+        // entering the kernel from ring 3. The invariant: in the kernel GS_BASE =
+        // per-CPU (above) and KERNEL_GS_BASE = 0 (the ring-3 user GS); on
+        // ring3→kernel the handler swapgs's them, restoring per-CPU GS. 0 for now
+        // (BEAM still ring 0, nothing swapgs's); the ring-3 flip manages it live.
+        Msr::new(0xC000_0102).write(0); // IA32_KERNEL_GS_BASE
     }
 }
 
@@ -83,6 +93,10 @@ pub fn init() {
         extern "C" { static syscall_stack_0_top: u8; }
         let kstack = &syscall_stack_0_top as *const u8 as u64;
         PERCPU_SYSCALL[0].kernel_stack = kstack;
+        // Stage 3a item 5: thread 0's RSP0 = its gs:[0] from the start (before any
+        // context switch), so an interrupt from ring-3 thread 0 lands on the same
+        // stack its syscalls use. Later switches keep them synced (set_current_kernel_stack).
+        crate::percpu::set_rsp0(0, kstack);
     }
     serial_println!("[syscall] MSRs configured");
 }
@@ -96,6 +110,10 @@ pub fn set_current_kernel_stack(kstack: u64) {
     unsafe {
         PERCPU_SYSCALL[cpu].kernel_stack = kstack;
     }
+    // Stage 3a item 5: keep TSS.RSP0 in lockstep with gs:[0] so a ring3→0
+    // interrupt lands on the *current thread's* kernel stack (the same one a
+    // syscall from ring 3 uses). Inert while ring 0 (RSP0 unconsulted).
+    crate::percpu::set_rsp0(cpu, kstack);
 }
 
 /// Read saved clone registers from this CPU's per-CPU data.
@@ -133,6 +151,9 @@ global_asm!(
     "syscall_entry:",
     // rcx = user return RIP (clobbered by syscall instruction)
     // r11 = user RFLAGS (clobbered by syscall instruction)
+    // Stage 3a: BEAM is ring 3, so on `syscall` GS is the user base — swap to the
+    // per-CPU base BEFORE touching gs:[...]. Paired with the swapgs before sysretq.
+    "swapgs",
     // GS_BASE points to per-CPU data: [0]=kernel_stack, [8]=scratch
     "mov gs:[8], rsp",           // save user RSP to per-CPU scratch
     "mov rsp, gs:[0]",           // load per-CPU kernel stack
@@ -194,19 +215,20 @@ global_asm!(
     "jb 3f",               // bad return address → trap
     "mov [rip + last_syscall_ret], rcx",
     "add rsp, 8",    // skip alignment padding
-    // Restore user RFLAGS from r11 (which we restored from the saved slot
-    // a few lines above). popfq pops 8 bytes from the kernel stack into
-    // the RFLAGS register, including DF/IF/etc.
-    "push r11",
-    "popfq",
     // Save kernel stack top to per-CPU data for next syscall (use rax as
     // scratch — but rax holds the syscall return value, so save/restore).
+    // (r11/rcx hold user RFLAGS/RIP for sysretq — not touched here.)
     "push rax",
     "lea rax, [rsp + 16]",
     "mov gs:[0], rax",
     "pop rax",
-    "pop rsp",
-    "jmp rcx",  // Return to user code (RFLAGS already restored by popfq)
+    "pop rsp",        // restore user RSP (ring-3 stack)
+    // Stage 3a: sysretq loads RIP=rcx, RFLAGS=r11, CS=0x3b/SS=0x33 (from STAR[63:48],
+    // RPL 3) and drops to ring 3, atomically restoring RFLAGS(IF=1). swapgs first
+    // (per-CPU → user). IF=0 in this window (SFMASK cleared it on entry), so no
+    // interrupt lands between the swapgs and the sysretq.
+    "swapgs",
+    "sysretq",
     // Bad return address detected
     "3:",
     "mov rdi, rcx",          // pass bad RCX as arg
@@ -2597,16 +2619,34 @@ fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
 /// musl _start. We jump directly — no fake return address is pushed, matching
 /// how the Linux kernel transfers control to ELF entry points.
 pub fn jump_to_user(entry: u64, user_stack_top: u64) -> ! {
-    serial_println!("[user] jumping to {:#x} sp={:#x}", entry, user_stack_top);
-    // SAFETY: entry is the ELF entry point, user_stack_top is a valid stack
-    // with argc at [rsp].
+    // Stage 3a: enter BEAM in RING 3 via iretq (was a plain ring-0 jmp). Build the
+    // iretq frame [SS,RSP,RFLAGS,CS,RIP] with the DPL=3 selectors, swapgs (per-CPU →
+    // user GS for ring 3), iretq → CPL 3. RFLAGS=0x202 (IF=1) so BEAM runs
+    // preemptible; cli before the swapgs so no interrupt lands mid-transition (it
+    // would run with user GS from a ring-0 CS → the handler's swapgs wouldn't fire).
+    let (ucode, udata) = crate::percpu::user_selectors();
+    let cs = (ucode | 3) as u64;
+    let ss = (udata | 3) as u64;
+    serial_println!(
+        "[user] iretq→ring3 entry={:#x} sp={:#x} cs={:#x} ss={:#x}",
+        entry, user_stack_top, cs, ss
+    );
+    // SAFETY: entry is the ELF entry point in a US=1 page; user_stack_top is a valid
+    // US=1 stack with argc at [rsp]; the DPL=3 selectors exist in the per-CPU GDT.
     unsafe {
         core::arch::asm!(
-            "mov rsp, {sp}",
             "xor rbp, rbp",
-            "sti",  // Enable interrupts for ERTS execution
-            "jmp {entry}",
+            "cli",
+            "swapgs",
+            "push {ss}",
+            "push {sp}",
+            "push 0x202",       // RFLAGS: IF=1 + reserved bit 1
+            "push {cs}",
+            "push {entry}",
+            "iretq",
+            ss = in(reg) ss,
             sp = in(reg) user_stack_top,
+            cs = in(reg) cs,
             entry = in(reg) entry,
             options(noreturn),
         );

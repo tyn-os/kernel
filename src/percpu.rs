@@ -35,6 +35,25 @@ static mut TSS_SELS: [u16; MAX_CPUS] = [0; MAX_CPUS];
 static mut USER_CODE_SEL: u16 = 0;
 static mut USER_DATA_SEL: u16 = 0;
 
+/// Stage 3a: per-CPU TSS pointers, so RSP0 can be retargeted at each context
+/// switch to track the *current thread's* kernel stack (the same one `gs:[0]`
+/// points at). Keeping RSP0 and `gs:[0]` in lockstep is item-5's "never drift".
+static mut TSS_PTRS: [*mut TaskStateSegment; MAX_CPUS] = [core::ptr::null_mut(); MAX_CPUS];
+
+/// Stage 3a: retarget `cpu_id`'s TSS.RSP0 (the clean kernel stack the CPU loads on
+/// a ring3→ring0 interrupt) to `top`. Called from `set_current_kernel_stack` on
+/// every context switch so RSP0 tracks the current thread's kernel stack. The CPU
+/// re-reads TSS.RSP0 from memory on each ring transition, so this takes effect
+/// immediately. Inert while everything is ring 0 (RSP0 is never consulted).
+pub fn set_rsp0(cpu_id: usize, top: u64) {
+    unsafe {
+        let p = TSS_PTRS[cpu_id];
+        if !p.is_null() {
+            (*p).privilege_stack_table[0] = VirtAddr::new(top);
+        }
+    }
+}
+
 /// The ring-3 user CS/SS selectors (RPL=3). Valid after the BSP's `alloc_cpu`.
 pub fn user_selectors() -> (u16, u16) {
     unsafe {
@@ -66,6 +85,7 @@ pub fn alloc_cpu(cpu_id: u32, apic_id: u32) {
     unsafe { PER_CPU[cpu_id as usize] = data as *mut PerCpuData; }
 
     let tss = Box::leak(Box::new(TaskStateSegment::new()));
+    let tss_ptr = tss as *mut TaskStateSegment; // Stage 3a: capture before the &'static tss_segment borrow
     let ist_top = data.ist_stack.as_ptr() as u64 + 16384;
     tss.interrupt_stack_table[0] = VirtAddr::new(ist_top);
     // Isolation Stage 2: RSP0 = the clean per-CPU kernel stack the CPU loads on a
@@ -89,6 +109,7 @@ pub fn alloc_cpu(cpu_id: u32, apic_id: u32) {
     unsafe {
         GDT_PTRS[cpu_id as usize] = gdt as *mut GlobalDescriptorTable;
         TSS_SELS[cpu_id as usize] = tss_sel.0;
+        TSS_PTRS[cpu_id as usize] = tss_ptr; // Stage 3a: for set_rsp0
         // Same layout in every per-CPU GDT, so a single global copy suffices.
         USER_CODE_SEL = user_code_sel.0;
         USER_DATA_SEL = user_data_sel.0;

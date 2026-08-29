@@ -24,6 +24,13 @@ stage2_mut_iret = ["stage2_shim"]
 # default; never in production.
 syscall_count = []
 
+# Isolation Stage-3a confinement teeth (OFF by default; --features confine_probe).
+# A deliberate ring-3 write to a US=0 kernel address proves the MMU DENIES it as a
+# US-violation and the kernel CONTAINS it (item-4 longjmp, not halt); a mutation
+# pass toggles the target US=1 to show the same write then succeeds. Never in
+# production. See src/confine_probe.rs.
+confine_probe = []
+
 [dependencies]
 x86_64 = "0.14"
 uart_16550 = "0.2"

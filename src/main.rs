@@ -571,6 +571,14 @@ extern "C" fn main(mbi: *const u8) -> ! {
         *(sp as *mut u64) = argc as u64;
     }
 
+    // Stage 3a confinement teeth (feature `confine_probe`): prove ring-3 → US=0
+    // kernel-memory write is DENIED + CONTAINED before BEAM launches; boot then
+    // proceeds and BEAM serves /health as the liveness witness.
+    #[cfg(feature = "confine_probe")]
+    unsafe {
+        tyn_kernel::confine_probe::run();
+    }
+
     serial_println!("[boot] launching ERTS at {:#x} sp={:#x}", info.entry, sp);
     tyn_kernel::syscall::jump_to_user(info.entry, sp);
 }

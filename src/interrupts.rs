@@ -121,7 +121,33 @@ pub fn init_timer() {
     x86_64::instructions::interrupts::enable();
 }
 
+/// Stage 3a: on a ring3→ring0 interrupt/trap the CPU does NOT swap GS, so the
+/// handler would run with BEAM's user GS base and mis-read per-CPU data (`gs:[0]`
+/// etc.). Swap iff the interrupt came from ring 3 (saved CS.RPL == 3); pair each
+/// call with `swapgs_restore` before returning to ring 3. While BEAM is still ring 0
+/// (pre-flip) every interrupt is CS.RPL==0 → both are no-ops, so this is inert.
+#[inline(always)]
+fn from_ring3(frame: &InterruptStackFrame) -> bool {
+    (frame.code_segment & 3) == 3
+}
+#[inline(always)]
+unsafe fn swapgs_enter(frame: &InterruptStackFrame) -> bool {
+    let u = from_ring3(frame);
+    if u {
+        core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
+    }
+    u
+}
+#[inline(always)]
+unsafe fn swapgs_restore(was_user: bool) {
+    if was_user {
+        core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
+    }
+}
+
 extern "x86-interrupt" fn timer_handler(mut frame: InterruptStackFrame) {
+    // Stage 3a: correct GS if we preempted ring-3 BEAM. (No-op while BEAM is ring 0.)
+    let from_user_ring = unsafe { swapgs_enter(&frame) };
     // EOI to APIC (PIC is disabled)
     crate::apic::eoi();
 
@@ -143,7 +169,13 @@ extern "x86-interrupt" fn timer_handler(mut frame: InterruptStackFrame) {
     const MMAP_END: u64 = 0xA000_0000;
     let ip = frame.instruction_pointer.as_u64();
     let is_user = ip < KERNEL_BASE || (ip >= MMAP_BASE && ip < MMAP_END);
-    if is_user {
+    // Stage 3a increment-1: the BUG-1 Path-A trampoline injects KERNEL code into the
+    // interrupted flow — impossible for ring-3 BEAM (can't run kernel code in ring 3).
+    // So take the trampoline ONLY for a ring-0 interruptee (pre-flip / never post-
+    // flip); a ring-3 preemption just ticks (defers the reschedule to the scheduler
+    // via the existing cooperative-yield path). Increment-2 replaces this with the
+    // direct Kind-B context switch on the clean RSP0 stack (dissolves BUG-1).
+    if is_user && !from_user_ring {
         // User (JIT/beam.smp) code interrupted. Redirect IRET to a trampoline that
         // does sched_yield, then resumes the interrupted code. check_resched at the
         // syscall exit performs the actual yield.
@@ -191,6 +223,12 @@ extern "x86-interrupt" fn timer_handler(mut frame: InterruptStackFrame) {
     } else {
         crate::sched::timer_tick();
     }
+    // Stage 3a: restore user GS before iretq back to ring 3 (no-op when ring 0).
+    // NOTE (phase 2): the ring-3 preemption path above (trampoline) still assumes
+    // ring-0 preemption — it must be reworked to context-switch directly on the
+    // clean RSP0 stack (which also dissolves BUG-1). Inert here: from_user_ring is
+    // false while BEAM is ring 0.
+    unsafe { swapgs_restore(from_user_ring); }
 }
 
 /// Per-thread preemption-context region reserved ABOVE each kernel-stack top
@@ -227,14 +265,43 @@ extern "x86-interrupt" fn page_fault_handler(
     frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    // Use lock-free serial writes for crash output (works even if another CPU holds the lock)
+    // Stage 3a confinement teeth (feature): an armed ring-3 fault IS the deliberate
+    // probe writing a US=0 kernel address. Record it and longjmp back into the probe
+    // (item-4: contain, not halt). Never returns to this handler.
+    #[cfg(feature = "confine_probe")]
+    {
+        if from_ring3(&frame) && crate::confine_probe::armed() {
+            unsafe {
+                crate::confine_probe::contain_longjmp(Cr2::read_raw(), error_code.bits());
+            }
+        }
+    }
+    // Fault report (lock-free serial: works even if another CPU holds the lock). The
+    // cs+err pair classifies it: cs.RPL==3 ⇒ ring-3 (BEAM); err bit0=P bit1=W bit2=U
+    // bit4=I/D — e.g. err=0x7 (P+W+U) is a ring-3 write to a US=0 kernel page (a
+    // confinement violation). This is item-4's report half — knowing WHAT faulted is
+    // useful for production containment, so it stays (the verbose GPR/fs debug dump
+    // used to root-cause the ring-3 startup faults was trimmed).
     crate::serial::raw_str_nolock(b"\n#PF ip=");
     crate::serial::raw_hex_nolock(frame.instruction_pointer.as_u64());
     crate::serial::raw_str_nolock(b" cr2=");
     crate::serial::raw_hex_nolock(Cr2::read_raw());
     crate::serial::raw_str_nolock(b" rsp=");
     crate::serial::raw_hex_nolock(frame.stack_pointer.as_u64());
+    crate::serial::raw_str_nolock(b" cs=");
+    crate::serial::raw_hex_nolock(frame.code_segment);
+    crate::serial::raw_str_nolock(b" err=");
+    crate::serial::raw_hex_nolock(error_code.bits());
     crate::serial::raw_str_nolock(b"\n");
+    // Item-4: contain-not-halt for a ring-3 fault. Kill the faulting context and hand
+    // control to the scheduler so the kernel + other threads survive — an unexpected
+    // ring-3 fault (e.g. mid Nitro md5-SMP hammer) reports+contains instead of a silent
+    // machine halt. A ring-0 fault is a kernel bug with no safe containment → halt.
+    if from_ring3(&frame) {
+        unsafe { core::arch::asm!("swapgs"); } // ring-3 entered on user GS → restore kernel GS
+        crate::serial::raw_str_nolock(b"[contain] ring-3 fault: killing faulting thread; kernel continues\n");
+        crate::sched::thread_exit(); // marks current Dead + switches to scheduler; never returns
+    }
     crate::halt_loop();
 }
 
