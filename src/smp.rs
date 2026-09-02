@@ -125,10 +125,14 @@ extern "C" fn ap_main(cpu_id: u32) -> ! {
     unsafe {
         // Clear CR0.TS (Task Switched) — allows FPU/SSE without #NM
         core::arch::asm!("clts", options(nomem, nostack));
-        // Set CR4.OSFXSR (bit 9) and CR4.OSXMMEXCPT (bit 10)
+        // Set CR4.OSFXSR (bit 9), CR4.OSXMMEXCPT (bit 10), CR4.SMEP (bit 20, 3b.1) and
+        // CR4.SMAP (bit 21, 3b.2). Each CPU has its own CR4, so APs must set these too.
+        // APs never touch US=1 memory in kernel boot (only US=0 kernel state + idle), so
+        // enabling SMAP here is safe; a cloned BEAM scheduler's syscalls route through
+        // `uaccess` like the BSP's.
         let mut cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4);
-        cr4 |= (1 << 9) | (1 << 10);
+        cr4 |= (1 << 9) | (1 << 10) | (1 << 20) | (1 << 21);
         core::arch::asm!("mov cr4, {}", in(reg) cr4);
     }
 

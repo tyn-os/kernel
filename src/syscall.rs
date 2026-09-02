@@ -44,8 +44,12 @@ pub fn init_cpu_msrs(cpu_id: usize) {
         // LSTAR: syscall entry point.
         Msr::new(0xC000_0082).write(syscall_entry as u64);
 
-        // SFMASK: clear IF on syscall entry.
-        Msr::new(0xC000_0084).write(0x200);
+        // SFMASK: clear IF (bit 9) AND AC (bit 18) on syscall entry. Clearing AC means
+        // every syscall starts SMAP-enforcing (AC=0) regardless of prior state — correct
+        // hygiene (the uaccess guard sets/clears AC around its own accesses), and it makes
+        // the 3b.2 SMAP hunt enumerate per-syscall (each syscall re-faults on its first
+        // unwrapped user access instead of AC persisting after the first fault of the run).
+        Msr::new(0xC000_0084).write(0x200 | 0x4_0000);
 
         // Enable SCE (System Call Enable) in EFER.
         let mut efer = Msr::new(0xC000_0080);
@@ -673,11 +677,15 @@ fn syscall_dispatch_inner(
         }
         SYS_WRITEV => sys_writev(a0 as i32, a1 as *const IoVec, a2 as usize),
         19 => { // readv — scatter read
-            let iov = a1 as *const IoVec;
+            let iov = a1 as u64;
             let iovcnt = a2 as usize;
             let mut total = 0i64;
             for i in 0..iovcnt {
-                let v = unsafe { &*iov.add(i) };
+                // 3b.2: the iovec array is user memory — read each entry via the guard.
+                let v = match read_user_iovec(iov, i) {
+                    Ok(v) => v,
+                    Err(e) => { if total == 0 { return e; } else { break; } }
+                };
                 let n = sys_read(a0 as i32, v.base as *mut u8, v.len);
                 if n < 0 { if total == 0 { return n; } else { break; } }
                 total += n;
@@ -716,11 +724,11 @@ fn syscall_dispatch_inner(
             // is why — real accounting needs per-thread CPU time from the scheduler.
             if a1 != 0 {
                 let ns = monotonic_ns();
-                unsafe {
-                    core::ptr::write_bytes(a1 as *mut u8, 0, 144);
-                    *(a1 as *mut u64) = ns / 1_000_000_000;            // ru_utime.tv_sec
-                    *((a1 + 8) as *mut u64) = (ns / 1000) % 1_000_000; // ru_utime.tv_usec
-                }
+                // 3b.2: `a1` is a user struct rusage (144 B) — build then one guarded copy.
+                let mut ru = [0u8; 144];
+                ru[0..8].copy_from_slice(&(ns / 1_000_000_000).to_ne_bytes()); // ru_utime.tv_sec
+                ru[8..16].copy_from_slice(&(((ns / 1000) % 1_000_000)).to_ne_bytes()); // ru_utime.tv_usec
+                let _ = unsafe { crate::uaccess::copy_to_user(a1, &ru) };
             }
             0
         }
@@ -980,14 +988,18 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
         return unsafe { crate::tmpfs::write(fd, buf, count) };
     }
     if fd == 1 || fd == 2 {
-        for i in 0..count {
-            // SAFETY: buf is in identity-mapped user memory.
-            let byte = unsafe { *buf.add(i) };
-            // SAFETY: 0x3F8 is COM1 data port, 0x3FD is LSR.
-            unsafe {
-                while (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20) == 0 {}
-                x86_64::instructions::port::Port::<u8>::new(0x3F8).write(byte);
-            }
+        // 3b.2: serial output reads the user `buf` — one guarded window (port I/O under
+        // stac is a wider AC window, but this is only fd 1/2 logging).
+        if unsafe {
+            crate::uaccess::with_user_access(buf as u64, count as u64, |p| {
+                for i in 0..count {
+                    let byte = *p.add(i);
+                    while (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20) == 0 {}
+                    x86_64::instructions::port::Port::<u8>::new(0x3F8).write(byte);
+                }
+            })
+        }.is_err() {
+            return crate::uaccess::EFAULT as i64;
         }
         // Boot-complete signal: when the boot eval prints "serial_shell ready"
         // (its last line, emitted by tyn_boot.erl only AFTER the app started
@@ -1014,9 +1026,13 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
         // backstop for "never," but keep this string in sync with tyn_boot.erl.
         const MARK: &[u8] = b"serial_shell ready";
         if !crate::serial::is_quiet() && count >= MARK.len() {
-            // SAFETY: buf points to `count` bytes of identity-mapped user memory.
-            let s = unsafe { core::slice::from_raw_parts(buf, count) };
-            if s.windows(MARK.len()).any(|w| w == MARK) {
+            // 3b.2: guarded read of the user buffer for the boot-complete marker.
+            let found = unsafe {
+                crate::uaccess::with_user_access(buf as u64, count as u64, |p| {
+                    core::slice::from_raw_parts(p, count).windows(MARK.len()).any(|w| w == MARK)
+                })
+            }.unwrap_or(false);
+            if found {
                 crate::sched::enable_blocking_futex();
                 crate::serial::set_quiet(true);
             }
@@ -1083,9 +1099,13 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     // /dev/urandom or /dev/random: fill from the kernel CSPRNG.
     if fd as i64 == FD_DEV_RANDOM {
         if count == 0 { return 0; }
-        // SAFETY: buf points to `count` bytes of identity-mapped user memory.
-        unsafe { crate::rng::fill_raw(buf, count); }
-        return count as i64;
+        // 3b.2: `buf` is a user dest — validate + stac around the CSPRNG fill.
+        return match unsafe {
+            crate::uaccess::with_user_access(buf as u64, count as u64, |_| crate::rng::fill_raw(buf, count))
+        } {
+            Ok(()) => count as i64,
+            Err(e) => e as i64,
+        };
     }
     // /tyn/resolv.conf: serve the snapshot from the current read position.
     if fd as i64 == FD_RESOLV_CONF {
@@ -1094,19 +1114,21 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
         let remaining = content.len().saturating_sub(*pos);
         if remaining == 0 { return 0; }
         let n = remaining.min(count);
-        // SAFETY: buf points to `count` bytes of identity-mapped user memory.
-        unsafe { core::ptr::copy_nonoverlapping(content[*pos..].as_ptr(), buf, n); }
+        // 3b.2: resolv snapshot (kernel) → user `buf` (dest) — guard the dest write.
+        if unsafe { crate::uaccess::copy_to_user(buf as u64, &content[*pos..*pos + n]) }.is_err() {
+            return crate::uaccess::EFAULT as i64;
+        }
         *pos += n;
         return n as i64;
     }
     // Synthetic /sys files: return "0\n" once, then EOF
     if fd as i64 == FD_SYNTH_ZERO {
         if count >= 2 {
-            unsafe {
-                *buf = b'0';
-                *buf.add(1) = b'\n';
-            }
-            return 2;
+            // 3b.2: `buf` is a user dest — guarded write of "0\n".
+            return match unsafe { crate::uaccess::copy_to_user(buf as u64, b"0\n") } {
+                Ok(()) => 2,
+                Err(e) => e as i64,
+            };
         }
         return 0;
     }
@@ -1225,9 +1247,13 @@ fn sys_mmap(addr: u64, length: u64, _prot: i32, flags: i32) -> i64 {
         // If the requested range falls in the free list, remove it — the
         // caller is reclaiming the virtual address explicitly.
         free_regions_drop_range(addr, aligned);
-        // SAFETY: addr is identity-mapped within our 4 GiB region.
+        // 3b.2: the mmap'd region is USER memory (US=1) — guard the zero-fill.
         if aligned <= 0x400_0000 { // up to 64 MiB
-            unsafe { core::ptr::write_bytes(addr as *mut u8, 0, aligned as usize) };
+            let _ = unsafe {
+                crate::uaccess::with_user_access(addr, aligned, |p| {
+                    core::ptr::write_bytes(p, 0, aligned as usize)
+                })
+            };
         }
         return addr as i64;
     }
@@ -1240,8 +1266,12 @@ fn sys_mmap(addr: u64, length: u64, _prot: i32, flags: i32) -> i64 {
         // rare (ERTS allocator carriers) and ERTS zero-initializes its
         // own carrier headers anyway.
         if aligned <= 0x400_0000 {
-            // SAFETY: identity-mapped, formerly owned by userspace.
-            unsafe { core::ptr::write_bytes(reused as *mut u8, 0, aligned as usize) };
+            // 3b.2: reused region is USER memory (US=1) — guard the zero-fill.
+            let _ = unsafe {
+                crate::uaccess::with_user_access(reused, aligned, |p| {
+                    core::ptr::write_bytes(p, 0, aligned as usize)
+                })
+            };
         }
         return reused as i64;
     }
@@ -1405,27 +1435,23 @@ fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
 }
 
 fn sys_uname(buf: *mut u8) -> i64 {
-    // struct utsname: 5 fields × 65 bytes each
-    // SAFETY: buf points to user memory (identity-mapped).
-    unsafe {
-        core::ptr::write_bytes(buf, 0, 65 * 5);
-        // nodename is DOTTED ("tyn.local", not "tyn") on purpose: musl's
-        // gethostname() returns this field, and ERTS's inet_config:set_hostname/0
-        // splits it into host+domain. A dot-less name leaves the resolver domain
-        // empty, which makes inet_config attempt a *native* gethostbyname at boot
-        // — spawning the inet_gethost port program Tyn can't exec (fatal). The
-        // dot gives a non-empty domain ("local"), so that native lookup is
-        // skipped. See src/net/socket.rs sys_bind for the paired reasoning.
-        let fields = [b"Linux" as &[u8], b"tyn.local", b"6.1.0-tyn", b"Tyn Kernel", b"x86_64"];
-        for (i, field) in fields.iter().enumerate() {
-            core::ptr::copy_nonoverlapping(
-                field.as_ptr(),
-                buf.add(i * 65),
-                field.len(),
-            );
-        }
+    // struct utsname: 5 fields × 65 bytes each. 3b.2: build in a kernel buffer, one
+    // guarded copy to the user `buf`.
+    // nodename is DOTTED ("tyn.local", not "tyn") on purpose: musl's gethostname()
+    // returns this field, and ERTS's inet_config:set_hostname/0 splits it into
+    // host+domain. A dot-less name leaves the resolver domain empty, which makes
+    // inet_config attempt a *native* gethostbyname at boot — spawning the inet_gethost
+    // port program Tyn can't exec (fatal). The dot gives a non-empty domain ("local"),
+    // so that native lookup is skipped. See src/net/socket.rs sys_bind for the pair.
+    let mut ut = [0u8; 65 * 5];
+    let fields = [b"Linux" as &[u8], b"tyn.local", b"6.1.0-tyn", b"Tyn Kernel", b"x86_64"];
+    for (i, field) in fields.iter().enumerate() {
+        ut[i * 65..i * 65 + field.len()].copy_from_slice(field);
     }
-    0
+    match unsafe { crate::uaccess::copy_to_user(buf as u64, &ut) } {
+        Ok(()) => 0,
+        Err(e) => e as i64,
+    }
 }
 
 fn sys_sched_getaffinity(len: usize, mask: *mut u8) -> i64 {
@@ -1434,37 +1460,55 @@ fn sys_sched_getaffinity(len: usize, mask: *mut u8) -> i64 {
     if len >= 8 {
         let ncpus = crate::sched::num_cpus().min(64);
         let mask_val: u64 = if ncpus >= 64 { !0u64 } else { (1u64 << ncpus) - 1 };
-        unsafe {
-            core::ptr::write_bytes(mask, 0, len);
-            *(mask as *mut u64) = mask_val;
+        // 3b.2: `mask` is a user dest (cpu_set_t, `len` bytes) — guard the zero + set.
+        match unsafe {
+            crate::uaccess::with_user_access(mask as u64, len as u64, |p| {
+                core::ptr::write_bytes(p, 0, len);
+                *(p as *mut u64) = mask_val;
+            })
+        } {
+            Ok(()) => 8,
+            Err(e) => e as i64,
         }
-        8
     } else {
         -22 // -EINVAL
     }
 }
 
 fn sys_clock_getres(res: *mut u64) -> i64 {
-    if !res.is_null() {
-        // SAFETY: res points to user memory (struct timespec = tv_sec + tv_nsec).
-        unsafe {
-            *res = 0;           // tv_sec
-            *(res.add(1)) = 1;  // tv_nsec = 1ns resolution
-        }
+    if res.is_null() {
+        return 0;
     }
-    0
+    // 3b.2: `res` is a user pointer (struct timespec, 16 B) — guarded write.
+    let r = unsafe {
+        crate::uaccess::with_user_access(res as u64, 16, |p| {
+            let p = p as *mut u64;
+            *p = 0; // tv_sec
+            *p.add(1) = 1; // tv_nsec = 1ns resolution
+        })
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => e as i64,
+    }
 }
 
 fn sys_prlimit64(_new: *const u8, old: *mut u8) -> i64 {
-    if !old.is_null() {
-        // SAFETY: old points to user struct rlimit64 (16 bytes).
-        unsafe {
-            let p = old as *mut u64;
-            *p = 8 * 1024 * 1024;       // rlim_cur = 8 MiB
-            *(p.add(1)) = u64::MAX;     // rlim_max = unlimited
-        }
+    if old.is_null() {
+        return 0;
     }
-    0
+    // 3b.2: `old` is a user pointer (struct rlimit64, 16 B) — guarded write.
+    let r = unsafe {
+        crate::uaccess::with_user_access(old as u64, 16, |p| {
+            let p = p as *mut u64;
+            *p = 8 * 1024 * 1024; // rlim_cur = 8 MiB
+            *p.add(1) = u64::MAX; // rlim_max = unlimited
+        })
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => e as i64,
+    }
 }
 
 /// Fake fd for /dev/null.
@@ -1486,14 +1530,12 @@ static RESOLV: spin::Mutex<(alloc::vec::Vec<u8>, usize)> =
 /// # Safety
 /// `ptr` must point to a NUL-terminated string in identity-mapped user memory.
 unsafe fn copy_path(ptr: *const u8, buf: &mut [u8; 256]) -> usize {
-    let mut len = 0;
-    while len < 255 {
-        let b = *ptr.add(len);
-        if b == 0 { break; }
-        buf[len] = b;
-        len += 1;
+    // 3b.2: `ptr` is a user string — page-safe guarded NUL-scan (EFAULT → treat as
+    // empty path, the tmpfs arms then fail the op gracefully). Caps at 255.
+    match unsafe { crate::uaccess::copy_user_cstr(&mut buf[..255], ptr as u64) } {
+        Ok(n) => n,
+        Err(_) => 0,
     }
-    len
 }
 
 fn sys_open(a0: u64, a1: u64, a2: u64, a3: u64, nr: u64) -> i64 {
@@ -1505,18 +1547,9 @@ fn sys_open(a0: u64, a1: u64, a2: u64, a3: u64, nr: u64) -> i64 {
         (a0 as *const u8, a1, a2)
     };
 
-    // Read path as a byte slice (up to 256 bytes).
+    // 3b.2: guarded path read (shared page-safe NUL-scan).
     let mut path_buf = [0u8; 256];
-    let mut path_len = 0;
-    // SAFETY: path_ptr is in identity-mapped user memory.
-    unsafe {
-        while path_len < 255 {
-            let b = *path_ptr.add(path_len);
-            if b == 0 { break; }
-            path_buf[path_len] = b;
-            path_len += 1;
-        }
-    }
+    let path_len = unsafe { copy_path(path_ptr, &mut path_buf) };
     let path = &path_buf[..path_len];
 
     // Check /dev/null
@@ -1621,91 +1654,64 @@ fn sys_getdents64(fd: i32, buf: *mut u8, count: usize) -> i64 {
 }
 
 fn sys_stat(path_ptr: *const u8, buf: *mut u8) -> i64 {
-    // Read path string
+    // 3b.2: guarded path read (shared page-safe NUL-scan).
     let mut path_buf = [0u8; 256];
-    let mut path_len = 0;
-    unsafe {
-        while path_len < 255 {
-            let b = *path_ptr.add(path_len);
-            if b == 0 { break; }
-            path_buf[path_len] = b;
-            path_len += 1;
-        }
-    }
+    let path_len = unsafe { copy_path(path_ptr, &mut path_buf) };
     let path = &path_buf[..path_len];
 
-    // tmpfs owns /tmp and /dev/shm. This is the first wall for System.tmp_dir:
-    // Elixir stats "/tmp" and only writes there if it stats as a directory.
+    // tmpfs owns /tmp and /dev/shm (the first wall for System.tmp_dir). It writes buf
+    // itself (its own guarded path).
     if crate::tmpfs::owns_path(path) {
-        // SAFETY: buf is null or a 144-byte struct stat; tmpfs::stat zeroes it.
         return unsafe { crate::tmpfs::stat(path, buf) };
     }
 
-    // Check if it's a VFS path (directory or file)
-    if !buf.is_null() {
-        unsafe { core::ptr::write_bytes(buf, 0, 144); }
-    }
-
-    // /dev/urandom + /dev/random: report a character device.
-    if path == b"/dev/urandom" || path == b"/dev/random" || path == b"/dev/null" {
-        if !buf.is_null() {
-            unsafe { *(buf.add(24) as *mut u32) = 0o020666; } // S_IFCHR | 0666
-        }
-        return 0;
-    }
-    // /tyn/resolv.conf: synthetic regular file sized from the DHCP nameservers.
-    if path == b"/tyn/resolv.conf" {
-        if !buf.is_null() {
-            unsafe {
-                *(buf.add(24) as *mut u32) = 0o100644; // S_IFREG
-                *(buf.add(48) as *mut u64) = crate::net::resolv_conf().len() as u64;
+    // 3b.2: assemble struct stat (144 B) in a kernel buffer, then ONE guarded copy out.
+    // st_mode @24 (u32), st_size @48 (u64), st_blksize @56 (u64).
+    let mut st = [0u8; 144];
+    let rc = if path == b"/dev/urandom" || path == b"/dev/random" || path == b"/dev/null" {
+        st[24..28].copy_from_slice(&0o020666u32.to_ne_bytes()); // S_IFCHR | 0666
+        0
+    } else if path == b"/tyn/resolv.conf" {
+        // synthetic regular file sized from the DHCP nameservers
+        st[24..28].copy_from_slice(&0o100644u32.to_ne_bytes()); // S_IFREG
+        st[48..56].copy_from_slice(&(crate::net::resolv_conf().len() as u64).to_ne_bytes());
+        0
+    } else if {
+        let vfs_fd = crate::vfs::open(path);
+        if vfs_fd >= 0 {
+            st[24..28].copy_from_slice(&0o100644u32.to_ne_bytes()); // regular file
+            if let Some(size) = crate::vfs::fstat_size(vfs_fd as i32) {
+                st[48..56].copy_from_slice(&(size as u64).to_ne_bytes());
             }
+            st[56..64].copy_from_slice(&4096u64.to_ne_bytes());
+            crate::vfs::close(vfs_fd as i32);
+            true
+        } else {
+            false
         }
-        return 0;
-    }
-
-    // Try opening as a file to get size
-    let vfs_fd = crate::vfs::open(path);
-    if vfs_fd >= 0 {
-        if !buf.is_null() {
-            unsafe {
-                let mode_ptr = buf.add(24) as *mut u32;
-                *mode_ptr = 0o100644; // regular file
-                if let Some(size) = crate::vfs::fstat_size(vfs_fd as i32) {
-                    let size_ptr = buf.add(48) as *mut u64;
-                    *size_ptr = size as u64;
-                }
-                let blksize_ptr = buf.add(56) as *mut u64;
-                *blksize_ptr = 4096;
-            }
-        }
-        crate::vfs::close(vfs_fd as i32);
-        return 0;
-    }
-
-    // Directory? A cpio has no directory entries, but any path that is a prefix
-    // of some entry (e.g. lib/<app>-<vsn>/ebin) is a directory as far as the
-    // release layout is concerned. Reporting S_IFDIR here is what lets
-    // code:add_pathz accept those dirs (file:read_file_info -> stat must say
-    // `directory`, else add_pathz returns {error,bad_directory} and code:lib_dir
-    // -> bad_name, breaking Application.app_dir/priv). The /sys entries are
-    // synthetic (not in the cpio) so keep them explicit.
-    if crate::vfs::is_dir_prefix(path)
+    } {
+        0
+    } else if crate::vfs::is_dir_prefix(path)
+        // A cpio has no dir entries, but any path that PREFIXES an entry
+        // (lib/<app>-<vsn>/ebin) is a directory for the release layout — reporting
+        // S_IFDIR is what lets code:add_pathz accept it. /sys entries are synthetic.
         || path == b"/sys/devices/system/node"
         || path == b"/sys/devices/system/cpu"
         || path.starts_with(b"/sys/devices/system/node/node")
         || path.starts_with(b"/sys/devices/system/cpu/cpu")
     {
-        if !buf.is_null() {
-            unsafe {
-                let mode_ptr = buf.add(24) as *mut u32;
-                *mode_ptr = 0o40755; // directory
-            }
-        }
-        return 0;
+        st[24..28].copy_from_slice(&0o40755u32.to_ne_bytes()); // directory
+        0
+    } else {
+        return -2; // -ENOENT (buf left undefined on error, per POSIX)
+    };
+    if buf.is_null() {
+        return rc;
     }
-
-    -2 // -ENOENT
+    match unsafe { crate::uaccess::copy_to_user(buf as u64, &st) } {
+        Ok(()) => rc,
+        Err(e) => e as i64,
+    }
 }
 
 fn sys_fstat(fd: i32, buf: *mut u8) -> i64 {
@@ -1713,37 +1719,33 @@ fn sys_fstat(fd: i32, buf: *mut u8) -> i64 {
         // SAFETY: buf is null or a 144-byte struct stat; tmpfs::fstat zeroes it.
         return unsafe { crate::tmpfs::fstat(fd, buf) };
     }
-    if !buf.is_null() {
-        // SAFETY: buf points to user struct stat (144 bytes on x86_64).
-        unsafe {
-            core::ptr::write_bytes(buf, 0, 144);
-            let mode_ptr = buf.add(24) as *mut u32; // st_mode at offset 24
-            // Directory fds — both the synthetic /sys placeholder and live
-            // VFS directory handles — must report S_IFDIR. glibc's
-            // opendir()/readdir() validates this after fstat and rejects
-            // the descriptor as ENOTDIR otherwise, which manifests as
-            // erl_prim_loader:list_dir/1 returning bare `error` and
-            // crashes code_server:init/3 at the `{ok,Dirs} = ...` match.
-            if fd as i64 == FD_SYNTH_DIR || crate::vfs::is_dir_fd(fd) {
-                *mode_ptr = 0o40755; // S_IFDIR | 0755
-            } else if fd as i64 == FD_DEV_RANDOM || fd as i64 == FD_DEVNULL {
-                *mode_ptr = 0o020666; // S_IFCHR | 0666
-            } else if fd as i64 == FD_RESOLV_CONF {
-                *mode_ptr = 0o100644; // S_IFREG
-                let size_ptr = buf.add(48) as *mut u64;
-                *size_ptr = RESOLV.lock().0.len() as u64;
-            } else {
-                *mode_ptr = 0o100644; // S_IFREG | 0644
-                if let Some(size) = crate::vfs::fstat_size(fd) {
-                    let size_ptr = buf.add(48) as *mut u64; // st_size at offset 48
-                    *size_ptr = size as u64;
-                }
-            }
-            let blksize_ptr = buf.add(56) as *mut u64; // st_blksize at offset 56
-            *blksize_ptr = 4096;
+    // 3b.2: assemble struct stat (144 B) in a kernel buffer, then ONE guarded copy out.
+    // st_mode @24 (u32), st_size @48 (u64), st_blksize @56 (u64) — x86_64 layout.
+    let mut st = [0u8; 144];
+    // Directory fds (synthetic /sys placeholder or live VFS dir handles) must report
+    // S_IFDIR — glibc's readdir rejects the fd as ENOTDIR otherwise (breaks
+    // erl_prim_loader:list_dir → code_server:init).
+    if fd as i64 == FD_SYNTH_DIR || crate::vfs::is_dir_fd(fd) {
+        st[24..28].copy_from_slice(&0o40755u32.to_ne_bytes()); // S_IFDIR | 0755
+    } else if fd as i64 == FD_DEV_RANDOM || fd as i64 == FD_DEVNULL {
+        st[24..28].copy_from_slice(&0o020666u32.to_ne_bytes()); // S_IFCHR | 0666
+    } else if fd as i64 == FD_RESOLV_CONF {
+        st[24..28].copy_from_slice(&0o100644u32.to_ne_bytes()); // S_IFREG
+        st[48..56].copy_from_slice(&(RESOLV.lock().0.len() as u64).to_ne_bytes());
+    } else {
+        st[24..28].copy_from_slice(&0o100644u32.to_ne_bytes()); // S_IFREG | 0644
+        if let Some(size) = crate::vfs::fstat_size(fd) {
+            st[48..56].copy_from_slice(&(size as u64).to_ne_bytes());
         }
     }
-    0
+    st[56..64].copy_from_slice(&4096u64.to_ne_bytes()); // st_blksize
+    if buf.is_null() {
+        return 0;
+    }
+    match unsafe { crate::uaccess::copy_to_user(buf as u64, &st) } {
+        Ok(()) => 0,
+        Err(e) => e as i64,
+    }
 }
 
 fn sys_newfstatat(dirfd: i32, path_ptr: *const u8, buf: *mut u8, _flags: i32) -> i64 {
@@ -1754,10 +1756,60 @@ fn sys_newfstatat(dirfd: i32, path_ptr: *const u8, buf: *mut u8, _flags: i32) ->
     // entirely and always returned an S_IFREG fstat of dirfd, so a call
     // like newfstatat(AT_FDCWD, "/otp/lib", &st, 0) reported "/otp/lib"
     // as a regular file and the JIT loader's list_dir gave up.
-    if !path_ptr.is_null() && unsafe { *path_ptr } != 0 {
-        return sys_stat(path_ptr, buf);
+    // 3b.2: guarded 1-byte probe for the empty-path (AT_EMPTY_PATH) case.
+    if !path_ptr.is_null() {
+        let mut first = [0u8; 1];
+        if unsafe { crate::uaccess::copy_from_user(&mut first, path_ptr as u64) }.is_ok()
+            && first[0] != 0
+        {
+            return sys_stat(path_ptr, buf);
+        }
     }
     sys_fstat(dirfd, buf)
+}
+
+/// 3b.2 confused-deputy TEETH (feature `deputy_probe`). Runs after SMAP is enabled: calls
+/// real syscall handlers with a KERNEL-range pointer and asserts the uaccess bounds-check
+/// rejects both a write-path (clock_gettime) and a read-path (futex) with EFAULT, kernel
+/// memory untouched. With `deputy_mutation` the bounds-check is disabled and the SAME calls
+/// demonstrably deref the kernel address (write clobbers the sentinel; read leaks the value
+/// → EAGAIN not EFAULT) — the contrast proves the check is the enforcement.
+#[cfg(feature = "deputy_probe")]
+pub fn deputy_test() {
+    // Kernel (US=0) targets — a confused deputy would have the kernel touch these.
+    static SCRATCH: AtomicU64 = AtomicU64::new(0xAAAA_AAAA_AAAA_AAAA);
+    static SECRET: u64 = 0xDEAD_BEEF_CAFE_F00D;
+    let scratch_addr = &SCRATCH as *const AtomicU64 as u64;
+    let secret_addr = &SECRET as *const u64 as u64;
+
+    let ua = crate::memory::paging::user_accessible(scratch_addr, 16);
+    serial_println!("[deputy] scratch={:#x} secret={:#x} user_accessible(scratch)={}",
+        scratch_addr, secret_addr, ua);
+
+    // WRITE-PATH: clock_gettime writes 16 B at the pointer → guarded EFAULT, sentinel
+    // intact; mutation clobbers the sentinel.
+    let before = SCRATCH.load(Ordering::SeqCst);
+    let rw = sys_clock_gettime(1, scratch_addr as *mut u64);
+    let after = SCRATCH.load(Ordering::SeqCst);
+    serial_println!("[deputy] WRITE clock_gettime(kernel ptr) -> {} (want -14); scratch {:#x} -> {:#x}",
+        rw, before, after);
+
+    // READ-PATH: epoll_ctl(ADD) copies a struct epoll_event FROM the pointer → guarded
+    // EFAULT without reading; mutation reads the event from SECRET (kernel) → returns 0.
+    // (futex is unsuitable — its pending-wake/bucket logic can short-circuit before the read.)
+    let _ = SECRET; // (SECRET is the read target below)
+    let rr = sys_epoll_ctl(1 /*EPOLL_CTL_ADD*/, 999, secret_addr);
+    serial_println!("[deputy] READ epoll_ctl(kernel ptr) -> {} (want -14; mutation 0 = read the event from SECRET)",
+        rr);
+
+    let write_ok = rw == -14 && before == after;
+    let read_ok = rr == -14;
+    if write_ok && read_ok {
+        serial_println!("[deputy] VERDICT: PASS — confused-deputy REJECTED both directions (EFAULT), kernel memory untouched.");
+    } else {
+        serial_println!("[deputy] VERDICT: MUTATION/FAIL — write rw={} scratch_clobbered={} | read rr={}",
+            rw, before != after, rr);
+    }
 }
 
 fn sys_getrandom(buf: *mut u8, len: usize) -> i64 {
@@ -1766,9 +1818,11 @@ fn sys_getrandom(buf: *mut u8, len: usize) -> i64 {
     if buf.is_null() || len == 0 {
         return 0;
     }
-    // SAFETY: buf/len come from the caller; user memory is identity-mapped.
-    unsafe { crate::rng::fill_raw(buf, len); }
-    len as i64
+    // 3b.2: `buf` is a user dest — validate + stac around the CSPRNG fill.
+    match unsafe { crate::uaccess::with_user_access(buf as u64, len as u64, |_| crate::rng::fill_raw(buf, len)) } {
+        Ok(()) => len as i64,
+        Err(e) => e as i64,
+    }
 }
 
 fn sys_pipe(fds: *mut i32) -> i64 {
@@ -1777,12 +1831,14 @@ fn sys_pipe(fds: *mut i32) -> i64 {
     }
     let (read_fd, write_fd) = crate::pipe::create();
     serial_println!("[sys_pipe] created ({}, {})", read_fd, write_fd);
-    // SAFETY: fds points to user memory (two consecutive i32s).
-    unsafe {
-        *fds = read_fd;
-        *fds.add(1) = write_fd;
+    // 3b.2: `fds` is a user pointer (two consecutive i32s) — guarded write.
+    let mut out = [0u8; 8];
+    out[0..4].copy_from_slice(&read_fd.to_ne_bytes());
+    out[4..8].copy_from_slice(&write_fd.to_ne_bytes());
+    match unsafe { crate::uaccess::copy_to_user(fds as u64, &out) } {
+        Ok(()) => 0,
+        Err(e) => e as i64,
     }
-    0
 }
 
 static CLONE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1860,9 +1916,19 @@ fn sys_epoll_ctl(op: i32, fd: i32, event_ptr: u64) -> i64 {
             }
             return 0;
         }
-        // ADD or MOD
-        let events = if event_ptr != 0 { *(event_ptr as *const u32) } else { 0 };
-        let data = if event_ptr != 0 { *((event_ptr + 4) as *const u64) } else { 0 };
+        // ADD or MOD — 3b.2: read the user epoll_event (u32 events + u64 data = 12 B).
+        let (events, data) = if event_ptr != 0 {
+            let mut ev = [0u8; 12];
+            if crate::uaccess::copy_from_user(&mut ev, event_ptr).is_err() {
+                return -14;
+            }
+            (
+                u32::from_ne_bytes(ev[0..4].try_into().unwrap()),
+                u64::from_ne_bytes(ev[4..12].try_into().unwrap()),
+            )
+        } else {
+            (0u32, 0u64)
+        };
         // Find existing or empty slot
         for e in EPOLL_TABLE.iter_mut() {
             if e.fd == fd { e.data = data; e.events = events; return 0; }
@@ -1930,10 +1996,14 @@ fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64, timeout_ms: i32) 
                 };
                 if revents != 0 {
                     let off = (count as u64) * 12;
-                    let ev = (events_ptr + off) as *mut u8;
-                    *(ev as *mut u32) = revents;
-                    *((ev as u64 + 4) as *mut u64) = e.data;
-                    count += 1;
+                    // 3b.2: write the epoll_event (u32 revents + u64 data = 12 B) to the
+                    // user array via the guard (best-effort: a bad slot is skipped).
+                    let mut evb = [0u8; 12];
+                    evb[0..4].copy_from_slice(&revents.to_ne_bytes());
+                    evb[4..12].copy_from_slice(&e.data.to_ne_bytes());
+                    if crate::uaccess::copy_to_user(events_ptr + off, &evb).is_ok() {
+                        count += 1;
+                    }
                 }
             }
         }
@@ -1967,8 +2037,13 @@ fn sys_ppoll(fds_ptr: u64, nfds: u64, timeout_ptr: u64) -> i64 {
     // Honor the timeout (struct timespec: { time_t tv_sec; long tv_nsec; }).
     // Without this, ppoll returns 0 instantly and ERTS spins.
     let target_ns = if timeout_ptr != 0 {
-        let tv_sec = unsafe { *(timeout_ptr as *const u64) };
-        let tv_nsec = unsafe { *((timeout_ptr + 8) as *const u64) };
+        // 3b.2: `timeout_ptr` is a user timespec (16 B) — guarded read.
+        let mut ts = [0u8; 16];
+        if unsafe { crate::uaccess::copy_from_user(&mut ts, timeout_ptr) }.is_err() {
+            return -14;
+        }
+        let tv_sec = u64::from_ne_bytes(ts[0..8].try_into().unwrap());
+        let tv_nsec = u64::from_ne_bytes(ts[8..16].try_into().unwrap());
         let ns = tv_sec.saturating_mul(1_000_000_000).saturating_add(tv_nsec);
         Some(monotonic_ns().saturating_add(ns))
     } else {
@@ -1982,14 +2057,19 @@ fn sys_ppoll(fds_ptr: u64, nfds: u64, timeout_ptr: u64) -> i64 {
     {
         static LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
         if !LOGGED.load(Ordering::Relaxed) {
-            for i in 0..nfds as usize {
-                let fd = unsafe { *((fds_ptr + (i as u64) * 8) as *const i32) };
-                if fd >= 500 {
-                    LOGGED.store(true, Ordering::Relaxed);
-                    serial_println!("[ppoll] nfds={} socket_fd={} at idx={}", nfds, fd, i);
-                    break;
-                }
-            }
+            // 3b.2: guarded read of the user pollfd array (best-effort debug scan).
+            let _ = unsafe {
+                crate::uaccess::with_user_access(fds_ptr, nfds.saturating_mul(8), |_| {
+                    for i in 0..nfds as usize {
+                        let fd = *((fds_ptr + (i as u64) * 8) as *const i32);
+                        if fd >= 500 {
+                            LOGGED.store(true, Ordering::Relaxed);
+                            serial_println!("[ppoll] nfds={} socket_fd={} at idx={}", nfds, fd, i);
+                            break;
+                        }
+                    }
+                })
+            };
         }
     }
 
@@ -1997,9 +2077,11 @@ fn sys_ppoll(fds_ptr: u64, nfds: u64, timeout_ptr: u64) -> i64 {
 
     // Inner: scan all pollfds, fill revents, return count of ready fds.
     let scan_once = || -> i64 {
+        // 3b.2: the pollfd array is user memory — one guarded window per scan.
+        unsafe { crate::uaccess::with_user_access(fds_ptr, (nfds as u64).saturating_mul(8), |_| {
         let mut ready = 0i64;
         for i in 0..nfds as usize {
-            unsafe {
+            {
                 let pfd = (fds_ptr + (i as u64) * 8) as *mut u8;
                 let fd = *(pfd as *const i32);
                 let events = *((pfd as u64 + 4) as *const u16);
@@ -2024,6 +2106,7 @@ fn sys_ppoll(fds_ptr: u64, nfds: u64, timeout_ptr: u64) -> i64 {
             }
         }
         ready
+        }).unwrap_or(0) }
     };
 
     let initial = scan_once();
@@ -2088,15 +2171,15 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64) -> i64 {
             // wait, and `receive after N` / gen_server:call timeouts
             // never fire.
             let deadline = if timeout_ptr != 0 {
-                // SAFETY: caller passes a user-space pointer; we treat
-                // it as identity-mapped into our address space.
-                unsafe {
-                    let tv_sec = *(timeout_ptr as *const u64);
-                    let tv_nsec = *((timeout_ptr + 8) as *const u64);
-                    let dur_ns = tv_sec.saturating_mul(1_000_000_000)
-                        .saturating_add(tv_nsec);
-                    Some(monotonic_ns().saturating_add(dur_ns))
+                // 3b.2: `timeout_ptr` is a user timespec (16 B) — guarded read.
+                let mut ts = [0u8; 16];
+                if unsafe { crate::uaccess::copy_from_user(&mut ts, timeout_ptr) }.is_err() {
+                    return -14;
                 }
+                let tv_sec = u64::from_ne_bytes(ts[0..8].try_into().unwrap());
+                let tv_nsec = u64::from_ne_bytes(ts[8..16].try_into().unwrap());
+                let dur_ns = tv_sec.saturating_mul(1_000_000_000).saturating_add(tv_nsec);
+                Some(monotonic_ns().saturating_add(dur_ns))
             } else {
                 None
             };
@@ -2116,24 +2199,19 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64) -> i64 {
 }
 
 fn sys_readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
-    // Read path string for logging/comparison
+    // 3b.2: guarded path read (shared page-safe NUL-scan).
     let mut path_buf = [0u8; 256];
-    let mut path_len = 0;
-    unsafe {
-        while path_len < 255 {
-            let b = *path.add(path_len);
-            if b == 0 { break; }
-            path_buf[path_len] = b;
-            path_len += 1;
-        }
-    }
+    let path_len = unsafe { copy_path(path, &mut path_buf) };
     let path_slice = &path_buf[..path_len];
 
     if path_slice == b"/proc/self/exe" {
         let target = b"/otp/erts-15.2.7/bin/beam.smp";
         let len = target.len().min(bufsiz);
-        unsafe { core::ptr::copy_nonoverlapping(target.as_ptr(), buf, len); }
-        return len as i64;
+        // 3b.2: kernel target → user `buf` (dest) — guarded.
+        return match unsafe { crate::uaccess::copy_to_user(buf as u64, &target[..len]) } {
+            Ok(()) => len as i64,
+            Err(e) => e as i64,
+        };
     }
     // Trace failed readlinks
     {
@@ -2322,32 +2400,30 @@ pub fn ap_tsc_sync() {
 static TIMERFD_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
 
 fn sys_timerfd_settime(_fd: i32, flags: i32, new_value_ptr: u64) -> i64 {
-    {
-        static LOG: AtomicU64 = AtomicU64::new(0);
-        let n = LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 5 {
-            if new_value_ptr != 0 {
-                let s = unsafe { *((new_value_ptr + 16) as *const u64) };
-                let ns = unsafe { *((new_value_ptr + 24) as *const u64) };
-                serial_println!("[timerfd_settime] flags={} sec={} nsec={}", flags, s, ns);
-            } else {
-                serial_println!("[timerfd_settime] disarm");
-            }
-        }
-    }
-    // struct itimerspec { struct timespec it_interval; struct timespec it_value; }
-    // struct timespec  { time_t tv_sec; long tv_nsec; }
-    // Layout (16 bytes interval, 16 bytes value):
-    //   off  0: it_interval.tv_sec
-    //   off  8: it_interval.tv_nsec
-    //   off 16: it_value.tv_sec
-    //   off 24: it_value.tv_nsec
+    // struct itimerspec { it_interval[16], it_value[16] }; it_value.tv_sec at off 16,
+    // it_value.tv_nsec at off 24.
     if new_value_ptr == 0 {
+        static LOG: AtomicU64 = AtomicU64::new(0);
+        if LOG.fetch_add(1, Ordering::Relaxed) < 5 {
+            serial_println!("[timerfd_settime] disarm");
+        }
         TIMERFD_DEADLINE_NS.store(0, Ordering::Release);
         return 0;
     }
-    let it_value_sec = unsafe { *((new_value_ptr + 16) as *const u64) };
-    let it_value_nsec = unsafe { *((new_value_ptr + 24) as *const u64) };
+    // 3b.2: read the 32-byte itimerspec from user memory via the guard (one read
+    // covers what the debug log + the deadline logic both need).
+    let mut its = [0u8; 32];
+    if unsafe { crate::uaccess::copy_from_user(&mut its, new_value_ptr) }.is_err() {
+        return -14;
+    }
+    let it_value_sec = u64::from_ne_bytes(its[16..24].try_into().unwrap());
+    let it_value_nsec = u64::from_ne_bytes(its[24..32].try_into().unwrap());
+    {
+        static LOG: AtomicU64 = AtomicU64::new(0);
+        if LOG.fetch_add(1, Ordering::Relaxed) < 5 {
+            serial_println!("[timerfd_settime] flags={} sec={} nsec={}", flags, it_value_sec, it_value_nsec);
+        }
+    }
     if it_value_sec == 0 && it_value_nsec == 0 {
         TIMERFD_DEADLINE_NS.store(0, Ordering::Release);
         return 0;
@@ -2446,17 +2522,42 @@ fn sys_clock_gettime(clk_id: i32, tp: *mut u64) -> i64 {
         0 | 5 => realtime_ns(),
         _ => monotonic_ns(),
     };
-    unsafe {
-        *tp = ns / 1_000_000_000;
-        *(tp.add(1)) = ns % 1_000_000_000;
+    // 3b.2: `tp` is a user pointer — validate + stac/clac via the one guarded path.
+    let r = unsafe {
+        crate::uaccess::with_user_access(tp as u64, 16, |p| {
+            let p = p as *mut u64;
+            *p = ns / 1_000_000_000;
+            *p.add(1) = ns % 1_000_000_000;
+        })
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => e as i64,
     }
-    0
 }
 
 #[repr(C)]
 struct IoVec {
     base: *const u8,
     len: usize,
+}
+
+/// 3b.2: read the `i`-th `IoVec` entry from a user iovec array at `iov` through the
+/// guard (the array itself is user memory). Returns the entry or an errno (EFAULT).
+#[inline]
+fn read_user_iovec(iov: u64, i: usize) -> Result<IoVec, i64> {
+    let mut v = IoVec { base: core::ptr::null(), len: 0 };
+    let sz = core::mem::size_of::<IoVec>();
+    let r = unsafe {
+        crate::uaccess::copy_from_user(
+            core::slice::from_raw_parts_mut(&mut v as *mut IoVec as *mut u8, sz),
+            iov + (i * sz) as u64,
+        )
+    };
+    match r {
+        Ok(()) => Ok(v),
+        Err(e) => Err(e as i64),
+    }
 }
 
 /// sendfile(2): copy up to `count` bytes from a file fd to a socket fd in the
@@ -2567,8 +2668,11 @@ fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: *mut u64, count: usize) -> 
 fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> i64 {
     let mut total = 0i64;
     for i in 0..iovcnt {
-        // SAFETY: iov array is in identity-mapped user memory.
-        let v = unsafe { &*iov.add(i) };
+        // 3b.2: the iovec array is user memory — read each entry via the guard.
+        let v = match read_user_iovec(iov as u64, i) {
+            Ok(v) => v,
+            Err(e) => { if total > 0 { return total; } return e; }
+        };
         if v.len == 0 {
             continue;
         }
@@ -2601,15 +2705,16 @@ fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> i64 {
 }
 
 fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
-    if size >= 2 {
-        // SAFETY: buf points to user memory.
-        unsafe {
-            *buf = b'/';
-            *buf.add(1) = 0;
-        }
-        1
-    } else {
-        -34 // -ERANGE
+    if size < 2 {
+        return -34; // -ERANGE
+    }
+    // 3b.2: `buf` is a user pointer — guarded write of "/\0".
+    let r = unsafe {
+        crate::uaccess::copy_to_user(buf as u64, b"/\0")
+    };
+    match r {
+        Ok(()) => 1,
+        Err(e) => e as i64,
     }
 }
 

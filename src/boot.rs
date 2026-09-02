@@ -19,7 +19,12 @@ const CR0: u64 = Cr0Flags::PROTECTED_MODE_ENABLE.bits()
 const CR4: u64 = Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits()
     | Cr4Flags::PAGE_GLOBAL.bits()
     | Cr4Flags::OSFXSR.bits()
-    | Cr4Flags::OSXMMEXCPT_ENABLE.bits();
+    | Cr4Flags::OSXMMEXCPT_ENABLE.bits()
+    // Stage 3b.1: SMEP — ring-0 instruction fetch from a US=1 (user) page faults. The
+    // kernel never executes BEAM/JIT (US=1) pages, so this is inert-but-enforcing; it
+    // guards the exec half of the kernel/BEAM boundary now that BEAM is ring 3. (SMAP,
+    // bit 21, is added in 3b.2 with the copy-site guards.)
+    | (1u64 << 20);
 
 const EFER: u64 = EferFlags::LONG_MODE_ENABLE.bits() | EferFlags::NO_EXECUTE_ENABLE.bits();
 

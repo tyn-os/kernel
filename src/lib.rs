@@ -32,6 +32,7 @@ pub mod pipe;
 pub mod thread;
 pub mod tmpfs;
 pub mod tmpfs_tree;
+pub mod uaccess;
 pub mod vfs;
 
 /// Halt the CPU in a loop, waking only on interrupts.

@@ -546,10 +546,13 @@ pub fn spawn(
     const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
     const CLONE_CHILD_SETTID: u64  = 0x0100_0000;
     if (clone_flags & CLONE_PARENT_SETTID) != 0 && parent_tid != 0 {
-        unsafe { *(parent_tid as *mut u32) = tid; }
+        // 3b.2: parent_tid is a user pointer — guarded write (best-effort; a bad ptr
+        // just skips the tid store, the thread is still created).
+        let _ = unsafe { crate::uaccess::write_user_u32(parent_tid, tid) };
     }
     if (clone_flags & CLONE_CHILD_SETTID) != 0 && child_tid != 0 {
-        unsafe { *(child_tid as *mut u32) = tid; }
+        // 3b.2: child_tid is a user pointer — guarded write (best-effort).
+        let _ = unsafe { crate::uaccess::write_user_u32(child_tid, tid) };
     }
 
     {
@@ -716,7 +719,8 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
         static WAIT_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let wc = WAIT_LOG.fetch_add(1, Ordering::Relaxed);
         if wc < 50 {
-            let cur = unsafe { (*(addr as *const AtomicU32)).load(Ordering::SeqCst) };
+            // 3b.2: `addr` is a user futex word — guarded read (best-effort for the log).
+            let cur = unsafe { crate::uaccess::read_user_u32(addr) }.unwrap_or(0);
             let cpu = current_cpu() as usize;
             let tid = unsafe { CPU_QUEUES[cpu].current.unwrap_or(0) };
             crate::serial_println!("[wait] tid={} addr={:#x} expect={:#x} cur={:#x}",
@@ -743,7 +747,14 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
     // way, but the explicit atomic operation makes the cross-CPU read
     // intent unambiguous and matches how ERTS writes the address
     // (`atomic_xchg`/store with seq_cst on the waker side).
-    let current = unsafe { (*(addr as *const AtomicU32)).load(Ordering::SeqCst) };
+    // 3b.2: `addr` is a user futex word — guarded read (a bad addr → EFAULT).
+    let current = match unsafe { crate::uaccess::read_user_u32(addr) } {
+        Ok(v) => v,
+        Err(_) => {
+            drop(flock_guard);
+            return -14; // -EFAULT
+        }
+    };
     if current != val {
         drop(flock_guard);
         return -11; // -EAGAIN
@@ -879,7 +890,8 @@ pub fn futex_wake(addr: u64, count: u32) -> i64 {
         static WAKE_CALL_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let wc = WAKE_CALL_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if wc < 50 {
-            let val = unsafe { (*(addr as *const AtomicU32)).load(Ordering::SeqCst) };
+            // 3b.2: `addr` is a user futex word — guarded read (best-effort for the log).
+            let val = unsafe { crate::uaccess::read_user_u32(addr) }.unwrap_or(0);
             crate::serial_println!("[wake_call] addr={:#x} count={} val={:#x}", addr, count, val);
         }
     }
@@ -1002,7 +1014,8 @@ pub fn watchdog_wake() {
             // protocol in futex_wait spans the wait→sleep transition
             // and shouldn't lose wakes, but this catches the
             // value-changed-without-wake bug class as a safety net.
-            let current = (*(thread.futex_addr as *const AtomicU32)).load(Ordering::SeqCst);
+            // 3b.2: futex_addr is a user word — guarded read (skip the thread on EFAULT).
+            let Ok(current) = crate::uaccess::read_user_u32(thread.futex_addr) else { continue };
             let value_changed = current != thread.futex_val;
 
             // Timed wait expired (used by ethr_event_twait to drive

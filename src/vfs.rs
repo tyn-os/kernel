@@ -148,8 +148,10 @@ pub fn read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     if remaining == 0 { return 0; }
     let to_read = count.min(remaining);
     let src = &cpio_data()[file.data_offset + file.pos..];
-    // SAFETY: buf is in identity-mapped user memory.
-    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), buf, to_read); }
+    // 3b.2: cpio data (kernel) is the source; `buf` is a USER dest — guard the dest write.
+    if unsafe { crate::uaccess::copy_to_user(buf as u64, &src[..to_read]) }.is_err() {
+        return crate::uaccess::EFAULT as i64;
+    }
     file.pos += to_read;
     to_read as i64
 }
@@ -408,24 +410,17 @@ fn fill_dir_entries(buf: *mut u8, count: usize, prefix: &[u8]) -> i64 {
                     let reclen = (19 + name_len + 7) & !7; // align to 8
                     if written + reclen > count { break; }
 
-                    unsafe {
-                        let entry = buf.add(written);
-                        // d_ino (u64)
-                        *(entry as *mut u64) = seen_count as u64;
-                        // d_off (u64)
-                        *((entry as u64 + 8) as *mut u64) = written as u64 + reclen as u64;
-                        // d_reclen (u16)
-                        *((entry as u64 + 16) as *mut u16) = reclen as u16;
-                        // d_type (u8) — DT_DIR=4 if has slash, DT_REG=8 otherwise
-                        let d_type = if child_end < rest.len() { 4u8 } else { 8u8 };
-                        *((entry as u64 + 18) as *mut u8) = d_type;
-                        // d_name (NUL-terminated)
-                        core::ptr::copy_nonoverlapping(child.as_ptr(), entry.add(19), child.len());
-                        *entry.add(19 + child.len()) = 0;
-                        // Zero padding
-                        for i in (19 + name_len)..reclen {
-                            *entry.add(i) = 0;
-                        }
+                    // 3b.2: build the linux_dirent64 in a kernel buffer, then ONE guarded
+                    // copy to the user `buf` at `written`. reclen ≤ 19+65+7 (child<64) < 96.
+                    let mut ent = [0u8; 96];
+                    ent[0..8].copy_from_slice(&(seen_count as u64).to_ne_bytes()); // d_ino
+                    ent[8..16].copy_from_slice(&(written as u64 + reclen as u64).to_ne_bytes()); // d_off
+                    ent[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes()); // d_reclen
+                    ent[18] = if child_end < rest.len() { 4u8 } else { 8u8 }; // d_type: DIR/REG
+                    ent[19..19 + child.len()].copy_from_slice(child); // d_name (NUL + pad already 0)
+                    let _ = name_len; // reclen already accounts for the NUL
+                    if unsafe { crate::uaccess::copy_to_user(buf as u64 + written as u64, &ent[..reclen]) }.is_err() {
+                        return crate::uaccess::EFAULT as i64;
                     }
                     written += reclen;
                 }

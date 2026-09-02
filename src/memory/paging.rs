@@ -100,20 +100,16 @@ pub unsafe fn init() {
         // leaves marked US=1 → allowed). Without US here, a US=1 leaf is still
         // unreachable from ring 3 (this was the Stage-1 attribution's latent gap).
         (*pdpt).entries[0] = phys_of(pd0) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-        // ---- Stage 3a TEMPORARY, BOUNDED relaxation (TRACKED — remove before ship) ----
-        // Ring-3 confinement surfaced latent NULL-base / low-address reads in *stock
-        // ERTS startup* that ring 0 silently tolerated (it iterates `&NULL[i]`, whose
-        // element null-check passes for i>0, then derefs a low kernel address — e.g.
-        // #PF cr2=0x2be4 at beam.smp:0x8f17da with rdx=0). To reach the interrupt-path
-        // and confinement teeth we boot-first: grant ring-3 READ of ONLY the low 2 MiB
-        // (0x0–0x200000: SMP trampoline + BIOS/low structures). This is bounded to
-        // pd0.entries[0] alone — the kernel image (0x0F00_0000+, pd0[0x78]), the KSTACK
-        // guard arena (0x0700_0000, pd0[0x38]), and all MMIO (GiB 3) stay US=0, so the
-        // T-confine probe (deliberate ring-3 write/read of a US=0 kernel address) still
-        // faults-and-contains. Revisit: either fix ERTS's latent low reads at source or
-        // keep this documented as a known confinement carve-out. See ISOLATION_SCOPING.
-        pd0.entries[0] |= PAGE_USER;
-        // ------------------------------------------------------------------------------
+        // Stage 3b.0: the low 2 MiB stays US=0 (kernel-confined) — the Stage-3a blanket
+        // US=1 relaxation is REMOVED. Stock ERTS startup does latent NULL-base low READS
+        // (`&NULL[i]`; ring 0 masked them, ring 3 faults — e.g. #PF cr2=0x2be4). Those
+        // are now satisfied on demand by `map_low_zero`: the #PF handler points that one
+        // 4 KiB page at a shared READ-ONLY ZERO frame with US=1, so BEAM reads zeros
+        // (matches an empty table) and kernel low-RAM (SMP trampoline / BIOS) is NEVER
+        // exposed to ring 3. This closes the confinement hole AND keeps the SMAP hunt
+        // clean (kernel low accesses stay US=0, not false copy sites). The 0-2 MiB region
+        // is pre-split to 4 KiB below (with the kstack arena) so demand-zero is a pure
+        // PTE flip — no runtime split / TLB shootdown.
         // GiB 1-3: keep 1 GiB huge pages (PDPTE.PS). Nothing here needs fine
         // granularity in Stage 0, so preserving the boot map's 1 GiB TLB reach
         // avoids the measured ~17% serving-throughput cost of blanket 2 MiB pages
@@ -142,6 +138,11 @@ pub unsafe fn init() {
             ensure_pt(KSTACK_ARENA_BASE + off);
             off += TWO_MIB;
         }
+
+        // Stage 3b.0: pre-split the low 2 MiB to 4 KiB (identity, US=0) so `map_low_zero`
+        // can satisfy a stray ring-3 low read with a pure PTE flip — no runtime split of
+        // a huge page other cores may have cached (no TLB shootdown needed).
+        ensure_pt(0);
 
         // Isolation Stage 1: label the map (BEAM US=1, kernel US=0, NX on kernel
         // data). Advisory at ring 0 — inert, but ready for Stage-3 ring-3 SMEP/SMAP.
@@ -353,6 +354,142 @@ pub unsafe fn set_page_us(addr: u64, us: bool) {
         let e = (*pt).entries[idx];
         (*pt).entries[idx] = if us { e | PAGE_USER } else { e & !PAGE_USER };
         core::arch::asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags));
+    }
+}
+
+/// Stage 3b.0: pool of per-page WRITABLE scratch frames for stray ring-3 low accesses.
+/// Stock ERTS startup does a read-MODIFY-WRITE through a NULL-base table (reads 0x2be4,
+/// then writes it), so a read-only page is insufficient — each touched low page gets its
+/// OWN zero-initialized throwaway frame (dedicated kernel memory, NOT the trampoline/
+/// BIOS low-RAM), so BEAM's latent NULL-base RMW is absorbed harmlessly and kernel
+/// low-RAM stays confined (US=0). Per-page (not shared) so distinct low pages don't
+/// alias. 16 frames = 64 KiB; ERTS touches ~1.
+#[repr(C, align(4096))]
+#[derive(Clone, Copy)]
+struct ScratchFrame([u8; 4096]);
+const LOW_SCRATCH_FRAMES: usize = 16;
+static mut LOW_SCRATCH: [ScratchFrame; LOW_SCRATCH_FRAMES] =
+    [ScratchFrame([0u8; 4096]); LOW_SCRATCH_FRAMES];
+static LOW_SCRATCH_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Stage 3b.0: satisfy a stray ring-3 read/write of the low 2 MiB (latent ERTS NULL-base
+/// RMW that ring 0 masked) by pointing that one 4 KiB page at a dedicated writable scratch
+/// frame with US=1 — BEAM reads/writes zeros-then-garbage there, kernel low-RAM (SMP
+/// trampoline / BIOS) is NEVER exposed. The 0-2 MiB region is pre-split at init, so this
+/// is a pure PTE flip + invlpg. Returns false if `addr` is outside the low 2 MiB or the
+/// scratch pool is exhausted — the caller then treats the fault as a real violation.
+///
+/// # Safety
+/// Mutates live page tables; per-core self-heal (the faulting core invlpg's its own
+/// entry). The low 2 MiB is not kernel-accessed at runtime, so a stale huge TLB entry
+/// on another core is harmless.
+pub unsafe fn map_low_scratch(addr: u64) -> bool {
+    let page = addr & !(FOUR_KIB - 1);
+    if page >= TWO_MIB {
+        return false;
+    }
+    unsafe {
+        let slot = LOW_SCRATCH_NEXT.fetch_add(1, Ordering::Relaxed);
+        if slot >= LOW_SCRATCH_FRAMES {
+            crate::serial_println!("[low-zero] scratch pool exhausted at {:#x}", page);
+            return false;
+        }
+        let pt = ensure_pt(page);
+        if pt.is_null() {
+            return false;
+        }
+        mark_user_covering_levels(page); // US-AND invariant: covering levels permissive
+        let frame = core::ptr::addr_of!(LOW_SCRATCH[slot]) as u64; // identity-mapped: PA == VA
+        let idx = ((page % TWO_MIB) / FOUR_KIB) as usize;
+        (*pt).entries[idx] = (frame & ADDR_MASK) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+        core::arch::asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags));
+        true
+    }
+}
+
+/// Stage 3b.2 confused-deputy guard (ground truth). Is EVERY 4 KiB page of
+/// `[addr, addr+len)` mapped PRESENT and US=1 at EVERY paging level (PML4E·PDPTE·PDE·PTE
+/// — the same AND the CPU applies)? A ring-3 syscall pointer must target BEAM's own
+/// (US=1) memory; a kernel-range (US=0), unmapped, or out-of-map pointer returns false so
+/// `uaccess` rejects it with EFAULT BEFORE the kernel dereferences it. SMAP forces the
+/// stac, but ONLY this check stops the kernel touching kernel memory on BEAM's behalf.
+pub fn user_accessible(addr: u64, len: u64) -> bool {
+    // 3b.2 TEETH mutation: disable the bounds-check so the confused-deputy deref
+    // demonstrably occurs (the mutation build proves the check below is the SOLE
+    // enforcement). Never in a real build.
+    #[cfg(feature = "deputy_mutation")]
+    {
+        let _ = (addr, len);
+        return true;
+    }
+    #[cfg(not(feature = "deputy_mutation"))]
+    {
+        if len == 0 {
+            return true;
+        }
+        let end = match addr.checked_add(len) {
+            Some(e) => e,
+            None => return false, // wrap / non-canonical
+        };
+        if end > 4 * GIB {
+            return false; // beyond the 4 GiB identity map — never user memory
+        }
+        let mut a = addr & !(FOUR_KIB - 1);
+        while a < end {
+            if !page_is_user(a) {
+                return false;
+            }
+            a += FOUR_KIB;
+        }
+        true
+    }
+}
+
+/// Stage 3b.2: turn on CR4.SMAP (bit 21) on the CURRENT CPU. After this, any ring-0
+/// access to a US=1 (BEAM) page faults unless bracketed by stac/clac (see `uaccess`).
+/// The BSP calls this right before `jump_to_user` (after the legit boot-time ELF-load /
+/// argv writes to US=1 memory); each AP sets it in `ap_main` (CR4 is per-CPU).
+///
+/// # Safety
+/// Enables a hardware protection that faults on unguarded kernel↔user access — every
+/// such site must already route through `uaccess`, or must be reached only after here.
+pub unsafe fn enable_smap() {
+    unsafe {
+        let mut cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        cr4 |= 1 << 21;
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Walk `addr` and require PRESENT+US at every level (huge PDPTE/PDE terminate early).
+fn page_is_user(addr: u64) -> bool {
+    const PU: u64 = PAGE_PRESENT | PAGE_USER;
+    unsafe {
+        let pml4 = &*core::ptr::addr_of!(PML4);
+        let e = pml4.entries[((addr >> 39) & 0x1ff) as usize];
+        if e & PU != PU {
+            return false;
+        }
+        let pdpt = &*((e & ADDR_MASK) as *const PageTable);
+        let e = pdpt.entries[((addr >> 30) & 0x1ff) as usize];
+        if e & PU != PU {
+            return false;
+        }
+        if e & PAGE_HUGE != 0 {
+            return true; // 1 GiB leaf, US=1
+        }
+        let pd = &*((e & ADDR_MASK) as *const PageTable);
+        let e = pd.entries[((addr >> 21) & 0x1ff) as usize];
+        if e & PU != PU {
+            return false;
+        }
+        if e & PAGE_HUGE != 0 {
+            return true; // 2 MiB leaf, US=1
+        }
+        let pt = &*((e & ADDR_MASK) as *const PageTable);
+        let e = pt.entries[((addr >> 12) & 0x1ff) as usize];
+        e & PU == PU
     }
 }
 

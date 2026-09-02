@@ -579,6 +579,19 @@ extern "C" fn main(mbi: *const u8) -> ! {
         tyn_kernel::confine_probe::run();
     }
 
+    // Stage 3b.2: enable SMAP now — AFTER the boot-time ELF-load + argv/env writes to
+    // BEAM's US=1 memory (those are legitimate kernel→user writes), and right before the
+    // ring-3 handoff. From here every kernel access to US=1 memory must route through
+    // `uaccess` (stac/clac + bounds-check) or it faults. (SMEP was enabled at boot.)
+    unsafe { tyn_kernel::memory::paging::enable_smap(); }
+
+    // Stage 3b.2 confused-deputy teeth (feature `deputy_probe`): with SMAP live, prove the
+    // uaccess bounds-check rejects a kernel-range pointer in both a write- and read-path
+    // syscall (EFAULT), kernel memory untouched. `deputy_mutation` disables the check to
+    // show the deref then actually occurs.
+    #[cfg(feature = "deputy_probe")]
+    tyn_kernel::syscall::deputy_test();
+
     serial_println!("[boot] launching ERTS at {:#x} sp={:#x}", info.entry, sp);
     tyn_kernel::syscall::jump_to_user(info.entry, sp);
 }

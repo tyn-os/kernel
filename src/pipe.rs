@@ -57,15 +57,23 @@ pub fn write(fd: i32, data: *const u8, count: usize) -> i64 {
     unsafe {
         for (idx, pipe) in PIPES.iter_mut().enumerate() {
             if pipe.write_fd == fd {
-                let mut written = 0;
-                for i in 0..count {
-                    let byte = *data.add(i);
-                    let next_tail = (pipe.tail + 1) % PIPE_BUF_SIZE;
-                    if next_tail == pipe.head { break; }
-                    pipe.buf[pipe.tail] = byte;
-                    pipe.tail = next_tail;
-                    written += 1;
-                }
+                // 3b.2: `data` is a user source — guard the read window (the pipe buffer
+                // it copies into is kernel).
+                let written = match crate::uaccess::with_user_access(data as u64, count as u64, |p| {
+                    let mut written = 0;
+                    for i in 0..count {
+                        let byte = *p.add(i);
+                        let next_tail = (pipe.tail + 1) % PIPE_BUF_SIZE;
+                        if next_tail == pipe.head { break; }
+                        pipe.buf[pipe.tail] = byte;
+                        pipe.tail = next_tail;
+                        written += 1;
+                    }
+                    written
+                }) {
+                    Ok(w) => w,
+                    Err(_) => return -14,
+                };
                 if fd == 205 {
                     crate::serial_println!("[pipe] write fd=205 slot={} read_fd={} head={} tail={} written={}",
                         idx, pipe.read_fd, pipe.head, pipe.tail, written);
@@ -91,12 +99,20 @@ pub fn read(fd: i32, buf: *mut u8, count: usize) -> i64 {
                     }
                 }
                 if !pipe.is_empty() {
-                    let mut nread = 0;
-                    while nread < count && pipe.head != pipe.tail {
-                        *buf.add(nread) = pipe.buf[pipe.head];
-                        pipe.head = (pipe.head + 1) % PIPE_BUF_SIZE;
-                        nread += 1;
-                    }
+                    // 3b.2: `buf` is a user dest — guard the write window (the pipe buffer
+                    // it copies from is kernel).
+                    let nread = match crate::uaccess::with_user_access(buf as u64, count as u64, |p| {
+                        let mut nread = 0;
+                        while nread < count && pipe.head != pipe.tail {
+                            *p.add(nread) = pipe.buf[pipe.head];
+                            pipe.head = (pipe.head + 1) % PIPE_BUF_SIZE;
+                            nread += 1;
+                        }
+                        nread
+                    }) {
+                        Ok(n) => n,
+                        Err(_) => return -14,
+                    };
                     static LOG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
                     let c = LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     if c < 10 { crate::serial_println!("[pipe] read fd={} got {} bytes", fd, nread); }

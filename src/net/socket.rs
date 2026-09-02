@@ -298,13 +298,11 @@ pub fn sys_socket(domain: i32, sock_type: i32, _protocol: i32) -> i64 {
 /// SYN and returns -EINPROGRESS; ERTS then waits on epoll for POLLOUT and calls
 /// getsockopt(SO_ERROR). UDP: records the default peer (send/2 needs no addr).
 pub fn sys_connect(fd: i32, addr_ptr: *const u8, _addrlen: u32) -> i64 {
-    // struct sockaddr_in { sa_family(2), sin_port(2 be), sin_addr(4), zero(8) }
-    let (port, addr) = unsafe {
-        let family = *(addr_ptr as *const u16);
-        if family != 2 { return -97; } // AF_INET only
-        let port = u16::from_be(*(addr_ptr.add(2) as *const u16));
-        let ip = core::slice::from_raw_parts(addr_ptr.add(4), 4);
-        (port, Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]))
+    // 3b.2: `addr_ptr` is a user sockaddr_in (dist's outbound connect exercises this) —
+    // guarded read via the shared helper.
+    let (port, addr) = match read_sockaddr_in(addr_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
     let remote = IpEndpoint { addr: IpAddress::Ipv4(addr), port };
 
@@ -353,15 +351,48 @@ pub fn sys_connect(fd: i32, addr_ptr: *const u8, _addrlen: u32) -> i64 {
 }
 
 /// bind(fd, addr, addrlen) → 0 or error
+/// 3b.2: read a `struct sockaddr_in` (16 B) from a user pointer through the guard,
+/// returning (port, ipv4). Err(errno): -EFAULT (bad/kernel pointer) or -EAFNOSUPPORT.
+/// Shared by bind/connect/sendto — one audited user-read for the sockaddr shape.
+fn read_sockaddr_in(addr_ptr: *const u8) -> Result<(u16, Ipv4Address), i64> {
+    let mut sa = [0u8; 16];
+    if unsafe { crate::uaccess::copy_from_user(&mut sa, addr_ptr as u64) }.is_err() {
+        return Err(-14); // -EFAULT
+    }
+    if u16::from_ne_bytes([sa[0], sa[1]]) != 2 {
+        return Err(-97); // -EAFNOSUPPORT (AF_INET only)
+    }
+    let port = u16::from_be_bytes([sa[2], sa[3]]);
+    Ok((port, Ipv4Address::new(sa[4], sa[5], sa[6], sa[7])))
+}
+
+/// 3b.2: write a `struct sockaddr_in` (16 B, zero-padded) + optional addrlen(=16) to
+/// user pointers through the guard. No-op if `addr_ptr` is null. Returns 0 or -EFAULT.
+/// Shared by accept/getsockname/getpeername — one audited user-write for the sockaddr.
+fn write_sockaddr_in(addr_ptr: *mut u8, addrlen_ptr: *mut u32, port: u16, ip: [u8; 4]) -> i64 {
+    if addr_ptr.is_null() {
+        return 0;
+    }
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    sa[4..8].copy_from_slice(&ip);
+    if unsafe { crate::uaccess::copy_to_user(addr_ptr as u64, &sa) }.is_err() {
+        return -14;
+    }
+    if !addrlen_ptr.is_null()
+        && unsafe { crate::uaccess::copy_to_user(addrlen_ptr as u64, &16u32.to_ne_bytes()) }.is_err()
+    {
+        return -14;
+    }
+    0
+}
+
 pub fn sys_bind(fd: i32, addr_ptr: *const u8, _addrlen: u32) -> i64 {
     // Parse struct sockaddr_in { sa_family(2), sin_port(2), sin_addr(4), zero(8) }
-    let (port, addr) = unsafe {
-        let family = *(addr_ptr as *const u16);
-        if family != 2 { return -97; } // AF_INET only
-        let port = u16::from_be(*(addr_ptr.add(2) as *const u16));
-        let ip_bytes = core::slice::from_raw_parts(addr_ptr.add(4), 4);
-        let addr = Ipv4Address::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
-        (port, addr)
+    let (port, addr) = match read_sockaddr_in(addr_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
     with_socket(fd, |sock| {
@@ -601,25 +632,12 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
         udp_peer: None,
     });
 
-    // Fill in peer address if requested
-    if !addr_ptr.is_null() {
-        if let Some(remote) = remote {
-            unsafe {
-                // struct sockaddr_in
-                *(addr_ptr as *mut u16) = 2; // AF_INET
-                *(addr_ptr.add(2) as *mut u16) = remote.port.to_be();
-                if let IpAddress::Ipv4(v4) = remote.addr {
-                    core::ptr::copy_nonoverlapping(
-                        v4.octets().as_ptr(),
-                        addr_ptr.add(4),
-                        4,
-                    );
-                }
-                if !addrlen_ptr.is_null() {
-                    *addrlen_ptr = 16;
-                }
-            }
-        }
+    // Fill in peer address if requested (guarded). Best-effort: the connection is
+    // already accepted (new_fd allocated), so a bad addr_ptr (EFAULT) just skips the
+    // fill rather than leaking the fd — and skipping means the kernel never wrote it.
+    if let Some(remote) = remote {
+        let ip = if let IpAddress::Ipv4(v4) = remote.addr { v4.octets() } else { [0u8; 4] };
+        let _ = write_sockaddr_in(addr_ptr, addrlen_ptr, remote.port, ip);
     }
 
     crate::vdbg!("[accept] returning new_fd={}", new_fd);
@@ -633,22 +651,7 @@ pub fn sys_getsockname(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32) -> i64
         None => return -9,
     };
 
-    if !addr_ptr.is_null() {
-        unsafe {
-            core::ptr::write_bytes(addr_ptr, 0, 16);
-            *(addr_ptr as *mut u16) = 2; // AF_INET
-            *(addr_ptr.add(2) as *mut u16) = local.0.to_be();
-            core::ptr::copy_nonoverlapping(
-                local.1.octets().as_ptr(),
-                addr_ptr.add(4),
-                4,
-            );
-            if !addrlen_ptr.is_null() {
-                *addrlen_ptr = 16;
-            }
-        }
-    }
-    0
+    write_sockaddr_in(addr_ptr, addrlen_ptr, local.0, local.1.octets())
 }
 
 /// getpeername(fd, addr, addrlen) → 0 or error
@@ -665,24 +668,8 @@ pub fn sys_getpeername(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32) -> i64
 
     match remote {
         Some(ep) => {
-            if !addr_ptr.is_null() {
-                unsafe {
-                    core::ptr::write_bytes(addr_ptr, 0, 16);
-                    *(addr_ptr as *mut u16) = 2; // AF_INET
-                    *(addr_ptr.add(2) as *mut u16) = ep.port.to_be();
-                    if let IpAddress::Ipv4(v4) = ep.addr {
-                        core::ptr::copy_nonoverlapping(
-                            v4.octets().as_ptr(),
-                            addr_ptr.add(4),
-                            4,
-                        );
-                    }
-                    if !addrlen_ptr.is_null() {
-                        *addrlen_ptr = 16;
-                    }
-                }
-            }
-            0
+            let ip = if let IpAddress::Ipv4(v4) = ep.addr { v4.octets() } else { [0u8; 4] };
+            write_sockaddr_in(addr_ptr, addrlen_ptr, ep.port, ip)
         }
         None => -107, // -ENOTCONN
     }
@@ -735,29 +722,30 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
         } else { 0 }
     }).unwrap_or(0);
 
-    unsafe {
-        let len = *optlen;
-        match (level, optname) {
-            (1, 12) => { // SO_PRIORITY
-                if len >= 4 { *(optval as *mut i32) = 0; *optlen = 4; }
-            }
-            (0, 1) => { // IP_TOS
-                if len >= 4 { *(optval as *mut i32) = 0; *optlen = 4; }
-            }
-            (1, 13) => { // SO_LINGER
-                if len >= 8 {
-                    *(optval as *mut i32) = 0; // l_onoff
-                    *((optval as *mut i32).add(1)) = 0; // l_linger
-                    *optlen = 8;
-                }
-            }
-            (1, 4) => { // SO_ERROR
-                if len >= 4 { *(optval as *mut i32) = so_error; *optlen = 4; }
-            }
-            _ => {
-                if len >= 4 { *(optval as *mut i32) = 0; *optlen = 4; }
-            }
-        }
+    // 3b.2: `optlen` and `optval` are user pointers — read the caller's buffer size,
+    // then write the value + updated length through the guard.
+    let mut lenbuf = [0u8; 4];
+    if unsafe { crate::uaccess::copy_from_user(&mut lenbuf, optlen as u64) }.is_err() {
+        return -14;
+    }
+    let len = u32::from_ne_bytes(lenbuf);
+    // (value, width): SO_LINGER is two i32 zeros (8 B); SO_ERROR reports so_error;
+    // everything else we accept as a 4-byte 0 (matches the prior no-op semantics).
+    let (val, width): (i32, u32) = match (level, optname) {
+        (1, 4) => (so_error, 4),  // SO_ERROR
+        (1, 13) => (0, 8),        // SO_LINGER (l_onoff, l_linger both 0)
+        _ => (0, 4),
+    };
+    if len < width {
+        return 0; // caller buffer too small — leave untouched, as before
+    }
+    let mut out = [0u8; 8];
+    out[0..4].copy_from_slice(&val.to_ne_bytes()); // low i32 = value; SO_LINGER's high i32 stays 0
+    if unsafe { crate::uaccess::copy_to_user(optval as u64, &out[..width as usize]) }.is_err() {
+        return -14;
+    }
+    if unsafe { crate::uaccess::copy_to_user(optlen as u64, &width.to_ne_bytes()) }.is_err() {
+        return -14;
     }
     0
 }
@@ -765,23 +753,22 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
 /// send/sendto/write on a socket fd
 pub fn sys_sendto(fd: i32, buf: *const u8, len: usize, _flags: i32,
                   dest_addr: *const u8, _addrlen: u32) -> i64 {
+    // `data` is a fat pointer over the user send buffer; the actual read happens
+    // inside `send_slice`, bracketed by the guard below (3b.2). Building the slice
+    // does not touch the memory.
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
 
-    // For UDP sendto, the destination is in dest_addr (sockaddr_in). If NULL
-    // (plain send/2 on a connected UDP socket), fall back to the stored peer.
-    let dest = if !dest_addr.is_null() {
-        unsafe {
-            let family = *(dest_addr as *const u16);
-            if family == 2 {
-                let port = u16::from_be(*(dest_addr.add(2) as *const u16));
-                let ip = core::slice::from_raw_parts(dest_addr.add(4), 4);
-                Some(IpEndpoint {
-                    addr: IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
-                    port,
-                })
-            } else { None }
+    // For UDP sendto, the destination is in dest_addr (sockaddr_in) — a user source.
+    // NULL (plain send/2 on a connected UDP socket) → fall back to the stored peer;
+    // a bad/non-AF_INET dest_addr also falls back (best-effort, never derefs kernel).
+    let dest = if dest_addr.is_null() {
+        None
+    } else {
+        match read_sockaddr_in(dest_addr) {
+            Ok((port, v4)) => Some(IpEndpoint { addr: IpAddress::Ipv4(v4), port }),
+            Err(_) => None,
         }
-    } else { None };
+    };
 
     with_socket(fd, |sock| {
         match sock.sock_type {
@@ -800,10 +787,14 @@ pub fn sys_sendto(fd: i32, buf: *const u8, len: usize, _flags: i32,
                 }
                 let r = crate::net::with_net(|net| {
                     let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
-                    match udp.send_slice(data, endpoint) {
-                        Ok(()) => len as i64,
-                        Err(udp::SendError::BufferFull) => -11, // -EAGAIN
-                        Err(_) => -22, // -EINVAL
+                    // 3b.2: `data` reads the user send buffer — validate + stac around it.
+                    match unsafe { crate::uaccess::with_user_access(buf as u64, len as u64, |_| {
+                        udp.send_slice(data, endpoint)
+                    }) } {
+                        Ok(Ok(())) => len as i64,
+                        Ok(Err(udp::SendError::BufferFull)) => -11, // -EAGAIN
+                        Ok(Err(_)) => -22, // -EINVAL
+                        Err(_) => -14, // -EFAULT (bad/kernel buffer pointer)
                     }
                 });
                 crate::net::poll(); // flush the datagram now
@@ -815,9 +806,11 @@ pub fn sys_sendto(fd: i32, buf: *const u8, len: usize, _flags: i32,
                     if !tcp.can_send() {
                         return -11i64; // -EAGAIN
                     }
-                    match tcp.send_slice(data) {
-                        Ok(sent) => sent as i64,
-                        Err(_) => -104, // -ECONNRESET
+                    // 3b.2: `data` reads the user send buffer — validate + stac around it.
+                    match unsafe { crate::uaccess::with_user_access(buf as u64, len as u64, |_| tcp.send_slice(data)) } {
+                        Ok(Ok(sent)) => sent as i64,
+                        Ok(Err(_)) => -104, // -ECONNRESET
+                        Err(_) => -14, // -EFAULT
                     }
                 })
             }
@@ -845,10 +838,12 @@ pub fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, _flags: i32,
                         }
                         return -11; // -EAGAIN
                     }
+                    // 3b.2: `dest` is the user recv buffer — validate + stac around it.
                     let dest = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-                    match tcp.recv_slice(dest) {
-                        Ok(n) => n as i64,
-                        Err(_) => -104, // -ECONNRESET
+                    match unsafe { crate::uaccess::with_user_access(buf as u64, len as u64, |_| tcp.recv_slice(dest)) } {
+                        Ok(Ok(n)) => n as i64,
+                        Ok(Err(_)) => -104, // -ECONNRESET
+                        Err(_) => -14, // -EFAULT
                     }
                 })
             }
@@ -861,23 +856,16 @@ pub fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, _flags: i32,
                     match udp.recv() {
                         Ok((data, meta)) => {
                             let n = data.len().min(len);
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(data.as_ptr(), buf, n);
-                                // recvfrom must fill src_addr — the resolver
-                                // verifies the reply came from the nameserver and
-                                // silently drops it otherwise.
-                                if !src_addr.is_null() {
-                                    let ep = meta.endpoint;
-                                    *(src_addr as *mut u16) = 2u16; // AF_INET
-                                    *(src_addr.add(2) as *mut u16) = ep.port.to_be();
-                                    if let IpAddress::Ipv4(v4) = ep.addr {
-                                        let oct = v4.octets();
-                                        core::ptr::copy_nonoverlapping(
-                                            oct.as_ptr(), src_addr.add(4), 4);
-                                    }
-                                    if !addrlen.is_null() { *addrlen = 16; }
-                                }
+                            // 3b.2: copy the datagram into the user buffer (kernel src →
+                            // user dest — guard the dest write).
+                            if unsafe { crate::uaccess::copy_to_user(buf as u64, &data[..n]) }.is_err() {
+                                return -14;
                             }
+                            // recvfrom must fill src_addr — the resolver verifies the reply
+                            // came from the nameserver and silently drops it otherwise.
+                            let ep = meta.endpoint;
+                            let ip = if let IpAddress::Ipv4(v4) = ep.addr { v4.octets() } else { [0u8; 4] };
+                            let _ = write_sockaddr_in(src_addr, addrlen, ep.port, ip);
                             n as i64
                         }
                         Err(_) => -11, // -EAGAIN

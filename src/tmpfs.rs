@@ -150,16 +150,21 @@ fn alloc_fd() -> i32 {
 ///
 /// # Safety
 /// `buf` must point to at least 144 bytes of writable user memory, or be null.
-unsafe fn write_stat(buf: *mut u8, mode: u32, size: usize) {
+unsafe fn write_stat(buf: *mut u8, mode: u32, size: usize) -> i64 {
     if buf.is_null() {
-        return;
+        return 0;
     }
-    core::ptr::write_bytes(buf, 0, 144);
-    *(buf.add(24) as *mut u32) = mode; // st_mode
-    *(buf.add(48) as *mut u64) = size as u64; // st_size
-    *(buf.add(56) as *mut u64) = 4096; // st_blksize
-    // st_nlink at offset 16 — report 1 for files, 2 for dirs (self + parent).
-    *(buf.add(16) as *mut u64) = if mode & 0o040000 != 0 { 2 } else { 1 };
+    // 3b.2: build struct stat (144 B) in a kernel buffer, then ONE guarded copy out.
+    let mut st = [0u8; 144];
+    // st_nlink @16 — 1 for files, 2 for dirs (self + parent).
+    st[16..24].copy_from_slice(&(if mode & 0o040000 != 0 { 2u64 } else { 1u64 }).to_ne_bytes());
+    st[24..28].copy_from_slice(&mode.to_ne_bytes()); // st_mode
+    st[48..56].copy_from_slice(&(size as u64).to_ne_bytes()); // st_size
+    st[56..64].copy_from_slice(&4096u64.to_ne_bytes()); // st_blksize
+    match crate::uaccess::copy_to_user(buf as u64, &st) {
+        Ok(()) => 0,
+        Err(e) => e as i64,
+    }
 }
 
 /// stat(2)/newfstatat(2) for a tmpfs path. Returns 0 and fills `buf`, or a
@@ -178,12 +183,10 @@ pub unsafe fn stat(path: &[u8], buf: *mut u8) -> i64 {
     };
     match fs.nodes.get(&n) {
         Some(node) if node.is_dir => {
-            write_stat(buf, 0o040000 | (node.mode & 0o7777), 4096);
-            0
+            write_stat(buf, 0o040000 | (node.mode & 0o7777), 4096)
         }
         Some(node) => {
-            write_stat(buf, 0o100000 | (node.mode & 0o7777), node.data.len());
-            0
+            write_stat(buf, 0o100000 | (node.mode & 0o7777), node.data.len())
         }
         None => ENOENT,
     }
@@ -295,8 +298,11 @@ unsafe fn write_at(fs: &mut Tmpfs, path: &[u8], at: usize, buf: *const u8, count
         node.data.resize(new_end, 0); // zero-fill any gap (at > len) and the tail
         fs.total += grow;
     }
-    let src = core::slice::from_raw_parts(buf, n);
-    node.data[at..new_end].copy_from_slice(src);
+    // 3b.2: `buf` is a USER source; node.data (the backing store) is kernel. Guard the
+    // source read only — copy user bytes into the kernel backing via the guard.
+    if unsafe { crate::uaccess::copy_from_user(&mut node.data[at..new_end], buf as u64) }.is_err() {
+        return crate::uaccess::EFAULT as i64;
+    }
     n as i64
 }
 
@@ -360,7 +366,11 @@ unsafe fn read_at(node: &Node, at: usize, buf: *mut u8, count: usize) -> i64 {
         return 0; // EOF
     }
     let n = count.min(node.data.len() - at);
-    core::ptr::copy_nonoverlapping(node.data[at..].as_ptr(), buf, n);
+    // 3b.2: node.data (backing store) is kernel; `buf` is a USER dest. Guard the dest
+    // write only — copy kernel backing into the user buffer via the guard.
+    if unsafe { crate::uaccess::copy_to_user(buf as u64, &node.data[at..at + n]) }.is_err() {
+        return crate::uaccess::EFAULT as i64;
+    }
     n as i64
 }
 
@@ -515,12 +525,10 @@ pub unsafe fn fstat(fd: i32, buf: *mut u8) -> i64 {
     };
     match fs.nodes.get(&o.path) {
         Some(node) if node.is_dir => {
-            write_stat(buf, 0o040000 | (node.mode & 0o7777), 4096);
-            0
+            write_stat(buf, 0o040000 | (node.mode & 0o7777), 4096)
         }
         Some(node) => {
-            write_stat(buf, 0o100000 | (node.mode & 0o7777), node.data.len());
-            0
+            write_stat(buf, 0o100000 | (node.mode & 0o7777), node.data.len())
         }
         None => EBADF,
     }

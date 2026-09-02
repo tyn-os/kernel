@@ -261,8 +261,33 @@ core::arch::global_asm!(
     "iretq",
 );
 
+/// Stage 3b.2 SMAP hunt: dedup table so each unwrapped copy site (by faulting IP) logs
+/// once across a run. Feature-gated — the hunt instrument only.
+#[cfg(feature = "smap_hunt")]
+mod smap_hunt {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    const MAX: usize = 128;
+    static SEEN_IP: [AtomicU64; MAX] = [const { AtomicU64::new(0) }; MAX];
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    /// Returns true if `ip` is a newly-seen site (caller logs it).
+    pub fn note(ip: u64) -> bool {
+        let n = COUNT.load(Ordering::Acquire).min(MAX);
+        for i in 0..n {
+            if SEEN_IP[i].load(Ordering::Relaxed) == ip {
+                return false;
+            }
+        }
+        let idx = COUNT.fetch_add(1, Ordering::AcqRel);
+        if idx < MAX {
+            SEEN_IP[idx].store(ip, Ordering::Relaxed);
+        }
+        true
+    }
+}
+
+#[allow(unused_mut)] // `mut frame` is only mutated under feature `smap_hunt`
 extern "x86-interrupt" fn page_fault_handler(
-    frame: InterruptStackFrame,
+    mut frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     // Stage 3a confinement teeth (feature): an armed ring-3 fault IS the deliberate
@@ -274,6 +299,61 @@ extern "x86-interrupt" fn page_fault_handler(
             unsafe {
                 crate::confine_probe::contain_longjmp(Cr2::read_raw(), error_code.bits());
             }
+        }
+    }
+    // Stage 3b.0: a stray ring-3 access to the low 2 MiB is a latent ERTS NULL-base RMW
+    // (ring 0 masked it; ring 3 faults). Satisfy it with a dedicated writable US=1 scratch
+    // page — BEAM's read/write lands there, kernel low-RAM stays confined (US=0) — and
+    // RETRY. Read OR write (the ERTS path reads 0x2be4 then writes it). Any non-low fault
+    // falls through to report + contain. Log each unique page (self-deduping — a mapped
+    // page no longer faults).
+    if from_ring3(&frame) {
+        let cr2 = Cr2::read_raw();
+        if cr2 < 0x20_0000 && unsafe { crate::memory::paging::map_low_scratch(cr2) } {
+            crate::serial::raw_str_nolock(b"[low-zero] ring-3 low access cr2=");
+            crate::serial::raw_hex_nolock(cr2);
+            crate::serial::raw_str_nolock(b" ip=");
+            crate::serial::raw_hex_nolock(frame.instruction_pointer.as_u64());
+            crate::serial::raw_str_nolock(b" err=");
+            crate::serial::raw_hex_nolock(error_code.bits());
+            crate::serial::raw_str_nolock(b"\n");
+            return; // retry (now hits the scratch page)
+        }
+    }
+    // Stage 3b.2 SMAP hunt (feature): a ring-0 access (supervisor, U/S=0) to a PRESENT,
+    // US=1 page with AC=0 is an UNWRAPPED copy site. Log it (once per faulting IP), set AC
+    // in the interrupted RFLAGS so the retried access proceeds, and return — so ONE run
+    // enumerates every site the exercised workload reaches instead of halting at the first.
+    // (This is the enumeration instrument; real enforcement is the uaccess guard.)
+    #[cfg(feature = "smap_hunt")]
+    {
+        let err = error_code.bits();
+        let cr2 = Cr2::read_raw();
+        if !from_ring3(&frame)
+            && (err & 0x1) != 0
+            && (err & 0x4) == 0
+            && crate::memory::paging::user_accessible(cr2, 1)
+        {
+            let ip = frame.instruction_pointer.as_u64();
+            if smap_hunt::note(ip) {
+                // ret = the value at the interrupted RSP. For a leaf routine
+                // (compiler-builtins memcpy/memset use `rep movs`, no prologue push) this
+                // is the CALLER's return address — which pins the bulk-copy call site the
+                // faulting ip (inside memcpy/memset) can't. Reading the kernel stack (US=0)
+                // from ring 0 is safe.
+                let ret = unsafe { *(frame.stack_pointer.as_u64() as *const u64) };
+                crate::serial::raw_str_nolock(b"[smap-site] ip=");
+                crate::serial::raw_hex_nolock(ip);
+                crate::serial::raw_str_nolock(b" cr2=");
+                crate::serial::raw_hex_nolock(cr2);
+                crate::serial::raw_str_nolock(b" err=");
+                crate::serial::raw_hex_nolock(err);
+                crate::serial::raw_str_nolock(b" ret=");
+                crate::serial::raw_hex_nolock(ret);
+                crate::serial::raw_str_nolock(b"\n");
+            }
+            unsafe { frame.as_mut().update(|f| f.cpu_flags |= 1 << 18) }; // set AC → retried access proceeds
+            return;
         }
     }
     // Fault report (lock-free serial: works even if another CPU holds the lock). The

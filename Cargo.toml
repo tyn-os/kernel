@@ -31,6 +31,23 @@ syscall_count = []
 # production. See src/confine_probe.rs.
 confine_probe = []
 
+# Isolation Stage-3b.2 SMAP copy-site hunt instrument (OFF by default; --features
+# smap_hunt). SMAP enforces only on real HW (TCG accepts CR4.SMAP but doesn't enforce),
+# so the hunt runs on Nitro: the #PF handler logs each unwrapped kernel->US=1 access
+# (dedup by ip), sets AC, and retries — one run enumerates the sites across the exercised
+# workload. Never in production (production wants the guard to enforce, not auto-recover).
+smap_hunt = []
+
+# Isolation Stage-3b.2 confused-deputy TEETH (OFF by default; --features deputy_probe).
+# After SMAP is on, calls real syscall handlers with a KERNEL-range pointer arg and
+# asserts the uaccess bounds-check rejects both the write path (clock_gettime) and the
+# read path (futex) with EFAULT, kernel memory untouched. `deputy_mutation` additionally
+# disables the bounds-check (user_accessible→true) so the SAME calls demonstrably deref
+# the kernel address (write clobbers a sentinel; read leaks a value) — the contrast proves
+# the check is enforcement, not luck. Never in production.
+deputy_probe = []
+deputy_mutation = ["deputy_probe"]
+
 [dependencies]
 x86_64 = "0.14"
 uart_16550 = "0.2"
