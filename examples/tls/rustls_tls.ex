@@ -96,10 +96,33 @@ defmodule Tyn.Transports.RustlsTLS do
   end
 
   @impl true
+  # rustls caps its outgoing buffer (~64 KB default); feeding a larger body to
+  # write_plain in one shot overflows it ("failed to write whole buffer") and drops
+  # the response. Chunk the plaintext and drain the ciphertext between chunks so the
+  # buffer never fills, for any body size.
+  @tls_chunk 16384
   def send({:tyn_s, raw, conn}, data) do
-    case :tyn_tls.write_plain(conn, :erlang.iolist_to_binary(data)) do
-      :ok -> flush(raw, conn)
-      {:error, e} -> {:error, e}
+    send_chunked(raw, conn, :erlang.iolist_to_binary(data))
+  end
+
+  defp send_chunked(_raw, _conn, <<>>), do: :ok
+
+  defp send_chunked(raw, conn, bin) do
+    {chunk, rest} =
+      case bin do
+        <<c::binary-size(@tls_chunk), r::binary>> -> {c, r}
+        _ -> {bin, <<>>}
+      end
+
+    case :tyn_tls.write_plain(conn, chunk) do
+      :ok ->
+        case flush(raw, conn) do
+          :ok -> send_chunked(raw, conn, rest)
+          e -> e
+        end
+
+      {:error, e} ->
+        {:error, e}
     end
   end
 
