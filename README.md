@@ -4,6 +4,8 @@ A minimal Rust microkernel purpose-built for the BEAM.
 
 No Linux. No POSIX. Your Erlang/Elixir code on bare metal.
 
+> **Recent:** the BEAM now runs confined in ring 3 (isolated from the kernel); in-guest TLS works both directions; deploying your own app is one command (`tyn deploy`). See [CHANGELOG.md](CHANGELOG.md).
+
 ## What is Tyn?
 
 Tyn is a unikernel: a single-purpose OS kernel that hosts exactly one thing — the BEAM virtual machine. It replaces the entire Linux stack with ~8,000 lines of Rust, and runs on KVM/QEMU and on **real AWS Nitro EC2**, driving the network with a from-scratch ENA driver and serving HTTP directly from the kernel.
@@ -35,7 +37,7 @@ The serving path is `ENA hardware → admin queue → I/O queues → smoltcp →
 
 ## Try it
 
-A public AMI is available in `us-east-1` — running in under two minutes, no build required.
+**Run the demo** — a public AMI in `us-east-1`, no build required:
 
 ```bash
 aws ec2 run-instances --image-id ami-0c13cb4a868a6e441 \
@@ -47,12 +49,19 @@ curl -s http://<public-ip>:8080/assets/app.js | wc -c    # → a static asset vi
 # open http://<public-ip>:8080/counter in a browser — the LiveView counter increments live
 ```
 
-The full walkthrough — security groups, the IAM-gated serial console, and deploying **your own** app with `tyn-pack` — is in [`docs/DEPLOY.md`](docs/DEPLOY.md). Instances accrue hourly charges; terminate when done.
+**Deploy your own app** — one command takes a Mix release to a running instance:
+
+```bash
+tyn deploy --env DATABASE_URL=... my_app/    # release → AMI → running Nitro instance
+```
+
+It packs the release, builds and imports the image, registers the AMI (reused on unchanged redeploys), launches, and prints the IP and how to reach it. The full walkthrough — IAM policy, security groups, the IAM-gated serial console, config/secrets — is in [`docs/DEPLOY.md`](docs/DEPLOY.md). Instances accrue hourly charges; terminate when done.
 
 ## What works
 
 - **Full Phoenix stack, stock app** — a `mix phx.new` app runs unmodified: static assets (`Plug.Static` / `send_file` over kernel `sendfile(2)`, no dependency patch), interactive LiveView (WebSocket mount + live updates), `runtime.exs`, signed cookies / CSRF / `Phoenix.Token`, and outbound TCP/UDP + DNS. Clean-clone validated byte-exact on Nitro; codified in [`tests/`](tests/).
 - **BEAM confined in ring 3** — the BEAM runs as ring-3 userland with the kernel in ring 0 behind a hardware boundary: US/NX page permissions, SMEP/SMAP, and a syscall path that bounds-checks every user pointer. A memory-safety bug in the BEAM or a NIF faults and is contained; the kernel keeps serving. Proven by violation — a deliberate BEAM write to a kernel address is denied and contained, and the confused-deputy case (handing the kernel a bad pointer) is rejected — on 16-vCPU Nitro. This confines the kernel from the BEAM; the JIT region is necessarily user-RWX, so it doesn't internally harden the BEAM, and side-channel (Meltdown/Spectre) isolation is future work.
+- **One-command deploy** — `tyn deploy` takes a Mix release to a running Nitro instance: packs it, builds/imports/registers the AMI (content-hashed, so unchanged redeploys skip the ~10-min import), launches, injects config/secrets via `--env`, and reports the IP. `tyn iam-policy` prints the required IAM, and a preflight fails early on missing permissions. A bash wrapper over `tyn-pack` + the AWS CLI.
 - **8-way SMP** — ACPI/MADT CPU discovery, APIC timer calibration, AP trampoline (16→64-bit), per-CPU GDT/TSS/IST, per-CPU GS_BASE syscall data, IPI wakeup, preemptive user-mode scheduling.
 - **BeamAsm JIT** — OTP 27 built `--enable-jit`. The timer preempts inside mmap'd JIT pages; `erlang:system_info(emu_flavor)` returns `jit`.
 - **TCP/UDP networking** — `gen_tcp` / `gen_udp` end-to-end: POSIX socket layer → smoltcp → virtio-net (QEMU) or the from-scratch ENA driver (Nitro). On Nitro the address comes from DHCP, with lease renewal.
@@ -89,6 +98,7 @@ Tyn is a specialized runtime, and these are first-class, not footnotes. Two kind
 - **Crypto and TLS are unreviewed.** The `:crypto` and TLS NIFs (RustCrypto primitives, kernel-CSPRNG-fed) pass known-answer vectors and match upstream OTP byte-for-byte, and `verify` — the silent-MITM keystone — is adversarially tested, but the surface has had **no outside security review**. Don't rely on it for production security until it has (RNG-review first). TLS 1.2 and mTLS aren't done. Boot panics without a hardware RNG (RDRAND/RDSEED; present on c5/m5/t3 Nitro).
 - **Clustering is not turnkey.** Two-node distribution is validated but needs static host mapping (no in-guest `.internal` DNS). Fine for a fixed pair; not drop-in multi-node discovery.
 - **Confinement is against memory-safety faults, not side channels.** Ring-3 isolation protects the kernel from a BEAM memory bug (proven), but doesn't yet defend Meltdown/Spectre-class side channels — that needs separate page tables (KPTI), which is future work. The JIT region is user-RWX by necessity, so the BEAM isn't internally W^X-hardened.
+- **No built-in observability yet.** Logs and BEAM stats are reachable over the eval shell / serial console, but there's no logs-off-the-box or metrics endpoint yet — operating a deployed instance is hands-on. Deployment (`tyn deploy`) is done; lifecycle/observability tooling is next.
 - **LiveView on a bare IP needs `check_origin`.** Phoenix returns `403` on the LiveView WebSocket when the served host doesn't match the configured URL host. `check_origin: false` is fine for a throwaway IP demo, but for production set the real host list — `false` is a cross-site WebSocket-hijacking hole on a real deployment.
 
 ## Architecture
@@ -143,7 +153,7 @@ qemu-system-x86_64 \
   -netdev user,id=net0,hostfwd=tcp::5555-:8080,hostfwd=tcp::5567-:9090
 ```
 
-The committed image boots a **minimal bench app** — small endpoints to confirm the kernel boots, serves, and runs the BEAM. It's *not* the full Phoenix demo; the stock-`phx.new` app is what the [public AMI](#try-it) runs and what you get by [packaging your own app](docs/DEPLOY.md). Once the serial console prints `phoenix_listening`:
+The committed image boots a **minimal bench app** — small endpoints to confirm the kernel boots, serves, and runs the BEAM. It's *not* the full Phoenix demo; the stock-`phx.new` app is what the [public AMI](#try-it) runs and what you get by deploying your own app. Once the serial console prints `phoenix_listening`:
 
 ```bash
 curl http://localhost:5555/          # landing page (endpoint list)
