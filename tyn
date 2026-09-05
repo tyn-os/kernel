@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# tyn — deploy a Mix release as a Tyn unikernel on AWS (v1).
+#
+#   tyn build   <release|mix-project> [opts]   # -> a registered AMI id
+#   tyn deploy  <release|mix-project> [opts]   # -> a running, reachable instance
+#
+# A thin wrapper over the proven pieces: tyn-pack (release -> cpio, config baked
+# into boot.config), build-disk.sh (cpio+kernel -> GRUB/BIOS raw), and the AWS CLI
+# (S3 -> import-snapshot -> register-image -> run-instances). AWS-specific by design
+# (that's where Tyn is proven); Tyn itself is a KVM unikernel, portable by NIC driver.
+#
+# Scope (v1): get one real app running with one command. Lifecycle/observability
+# (status/logs/terminate) are the next piece, intentionally out of scope here.
+set -euo pipefail
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REGION="${AWS_REGION:-us-east-1}"
+KERNEL="${TYN_KERNEL:-$SELF/target/x86_64-tyn/release/tyn-kernel}"
+BASE_CPIO="${TYN_BASE:-$SELF/src/otp-rootfs.cpio}"
+PACK="${TYN_PACK:-$SELF/tyn-pack}"
+BUILD_DISK="${TYN_BUILD_DISK:-$SELF/build-disk.sh}"
+INSTANCE_TYPE="c5.large"
+APP_PORT=8080
+SHELL_PORT=9090
+STATE_DIR="${TYN_STATE_DIR:-$HOME/.tyn}"
+
+# ---- logging: everything to stderr so stdout carries only machine output (the AMI id) ----
+say()  { printf '\033[36m▸\033[0m %s\n' "$*" >&2; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+hr()   { printf '\033[2m%s\033[0m\n' "────────────────────────────────────────────" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+tyn — deploy a Mix release as a Tyn unikernel on AWS (v1)
+
+  tyn build   <release|mix-project> [options]     build a registered AMI
+  tyn deploy  <release|mix-project> [options]     build (or reuse) + launch an instance
+  tyn iam-policy                                   print the IAM policy JSON you need
+  tyn help
+
+<release|mix-project>
+  A Mix release dir (_build/prod/rel/<app>), OR a project root with mix.exs
+  (then 'mix release' is run for you with MIX_ENV=prod).
+
+Options
+  --env KEY=VALUE        set a runtime env var (repeatable) — e.g. DATABASE_URL
+  --env-file FILE        load KEY=VALUE lines as --env
+  --app NAME             release app name (default: release dir basename)
+  --port N               app listener port (default: $APP_PORT)
+  --instance-type T      EC2 type (deploy; default: $INSTANCE_TYPE)
+  --region R             AWS region (default: \$AWS_REGION or us-east-1)
+  --name NAME            name tag / AMI name prefix (default: the app name)
+  --sg SG_ID             reuse an existing security group (else find/create 'tyn-sg')
+  --kernel FILE          Tyn kernel (default: $KERNEL)
+  --base FILE            base OTP rootfs cpio (default: $BASE_CPIO)
+  --no-reuse             force a fresh import even if a matching AMI exists
+  --yes                  don't prompt (non-interactive)
+
+Env vars honored: AWS_REGION, TYN_KERNEL, TYN_BASE.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# gotcha note — shown once per machine, or every time with TYN_ALWAYS_NOTE=1.
+# These are the Tyn-specific surprises that actually bite at deploy time.
+# ---------------------------------------------------------------------------
+gotcha_note() {
+  local marker="$STATE_DIR/seen-gotchas"
+  if [ "${TYN_ALWAYS_NOTE:-0}" != "1" ] && [ -f "$marker" ]; then return 0; fi
+  cat >&2 <<'EOF'
+
+  ┌─ What's different about Tyn (read once) ─────────────────────────────────┐
+  │ • No persistent disk. /tmp and /dev/shm are a volatile 4 MiB tmpfs, lost  │
+  │   on reboot. The app VFS is read-only. Use an external DB for state.      │
+  │ • IPv4 only. Stock Phoenix binds IPv6-any; Tyn rewrites that to IPv4 at   │
+  │   boot — handled, but real (no IPv6).                                     │
+  │ • LiveView on a bare IP needs check_origin set, or Phoenix 403s the       │
+  │   WebSocket. For a throwaway demo, check_origin: false; for real use set  │
+  │   the host list (false is a WS-hijacking hole in production).             │
+  │ • In-guest crypto/TLS is from-scratch and UNREVIEWED — fine to try, do    │
+  │   not rely on it for production session security yet.                     │
+  └──────────────────────────────────────────────────────────────────────────┘
+EOF
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  touch "$marker" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# IAM preflight — fail early, name the missing permission (opaque mid-flow AWS
+# failures are worse than the manual steps).
+# ---------------------------------------------------------------------------
+aws_ec2() { aws ec2 "$@" --region "$REGION"; }
+
+dryrun_authorized() {  # $* = ec2 subcommand + args; 0 if authorized, 1 if explicitly not
+  local out
+  out=$(aws ec2 "$@" --dry-run --region "$REGION" 2>&1) || true
+  echo "$out" | grep -q "UnauthorizedOperation" && return 1
+  return 0   # DryRunOperation, or a non-auth error (resource) => auth is not the blocker
+}
+
+preflight() {
+  command -v aws >/dev/null 2>&1 || die "aws CLI not found — install and configure it."
+  [ -x "$PACK" ] || die "tyn-pack not found/executable at $PACK"
+  [ -f "$KERNEL" ] || die "kernel not found at $KERNEL (build it, or pass --kernel)"
+  [ -f "$BASE_CPIO" ] || die "base rootfs cpio not found at $BASE_CPIO (pass --base)"
+
+  local acct
+  acct=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) \
+    || die "AWS credentials not working (sts get-caller-identity failed). Run 'aws configure'."
+
+  # read perms we rely on for polling / lookups
+  aws_ec2 describe-instances --max-items 1 >/dev/null 2>&1 \
+    || die "missing IAM permission ec2:DescribeInstances — see 'tyn iam-policy'"
+  aws_ec2 describe-images --owners self --max-items 1 >/dev/null 2>&1 \
+    || die "missing IAM permission ec2:DescribeImages — see 'tyn iam-policy'"
+  aws_ec2 describe-security-groups --max-items 1 >/dev/null 2>&1 \
+    || die "missing IAM permission ec2:DescribeSecurityGroups — see 'tyn iam-policy'"
+
+  # write perms via dry-run where supported
+  dryrun_authorized create-security-group --group-name tyn-preflight-xxx --description x \
+    || die "missing IAM permission ec2:CreateSecurityGroup — see 'tyn iam-policy'"
+  dryrun_authorized run-instances --image-id ami-00000000 --instance-type "$INSTANCE_TYPE" \
+    || die "missing IAM permission ec2:RunInstances — see 'tyn iam-policy'"
+
+  echo "$acct"   # stdout: caller account, used to name the S3 bucket
+}
+
+# ---------------------------------------------------------------------------
+# arg parsing (shared by build + deploy)
+# ---------------------------------------------------------------------------
+SRC=""; APP=""; NAME=""; SG_ID=""; NO_REUSE=0; ASSUME_YES=0
+declare -a ENVS=()
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --env)          ENVS+=("$2"); shift 2;;
+      --env-file)     [ -f "$2" ] || die "--env-file not found: $2"
+                      while IFS= read -r line; do
+                        [ -z "$line" ] && continue
+                        case "$line" in \#*) continue;; esac
+                        ENVS+=("$line")
+                      done < "$2"; shift 2;;
+      --app)          APP="$2"; shift 2;;
+      --port)         APP_PORT="$2"; shift 2;;
+      --instance-type)INSTANCE_TYPE="$2"; shift 2;;
+      --region)       REGION="$2"; shift 2;;
+      --name)         NAME="$2"; shift 2;;
+      --sg)           SG_ID="$2"; shift 2;;
+      --kernel)       KERNEL="$2"; shift 2;;
+      --base)         BASE_CPIO="$2"; shift 2;;
+      --no-reuse)     NO_REUSE=1; shift;;
+      --yes|-y)       ASSUME_YES=1; shift;;
+      -h|--help)      usage; exit 0;;
+      -*)             die "unknown option: $1";;
+      *)              [ -z "$SRC" ] && SRC="$1" || die "unexpected arg: $1"; shift;;
+    esac
+  done
+  [ -n "$SRC" ] || { usage; die "missing <release|mix-project>"; }
+}
+
+# resolve a Mix project (mix.exs) into a built release dir; pass a release dir through
+resolve_release() {
+  local src="$1"
+  if [ -f "$src/mix.exs" ]; then
+    say "mix project detected — running MIX_ENV=prod mix release"
+    ( cd "$src" && MIX_ENV=prod mix release --overwrite >&2 ) || die "mix release failed"
+    local name; name=$(cd "$src" && ls _build/prod/rel 2>/dev/null | head -1)
+    [ -n "$name" ] || die "no release under $src/_build/prod/rel after mix release"
+    echo "$src/_build/prod/rel/$name"
+  elif [ -d "$src/releases" ] || [ -d "$src/bin" ]; then
+    echo "$src"
+  else
+    die "not a Mix release or project (no mix.exs, no releases/): $src"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# tyn build: release -> cpio -> fingerprint -> reuse-or-import -> AMI id (stdout)
+# ---------------------------------------------------------------------------
+do_build() {
+  local acct="$1"; shift
+  local rel; rel=$(resolve_release "$SRC")
+  [ -z "$APP" ] && APP=$(basename "$rel")
+  [ -z "$NAME" ] && NAME="$APP"
+
+  # Build fingerprint from the INPUTS, not the packed cpio: tyn-pack embeds
+  # timestamps, so the cpio differs every run and would defeat reuse. Hash file
+  # CONTENTS (not paths — sha256sum prints the filename, which would make the
+  # fingerprint depend on relative-vs-absolute paths): release files by their
+  # rel-relative path+content, kernel and base by content only.
+  local fp
+  fp=$( {
+    ( cd "$rel" && find . -type f -print0 2>/dev/null | LC_ALL=C sort -z | xargs -0 sha256sum 2>/dev/null )
+    printf 'env:%s\n' "${ENVS[@]:-}" | LC_ALL=C sort
+    echo "app=$APP port=$APP_PORT"
+    sha256sum < "$KERNEL"
+    sha256sum < "$BASE_CPIO"
+  } | sha256sum | cut -c1-16 )
+  say "build fingerprint: $fp"
+
+  if [ "$NO_REUSE" != "1" ]; then
+    local existing
+    existing=$(aws_ec2 describe-images --owners self \
+      --filters "Name=tag:tyn-fingerprint,Values=$fp" "Name=state,Values=available" \
+      --query 'Images[0].ImageId' --output text 2>/dev/null || echo None)
+    if [ -n "$existing" ] && [ "$existing" != "None" ]; then
+      ok "reusing AMI $existing (fingerprint match — skipped pack + the ~10 min import)"
+      echo "$existing"; return 0
+    fi
+  fi
+
+  # not reusing — pack the release and build the disk image
+  local work; work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+  local cpio="$work/app.cpio"
+  say "packing release '$APP' (port $APP_PORT${ENVS:+, ${#ENVS[@]} env var(s)})"
+  local packargs=("$rel" --base "$BASE_CPIO" --app "$APP" --port "$APP_PORT" -o "$cpio")
+  local e; for e in "${ENVS[@]:-}"; do [ -n "$e" ] && packargs+=(--env "$e"); done
+  "$PACK" "${packargs[@]}" >&2 || die "tyn-pack failed"
+
+  local BUCKET="tyn-images-$acct"
+  local TS; TS=$(date +%Y%m%d-%H%M%S)
+  local raw="$work/disk.raw"
+
+  say "building disk image (GRUB/BIOS)"
+  CPIO="$cpio" IMAGE="$raw" KERNEL="$KERNEL" SIZE_MB="${SIZE_MB:-128}" bash "$BUILD_DISK" >&2 \
+    || die "build-disk.sh failed"
+
+  say "ensuring S3 bucket $BUCKET"
+  # NB: keep this off stdout — recent aws s3api head-bucket prints a JSON object on
+  # success, and do_build's stdout must carry only the AMI id.
+  if ! aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null 2>&1; then
+    aws s3 mb "s3://$BUCKET" --region "$REGION" >&2 \
+      || die "cannot access/create S3 bucket $BUCKET (need s3:CreateBucket/PutObject — see 'tyn iam-policy')"
+  fi
+
+  local S3_KEY="tyn-${NAME}-${TS}.raw"
+  say "uploading image to s3://$BUCKET/$S3_KEY"
+  aws s3 cp "$raw" "s3://$BUCKET/$S3_KEY" --region "$REGION" >&2 || die "S3 upload failed"
+
+  say "importing EBS snapshot (async, ~5-10 min) — polling"
+  local task
+  task=$(aws_ec2 import-snapshot --description "tyn ${NAME} ${TS}" \
+    --disk-container "Format=RAW,UserBucket={S3Bucket=${BUCKET},S3Key=${S3_KEY}}" \
+    --query 'ImportTaskId' --output text) || die "import-snapshot failed (need ec2:ImportSnapshot — see 'tyn iam-policy')"
+  local status progress snap
+  while true; do
+    status=$(aws_ec2 describe-import-snapshot-tasks --import-task-ids "$task" \
+      --query 'ImportSnapshotTasks[0].SnapshotTaskDetail.Status' --output text 2>/dev/null || echo pending)
+    progress=$(aws_ec2 describe-import-snapshot-tasks --import-task-ids "$task" \
+      --query 'ImportSnapshotTasks[0].SnapshotTaskDetail.Progress' --output text 2>/dev/null || echo "?")
+    printf '\r\033[36m  import: %s (%s%%)   \033[0m' "$status" "$progress" >&2
+    [ "$status" = "completed" ] && { echo >&2; break; }
+    { [ "$status" = "error" ] || [ "$status" = "deleted" ]; } && { echo >&2; die "snapshot import failed (status=$status)"; }
+    sleep 15
+  done
+  snap=$(aws_ec2 describe-import-snapshot-tasks --import-task-ids "$task" \
+    --query 'ImportSnapshotTasks[0].SnapshotTaskDetail.SnapshotId' --output text)
+
+  # snapshot lives on; the raw in S3 is no longer needed
+  aws s3 rm "s3://$BUCKET/$S3_KEY" --region "$REGION" >/dev/null 2>&1 || true
+
+  say "registering AMI (legacy-BIOS boot)"
+  local ami
+  ami=$(aws_ec2 register-image --name "tyn-${NAME}-${TS}" \
+    --description "Tyn unikernel: ${APP}" \
+    --architecture x86_64 --root-device-name /dev/xvda \
+    --block-device-mappings "DeviceName=/dev/xvda,Ebs={SnapshotId=${snap},VolumeSize=1,DeleteOnTermination=true,VolumeType=gp3}" \
+    --virtualization-type hvm --boot-mode legacy-bios --ena-support \
+    --query 'ImageId' --output text) || die "register-image failed (need ec2:RegisterImage — see 'tyn iam-policy')"
+
+  aws_ec2 create-tags --resources "$ami" \
+    --tags "Key=tyn-fingerprint,Value=$fp" "Key=Name,Value=tyn-${NAME}" >/dev/null 2>&1 || true
+
+  ok "AMI $ami  (snapshot $snap)"
+  echo "$ami"
+}
+
+# ---------------------------------------------------------------------------
+# tyn deploy: build/reuse -> SG -> run-instances -> wait reachable -> report
+# ---------------------------------------------------------------------------
+ensure_sg() {
+  local acct="$1"
+  if [ -n "$SG_ID" ]; then echo "$SG_ID"; return 0; fi
+  local sg
+  sg=$(aws_ec2 describe-security-groups --filters "Name=group-name,Values=tyn-sg" \
+    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo None)
+  if [ -z "$sg" ] || [ "$sg" = "None" ]; then
+    sg=$(aws_ec2 create-security-group --group-name tyn-sg --description "Tyn unikernel" \
+      --query 'GroupId' --output text) || die "create-security-group failed"
+    aws_ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port "$APP_PORT" --cidr 0.0.0.0/0 >/dev/null
+    warn "security group tyn-sg ($sg): port $APP_PORT opened to 0.0.0.0/0 (WORLD-OPEN). Restrict the CIDR for anything real."
+  else
+    # make sure the app port is open on the reused group
+    aws_ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port "$APP_PORT" --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+  fi
+  echo "$sg"
+}
+
+do_deploy() {
+  local acct="$1"
+  # APP defaults are computed inside do_build's subshell (for the AMI capture), so
+  # derive a display name here too for the report.
+  local app_disp="${APP:-$(basename "$SRC")}"
+  local ami; ami=$(do_build "$acct") || die "build step failed"
+  local sg; sg=$(ensure_sg "$acct")
+
+  say "launching $INSTANCE_TYPE from $ami"
+  local iid
+  iid=$(aws_ec2 run-instances --image-id "$ami" --instance-type "$INSTANCE_TYPE" \
+    --security-group-ids "$sg" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=tyn-${NAME}}]" \
+    --query 'Instances[0].InstanceId' --output text) || die "run-instances failed"
+  say "instance $iid — waiting for running state"
+  aws_ec2 wait instance-running --instance-ids "$iid" || die "instance did not reach running"
+  local ip
+  ip=$(aws_ec2 describe-instances --instance-ids "$iid" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+
+  say "waiting for the app to answer on http://$ip:$APP_PORT (boot + DHCP, ~20-40s)"
+  local reachable=0 i
+  for i in $(seq 1 40); do
+    if curl -s -o /dev/null --max-time 4 "http://$ip:$APP_PORT/" 2>/dev/null; then reachable=1; break; fi
+    sleep 3
+  done
+
+  hr
+  if [ "$reachable" = 1 ]; then ok "deployed and reachable"; else warn "deployed, but not answering yet (give it another ~30s, or check the serial console)"; fi
+  cat >&2 <<EOF
+
+  App:        $app_disp
+  Instance:   $iid   ($INSTANCE_TYPE, $REGION)
+  AMI:        $ami
+  Public IP:  $ip
+
+  Reach it:
+    curl http://$ip:$APP_PORT/
+    curl http://$ip:$APP_PORT/health
+
+  Interactive BEAM shell over the IAM-gated serial console (no open port):
+    aws ec2 modify-serial-console-access --serial-console-access-enabled --region $REGION
+    aws ec2-instance-connect send-serial-console-ssh-public-key --instance-id $iid \\
+      --serial-port 0 --ssh-public-key file://~/.ssh/id_rsa.pub --region $REGION
+    ssh $iid.port0@serial-console.ec2-instance-connect.$REGION.aws
+
+  Terminate when done:
+    aws ec2 terminate-instances --region $REGION --instance-ids $iid
+EOF
+  echo "$iid"   # stdout: the instance id
+}
+
+# ---------------------------------------------------------------------------
+# IAM policy (copy-pasteable)
+# ---------------------------------------------------------------------------
+iam_policy() {
+  cat <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "TynDeployEC2",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:ImportSnapshot",
+        "ec2:DescribeImportSnapshotTasks",
+        "ec2:RegisterImage",
+        "ec2:DeregisterImage",
+        "ec2:DescribeImages",
+        "ec2:CreateTags",
+        "ec2:DescribeSnapshots",
+        "ec2:DeleteSnapshot",
+        "ec2:RunInstances",
+        "ec2:TerminateInstances",
+        "ec2:DescribeInstances",
+        "ec2:CreateSecurityGroup",
+        "ec2:DescribeSecurityGroups",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:ModifySerialConsoleAccess"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "TynDeployVMIE",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateStore", "ec2:DescribeImportImageTasks"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "TynDeployS3",
+      "Effect": "Allow",
+      "Action": ["s3:CreateBucket", "s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::tyn-images-*", "arn:aws:s3:::tyn-images-*/*"]
+    },
+    {
+      "Sid": "TynDeployVMIEServiceRole",
+      "Effect": "Allow",
+      "Action": ["iam:CreateRole", "iam:PutRolePolicy"],
+      "Resource": "arn:aws:iam::*:role/vmimport"
+    }
+  ]
+}
+EOF
+  cat >&2 <<'EOF'
+
+Note: EBS snapshot import uses the AWS VM Import/Export service, which needs a
+one-time 'vmimport' service role in your account. If import-snapshot fails with a
+role error, create it per:
+  https://docs.aws.amazon.com/vm-import/latest/userguide/required-permissions.html
+EOF
+}
+
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    build)
+      parse_args "$@"; gotcha_note
+      local acct; acct=$(preflight)
+      local ami; ami=$(do_build "$acct") || die "build failed"
+      ok "build complete: $ami"
+      echo "$ami"          # stdout: the AMI id
+      ;;
+    deploy)
+      parse_args "$@"; gotcha_note
+      local acct; acct=$(preflight)
+      do_deploy "$acct"    # stdout: the instance id; human report on stderr
+      ;;
+    iam-policy) iam_policy;;
+    help|-h|--help) usage;;
+    *) usage; die "unknown command: $cmd";;
+  esac
+}
+main "$@"

@@ -100,8 +100,29 @@ Once it prints `phoenix_listening`, from another terminal: `curl http://localhos
 
 ## 3. Deploy your own Phoenix/Elixir app
 
-Tyn packages a standard **Mix release** into a bootable image with `tyn-pack` → `build-disk.sh`
-→ (for AWS) `deploy-ami.sh`. No kernel rebuild.
+One command turns a Mix release into a running Tyn instance on AWS:
+
+```bash
+./tyn deploy my_app/ --env SECRET_KEY_BASE=$(openssl rand -hex 40) --env PHX_SERVER=true
+```
+
+`tyn deploy` takes a Mix release dir (or a project root with `mix.exs` — it runs `mix release`
+for you), packs it, builds a bootable image, imports it as an AMI (polling the slow snapshot
+import for you), launches an instance, waits until the app answers, and prints the public IP,
+the port, and the serial-console hint. `tyn build` stops at the registered AMI id.
+
+- **`--env KEY=VALUE` / `--env-file`** land config in the image's boot config (feeding
+  `runtime.exs`), so `DATABASE_URL` and friends reach the app without baking them into source.
+- **Hash-reuse** — the build is fingerprinted from its inputs (release contents + env + kernel);
+  an unchanged redeploy reuses the existing AMI and skips the ~10-minute snapshot import.
+- **IAM** — `./tyn iam-policy` prints the exact permission set (a copy-pasteable policy JSON).
+  The tool preflights your credentials and fails early, naming any missing permission.
+- **No kernel rebuild** — the committed kernel + base rootfs are reused; only your app is packed.
+
+`tyn deploy` is a **v1 bash wrapper** over the pieces below (`tyn-pack` + `build-disk.sh` + the
+AWS CLI) — deliberately thin and easy to change, not a packaged CLI. Region defaults to
+`$AWS_REGION` (or `us-east-1`) and is overridable with `--region`; the S3 import bucket is
+derived from your account id.
 
 ### Prerequisites (verified on a clean Ubuntu 24.04 box)
 
@@ -144,7 +165,11 @@ MIX_ENV=prod mix assets.deploy
 MIX_ENV=prod mix release            # OTP <= 27; older is fine, newer is rejected
 ```
 
-### Pack it into a Tyn cpio
+### Under the hood — the manual pieces
+
+`tyn deploy` runs these for you; reach for them directly for a local QEMU boot or a custom flow.
+
+**Pack** a Mix release into a Tyn cpio (config via `--env`):
 
 ```bash
 ./tyn-pack _build/prod/rel/my_app -o my_app.cpio --app my_app --port 8080 \
@@ -157,25 +182,26 @@ env vars. Core OTP/Elixir apps come from Tyn's base image; everything else (Phoe
 your app, its deps) comes from your release — **unmodified**. `tyn_boot` evaluates `runtime.exs`
 at boot and deep-merges it, so a stock app's config Just Works.
 
-### Boot it (local) or deploy it (AWS)
+**Build the image**, then boot locally or take the AWS path (`tyn deploy` automates the AWS one):
 
 ```bash
 CPIO=my_app.cpio ./build-disk.sh          # -> a bootable raw disk image
 # local: qemu ... -drive file=<image>,format=raw,if=virtio ...
-# AWS:   CPIO=my_app.cpio ./deploy-ami.sh  # S3 -> import-snapshot -> register AMI -> launch
+# AWS (what `tyn deploy` automates): S3 -> import-snapshot -> register AMI -> launch (deploy-ami.sh)
 ```
 
 ### Three things every real deployment needs
 
-- **Terminate inbound TLS at the load balancer.** Tyn has no in-guest TLS: `:ssl` and `:public_key`
-  load, but the crypto shim is **symmetric-only** (no RSA/ECDSA/ECDHE/curves), so `:ssl` can't
-  negotiate — it fails building its signature-algorithm set (`:ssl.opt_signature_algs`). Put an
-  ALB/NLB in front, terminate HTTPS there, and serve plain HTTP in-guest (`scheme: "http"`). An
-  `https:` listener starts then fails at request time.
+- **TLS: in-guest works, or terminate at a load balancer.** In-guest TLS (inbound *and* outbound)
+  now works — HTTPS both terminates and originates inside the guest via the `tyn_tls`/RustCrypto
+  NIFs (see the README and [`IN_GUEST_TLS.md`](IN_GUEST_TLS.md)). But that crypto/TLS surface is
+  **unreviewed**, so for production you may still prefer to terminate HTTPS at an ALB/NLB and serve
+  plain HTTP in-guest (`scheme: "http"`) — keeping crypto outside the trust boundary until the NIF
+  is review-cleared.
 - **Reach a TLS-required database through a sidecar** *(the outbound analogue of the LB above)*. Tyn
-  speaks **plaintext** Postgres fine (Ecto/Postgrex confirmed), but the same crypto-NIF gap means
-  `Postgrex ssl: true` can't do TLS in-guest. Managed Postgres (RDS/Supabase) requires TLS *from the
-  client*, so terminate it in a small proxy beside the instance — **stunnel**, or **pgbouncer** with a
+  speaks **plaintext** Postgres fine (Ecto/Postgrex confirmed), and in-guest outbound TLS now works
+  (`Postgrex ssl: true` via the RustCrypto NIF) — but that surface is **unreviewed**, so to keep
+  crypto out of the guest until it's review-cleared you can terminate DB TLS in a small proxy beside the instance — **stunnel**, or **pgbouncer** with a
   TLS upstream — in the same VPC/trust boundary. The app connects plaintext to the proxy; the proxy
   originates TLS to the database and validates its certificate with a real clock:
 
