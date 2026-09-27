@@ -73,6 +73,10 @@ start() ->
 start_shells() ->
     catch tcp_shell:start(9090),
     catch serial_shell:start(),
+    %% Standardized, app-independent status endpoint (BEAM health as JSON) on a
+    %% dedicated port — every image exposes it, no app route needed. `catch` so a
+    %% status-listener failure can never take down the shells or the boot process.
+    catch tyn_status:start(9091),
     io:format("shell_listening 9090~n").
 
 %% Configure ERTS's resolver to use the kernel-synthesized nameservers via the

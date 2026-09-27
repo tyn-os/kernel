@@ -190,6 +190,30 @@ CPIO=my_app.cpio ./build-disk.sh          # -> a bootable raw disk image
 # AWS (what `tyn deploy` automates): S3 -> import-snapshot -> register AMI -> launch (deploy-ami.sh)
 ```
 
+### Operate it — status, logs, terminate
+
+`tyn deploy` prints the instance id; the operability commands take it and complete the
+deploy → operate → teardown loop:
+
+```bash
+tyn status    <instance-id>    # instance state + BEAM health (memory, procs, schedulers, uptime)
+tyn logs      <instance-id>    # serial-console output (app logs + boot markers)
+tyn terminate <instance-id>    # stop + delete when done  (--yes to skip the prompt)
+```
+
+- **`tyn status`** hits a standardized `/status` endpoint every Tyn image exposes on port
+  `9091` — a dependency-free JSON snapshot of BEAM health (`memory_*`, `process_count`,
+  `schedulers`, `run_queue`, `uptime_ms`, OTP/ERTS versions). It's baked into the base image
+  (started by `tyn_boot`), so it's present without your app adding a route, and it answers on
+  its own listener — so it survives a wedged *app* listener. It does **not** survive a wedged
+  whole BEAM; a kernel-served status endpoint that does is a planned follow-on. It's also a
+  plain endpoint: `curl http://<ip>:9091/`.
+- **`tyn logs`** fetches the EC2 serial console (`get-console-output`) — recent output, a
+  bounded buffer, not full history. Persistent off-instance logs (a CloudWatch shipper) are a
+  planned follow-on; until then the serial console is the source of truth.
+- **`tyn terminate`** stops and deletes the instance. The AMI + snapshot persist (so a redeploy
+  reuses them); deregister/delete those separately if you want them gone.
+
 ### Three things every real deployment needs
 
 - **TLS: in-guest works, or terminate at a load balancer.** In-guest TLS (inbound *and* outbound)

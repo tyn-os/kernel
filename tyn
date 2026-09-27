@@ -22,6 +22,7 @@ BUILD_DISK="${TYN_BUILD_DISK:-$SELF/build-disk.sh}"
 INSTANCE_TYPE="c5.large"
 APP_PORT=8080
 SHELL_PORT=9090
+STATUS_PORT=9091   # tyn_status BEAM-health endpoint (standardized in the base image)
 STATE_DIR="${TYN_STATE_DIR:-$HOME/.tyn}"
 
 # ---- logging: everything to stderr so stdout carries only machine output (the AMI id) ----
@@ -35,8 +36,11 @@ usage() {
   cat >&2 <<EOF
 tyn — deploy a Mix release as a Tyn unikernel on AWS (v1)
 
-  tyn build   <release|mix-project> [options]     build a registered AMI
-  tyn deploy  <release|mix-project> [options]     build (or reuse) + launch an instance
+  tyn build     <release|mix-project> [options]   build a registered AMI
+  tyn deploy    <release|mix-project> [options]   build (or reuse) + launch an instance
+  tyn status    <instance-id> [--region R]        instance state + BEAM health (/status)
+  tyn logs      <instance-id> [--region R]        fetch serial-console output
+  tyn terminate <instance-id> [--yes] [--region R] stop + delete the instance
   tyn iam-policy                                   print the IAM policy JSON you need
   tyn help
 
@@ -292,10 +296,12 @@ ensure_sg() {
     sg=$(aws_ec2 create-security-group --group-name tyn-sg --description "Tyn unikernel" \
       --query 'GroupId' --output text) || die "create-security-group failed"
     aws_ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port "$APP_PORT" --cidr 0.0.0.0/0 >/dev/null
-    warn "security group tyn-sg ($sg): port $APP_PORT opened to 0.0.0.0/0 (WORLD-OPEN). Restrict the CIDR for anything real."
+    aws_ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port "$STATUS_PORT" --cidr 0.0.0.0/0 >/dev/null
+    warn "security group tyn-sg ($sg): ports $APP_PORT (app) + $STATUS_PORT (status) opened to 0.0.0.0/0 (WORLD-OPEN). Restrict the CIDR for anything real."
   else
-    # make sure the app port is open on the reused group
+    # make sure the app + status ports are open on the reused group
     aws_ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port "$APP_PORT" --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+    aws_ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port "$STATUS_PORT" --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
   fi
   echo "$sg"
 }
@@ -340,16 +346,86 @@ do_deploy() {
     curl http://$ip:$APP_PORT/
     curl http://$ip:$APP_PORT/health
 
-  Interactive BEAM shell over the IAM-gated serial console (no open port):
-    aws ec2 modify-serial-console-access --serial-console-access-enabled --region $REGION
-    aws ec2-instance-connect send-serial-console-ssh-public-key --instance-id $iid \\
-      --serial-port 0 --ssh-public-key file://~/.ssh/id_rsa.pub --region $REGION
-    ssh $iid.port0@serial-console.ec2-instance-connect.$REGION.aws
+  Operate it:
+    tyn status    $iid      # instance state + BEAM health (memory, procs, uptime)
+    tyn logs      $iid      # serial-console output (app logs + boot markers)
+    tyn terminate $iid      # stop + delete when done
 
-  Terminate when done:
-    aws ec2 terminate-instances --region $REGION --instance-ids $iid
+  (BEAM health is also a plain endpoint: curl http://$ip:$STATUS_PORT/ )
 EOF
   echo "$iid"   # stdout: the instance id
+}
+
+# ---------------------------------------------------------------------------
+# Operability: logs / status / terminate — the deploy → operate → teardown loop.
+# These take an instance id (from `tyn deploy`'s output).
+# ---------------------------------------------------------------------------
+instance_ip() {  # $1 = instance id -> public IP on stdout (or empty)
+  aws_ec2 describe-instances --instance-ids "$1" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null
+}
+
+do_logs() {
+  local iid="${1:?usage: tyn logs <instance-id>}"
+  say "fetching serial console output for $iid (may lag a few minutes after boot)"
+  # get-console-output --latest is the freshest bounded buffer. It's the app's
+  # stdout/stderr on serial (logger output + Tyn boot markers). Follow-on: an
+  # in-guest CloudWatch shipper for persistent, full history (see TYN_OPERABILITY).
+  local out
+  out=$(aws_ec2 get-console-output --instance-id "$iid" --latest --output text 2>&1) \
+    || die "get-console-output failed (need ec2:GetConsoleOutput — see 'tyn iam-policy')"
+  if [ -z "$out" ] || [ "$out" = "None" ]; then
+    warn "console buffer empty — output can take a few minutes to appear after boot; retry shortly."
+  else
+    printf '%s\n' "$out"
+  fi
+}
+
+do_status() {
+  local iid="${1:?usage: tyn status <instance-id>}"
+  local state ip
+  state=$(aws_ec2 describe-instances --instance-ids "$iid" \
+    --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null) \
+    || die "describe-instances failed for $iid"
+  ip=$(instance_ip "$iid")
+  hr
+  printf '  Instance:   %s\n  State:      %s\n  Public IP:  %s\n' "$iid" "$state" "${ip:-<none>}" >&2
+  if [ "$state" != "running" ] || [ -z "$ip" ] || [ "$ip" = "None" ]; then
+    warn "not running / no public IP — can't query the /status endpoint."
+    echo "$state"; return 0
+  fi
+  # hit the standardized in-guest status endpoint (tyn_status on STATUS_PORT)
+  local body
+  body=$(curl -s --max-time 6 "http://$ip:$STATUS_PORT/" 2>/dev/null || true)
+  if [ -n "$body" ]; then
+    ok "app healthy — BEAM stats:"
+    # pretty-print if python is around, else raw JSON. Capture to a var first —
+    # `python | ... 2>/dev/null >&2` has a redirect-order trap that eats stdout.
+    local pretty
+    if command -v python3 >/dev/null 2>&1; then
+      pretty=$(printf '%s' "$body" | python3 -m json.tool 2>/dev/null) || pretty="$body"
+    else
+      pretty="$body"
+    fi
+    printf '%s\n' "$pretty" >&2
+  else
+    warn "instance is running but /status ($ip:$STATUS_PORT) did not answer — the BEAM may still be booting, or the security group doesn't open $STATUS_PORT."
+  fi
+  echo "$state"   # stdout: instance state
+}
+
+do_terminate() {
+  local iid="${1:?usage: tyn terminate <instance-id>}"
+  if [ "$ASSUME_YES" != "1" ]; then
+    printf 'Terminate %s in %s? [y/N] ' "$iid" "$REGION" >&2
+    local ans; read -r ans
+    case "$ans" in [yY]|[yY][eE][sS]) ;; *) say "aborted"; return 0;; esac
+  fi
+  say "terminating $iid"
+  aws_ec2 terminate-instances --instance-ids "$iid" \
+    --query 'TerminatingInstances[0].CurrentState.Name' --output text >&2 \
+    || die "terminate-instances failed (need ec2:TerminateInstances — see 'tyn iam-policy')"
+  ok "termination requested for $iid (the AMI + snapshot persist; deregister/delete separately if you want them gone)"
 }
 
 # ---------------------------------------------------------------------------
@@ -375,6 +451,7 @@ iam_policy() {
         "ec2:RunInstances",
         "ec2:TerminateInstances",
         "ec2:DescribeInstances",
+        "ec2:GetConsoleOutput",
         "ec2:CreateSecurityGroup",
         "ec2:DescribeSecurityGroups",
         "ec2:AuthorizeSecurityGroupIngress",
@@ -429,6 +506,25 @@ main() {
       parse_args "$@"; gotcha_note
       local acct; acct=$(preflight)
       do_deploy "$acct"    # stdout: the instance id; human report on stderr
+      ;;
+    logs|status|terminate)
+      # operability commands: <instance-id> [--region R] [--yes]
+      local iid=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --region) REGION="$2"; shift 2;;
+          --yes|-y) ASSUME_YES=1; shift;;
+          -*) die "unknown option: $1";;
+          *) [ -z "$iid" ] && iid="$1" || die "unexpected arg: $1"; shift;;
+        esac
+      done
+      [ -n "$iid" ] || die "usage: tyn $cmd <instance-id> [--region R]"
+      command -v aws >/dev/null 2>&1 || die "aws CLI not found."
+      case "$cmd" in
+        logs)      do_logs "$iid";;
+        status)    do_status "$iid" >/dev/null;;
+        terminate) do_terminate "$iid";;
+      esac
       ;;
     iam-policy) iam_policy;;
     help|-h|--help) usage;;

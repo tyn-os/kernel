@@ -140,7 +140,14 @@ trap 'rm -rf "$STAGE"' EXIT
 
 # Overlay the enhanced launcher + shells (base already has them; refresh so the
 # module cpio carries the current tyn_boot).
-for b in tyn_boot.beam serial_shell.beam tcp_shell.beam; do
+#
+# ⚠️ INVARIANT: the modules listed here OVERRIDE the base cpio's copies — this list
+# is authoritative for the src/erl/ runtime modules in a packed image. Any NEW
+# src/erl/ module (e.g. a runtime-level status endpoint, a CloudWatch shipper) MUST
+# be added here, or the packed image silently runs the base cpio's copy (or nothing)
+# even after build-rootfs.sh refreshes the base — the exact stale-beam trap that
+# hid tyn_status: source shipped, but the packed tyn_boot.beam was the old one.
+for b in tyn_boot.beam serial_shell.beam tcp_shell.beam tyn_status.beam; do
   [ -f "$TYN_ERL/$b" ] && cp "$TYN_ERL/$b" "$STAGE/$b"
 done
 

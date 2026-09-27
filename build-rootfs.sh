@@ -37,6 +37,7 @@ OUT="${OUT:-$ROOT/src/otp-rootfs.cpio}"
 ERLC="${ERLC:-erlc}"
 ELIXIR="${ELIXIR:-elixir}"
 BOOT_SRC="$ROOT/src/erl/tyn_boot.erl"
+STATUS_SRC="$ROOT/src/erl/tyn_status.erl"   # standardized /status listener (operability)
 ELIXIR_APPS="elixir logger eex iex mix"   # the OTP-app resource files Wall A needs
 
 say() { printf '\033[1;36m[build-rootfs]\033[0m %s\n' "$*"; }
@@ -47,6 +48,7 @@ command -v "$ELIXIR" >/dev/null 2>&1 || die "elixir not on PATH (need Elixir 1.1
 command -v cpio      >/dev/null 2>&1 || die "cpio not on PATH"
 [ -f "$SEED" ]      || die "seed cpio not found: $SEED"
 [ -f "$BOOT_SRC" ]  || die "tyn_boot source not found: $BOOT_SRC"
+[ -f "$STATUS_SRC" ] || die "tyn_status source not found: $STATUS_SRC"
 
 # Locate the Elixir lib dir (parent of elixir/logger/eex/iex/mix ebin dirs).
 ELIXIR_LIB="${ELIXIR_LIB:-$("$ELIXIR" -e 'IO.puts(Path.expand(Path.join(to_string(:code.lib_dir(:elixir)), "..")))' 2>/dev/null)}"
@@ -65,6 +67,13 @@ say "Compiling tyn_boot.erl -> tyn_boot.beam"
 "$ERLC" +deterministic -o "$STAGE" "$BOOT_SRC"   # +deterministic: no paths/timestamps in the beam
 strings "$STAGE/tyn_boot.beam" 2>/dev/null | grep -q 'eval_runtime_config' \
   || die "compiled tyn_boot.beam lacks eval_runtime_config — source/toolchain mismatch"
+
+# 1b. tyn_status.beam — the standardized /status listener (operability). Always
+#     recompiled from source, same as tyn_boot, so it can't go stale.
+say "Compiling tyn_status.erl -> tyn_status.beam"
+"$ERLC" +deterministic -o "$STAGE" "$STATUS_SRC"
+strings "$STAGE/tyn_status.beam" 2>/dev/null | grep -q 'snapshot_json' \
+  || die "compiled tyn_status.beam lacks snapshot_json — source/toolchain mismatch"
 
 # 2. Elixir OTP-app .app resource files — copy from the toolchain into the root.
 for a in $ELIXIR_APPS; do
@@ -93,6 +102,7 @@ for a in $ELIXIR_APPS; do
   have "$a.app" || die "$a.app missing from built cpio"
 done
 have "tyn_boot.beam" || die "tyn_boot.beam missing from built cpio"
+have "tyn_status.beam" || die "tyn_status.beam missing from built cpio"
 
 sz=$(wc -c < "$OUT" | tr -d ' ')
 if command -v md5sum >/dev/null 2>&1; then md5=$(md5sum "$OUT" | awk '{print $1}');
